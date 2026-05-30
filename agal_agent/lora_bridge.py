@@ -55,7 +55,7 @@ class LoRaBridge:
         """Connect to local MQTT broker and subscribe to gateway bridge topics."""
         self._client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-            client_id=f"menvayal-lora-bridge-{self.config.gateway_eui[:8]}",
+            client_id=f"agal-lora-bridge-{self.config.gateway_eui[:8]}",
         )
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect

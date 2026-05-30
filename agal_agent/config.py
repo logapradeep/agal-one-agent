@@ -45,6 +45,11 @@ class PinConfig:
     spi_cs_pin: Optional[int] = None          # CS pin number for SPI device selection
     uart_baud_rate: Optional[int] = None      # UART baud rate
     one_wire_device_id: Optional[str] = None  # 1-Wire ROM ID (e.g., "28-00000ABCDE")
+    # Sensor driver metadata (see agal_agent/sensors/)
+    sensor_type: Optional[str] = None         # e.g., "current_acs758", "ultrasonic_jsn_sr04t"
+    sensor_params: dict = field(default_factory=dict)
+    # Edge protection config (dry-run cutoff, low-water warnings) — see sensors/protection.py
+    protection: Optional[dict] = None
 
 
 @dataclass
@@ -126,7 +131,7 @@ class AgentConfig:
     def is_lora_device(self) -> bool:
         return self.lora is not None and self.lora.role == "end_device"
 
-    def update_pins(self, pins_data: list[dict], config_path: str = "/etc/menvayal/config.yaml") -> None:
+    def update_pins(self, pins_data: list[dict], config_path: str = "/etc/agal-agent/config.yaml") -> None:
         """Update pin configuration in memory and persist to config.yaml."""
         self.pins = [
             PinConfig(
@@ -141,6 +146,9 @@ class AgentConfig:
                 spi_cs_pin=p.get("spi_cs_pin"),
                 uart_baud_rate=p.get("uart_baud_rate"),
                 one_wire_device_id=p.get("one_wire_device_id"),
+                sensor_type=p.get("sensor_type"),
+                sensor_params=p.get("sensor_params") or {},
+                protection=p.get("protection"),
             )
             for p in pins_data
         ]
@@ -176,6 +184,12 @@ class AgentConfig:
                     entry["uart_baud_rate"] = p["uart_baud_rate"]
                 if p.get("one_wire_device_id"):
                     entry["one_wire_device_id"] = p["one_wire_device_id"]
+                if p.get("sensor_type"):
+                    entry["sensor_type"] = p["sensor_type"]
+                if p.get("sensor_params"):
+                    entry["sensor_params"] = p["sensor_params"]
+                if p.get("protection"):
+                    entry["protection"] = p["protection"]
                 yaml_pins.append(entry)
 
             data["pins"] = yaml_pins
@@ -208,9 +222,9 @@ class AgentConfig:
             tls=mqtt_data.get("tls", True),
             username=mqtt_data.get("username", node.uid),
             password=mqtt_data.get("password", node.auth_token),
-            commands_topic=topics.get("commands", f"menvayal/{node.uid}/commands"),
-            telemetry_topic=topics.get("telemetry", f"menvayal/{node.uid}/telemetry"),
-            status_topic=topics.get("status", f"menvayal/{node.uid}/status"),
+            commands_topic=topics.get("commands", f"agal/{node.uid}/commands"),
+            telemetry_topic=topics.get("telemetry", f"agal/{node.uid}/telemetry"),
+            status_topic=topics.get("status", f"agal/{node.uid}/status"),
         )
 
         tel_data = data.get("telemetry", {})
@@ -299,6 +313,9 @@ class AgentConfig:
                 spi_cs_pin=p.get("spi_cs_pin"),
                 uart_baud_rate=p.get("uart_baud_rate"),
                 one_wire_device_id=p.get("one_wire_device_id"),
+                sensor_type=p.get("sensor_type"),
+                sensor_params=p.get("sensor_params") or {},
+                protection=p.get("protection"),
             )
             for p in pins_data
         ]

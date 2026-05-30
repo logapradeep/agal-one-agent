@@ -20,10 +20,16 @@ class MenvayalMqttClient:
         self.config = config
         self._client: Optional[mqtt.Client] = None
         self._on_command: Optional[Callable[[dict], None]] = None
+        self._on_reconnect: Optional[Callable[[], None]] = None
         self._connected = False
+        self._was_connected = False  # Tracks if we ever connected before
 
     def set_command_handler(self, handler: Callable[[dict], None]) -> None:
         self._on_command = handler
+
+    def set_reconnect_handler(self, handler: Callable[[], None]) -> None:
+        """Called when MQTT reconnects after a disconnection (not on first connect)."""
+        self._on_reconnect = handler
 
     def connect(self) -> None:
         self._client = mqtt.Client(
@@ -106,6 +112,43 @@ class MenvayalMqttClient:
             qos=1,
         )
 
+    def publish_event(self, event: dict) -> None:
+        """Publish a structured event to the status topic.
+
+        Used by the edge protection module (dry-run cutoff, low-water warning,
+        baseline-learned) and any other code that needs to emit an event the
+        cloud should record in the /events collection.
+
+        Event shape (matches contracts/schemas/event.schema.json):
+            {
+                "type": "dry_run_protection_triggered" | "low_water_level_warning" | ...,
+                "source": "protection" | "node" | ...,
+                "sourceKey": "<asset.subkey>",
+                "payload": { ... }
+            }
+
+        Caller does NOT need to include nodeUid or timestamp — backend stamps them.
+        """
+        if not self._client or not self._connected:
+            logger.warning("Cannot publish event (%s): not connected", event.get("type", "?"))
+            return
+
+        wrapped = {
+            "nodeUid": self.config.username,
+            "type": "sensor_event",
+            "event": event,
+            "timestamp": int(time.time() * 1000),
+        }
+        self._client.publish(
+            self.config.status_topic,
+            json.dumps(wrapped),
+            qos=1,
+        )
+        logger.info(
+            "Published event %s (sourceKey=%s)",
+            event.get("type", "?"), event.get("sourceKey", "?"),
+        )
+
     def publish_lora_uplink(self, uplink_data: dict) -> None:
         """Publish a LoRa uplink payload to the cloud for processing."""
         if not self._client or not self._connected:
@@ -179,6 +222,11 @@ class MenvayalMqttClient:
             logger.info("Connected to MQTT broker")
             client.subscribe(self.config.commands_topic, qos=1)
             logger.info("Subscribed to %s", self.config.commands_topic)
+            # Trigger reconciliation on reconnect (not first connect — main.py handles that)
+            if self._was_connected and self._on_reconnect:
+                logger.info("MQTT reconnected — triggering state reconciliation")
+                self._on_reconnect()
+            self._was_connected = True
         else:
             logger.error("MQTT connection failed with code %d", rc)
 

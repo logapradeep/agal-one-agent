@@ -13,7 +13,7 @@ from .http_reporter import HttpReporter
 
 def _get_agent_version() -> str:
     try:
-        return pkg_version("menvayal-agent")
+        return pkg_version("agal-agent")
     except Exception:
         return "0.1.0"
 

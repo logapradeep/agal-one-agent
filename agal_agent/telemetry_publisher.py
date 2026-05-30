@@ -55,12 +55,49 @@ class TelemetryPublisher:
             self._schedule_next()
 
     def _read_all_inputs(self) -> list[dict]:
-        """Read all input pins and return telemetry readings."""
-        from .command_executor import _get_handler
+        """Build telemetry readings from all readable pins.
 
-        readings = []
+        Three sources:
+          1. Generic input pins (gpio_input / analog_input without sensor_type / oneWire) — read directly via handlers.
+          2. Sensor pins (sensor_type set) — pull the latest reading from the sensor
+             instance maintained by the ProtectionMonitor (which is the sole owner
+             of high-frequency sensor I/O — telemetry just publishes the latest).
+          3. Sensor pins WITHOUT a protection monitor (configured but protection thread
+             not running) — read on-demand here.
+        """
+        from .command_executor import _get_handler, get_sensor_instance
+
+        readings: list[dict] = []
 
         for pin in self.config.pins:
+            # ---- Sensor-typed pins: publish whatever the sensor's state has -------
+            if pin.sensor_type:
+                sensor = get_sensor_instance(pin)
+                if sensor is None:
+                    continue
+
+                try:
+                    if pin.sensor_type == "current_acs758":
+                        last = sensor.state.last_reading
+                        if last is None:
+                            # No protection thread reading it yet — do a one-shot read.
+                            last = sensor.read_rms()
+                        if last is not None:
+                            readings.append(sensor.to_telemetry(last))
+                    elif pin.sensor_type == "ultrasonic_jsn_sr04t":
+                        last = sensor.state.last_reading
+                        if last is None:
+                            last = sensor.read()
+                        if last is not None:
+                            readings.extend(sensor.to_telemetry(last))
+                    else:
+                        logger.debug("Unknown sensor_type for telemetry: %s", pin.sensor_type)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("Sensor read failed for pin %d (%s): %s",
+                                 pin.physical_pin, pin.sensor_type, e)
+                continue
+
+            # ---- Generic input pins ---------------------------------------------
             if pin.protocol not in ("gpio_input", "analog_input", "oneWire"):
                 continue
 

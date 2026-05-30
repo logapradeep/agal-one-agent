@@ -7,7 +7,7 @@ import os
 
 logger = logging.getLogger(__name__)
 
-GITHUB_REPO = "https://github.com/logapradeep/menvayal-agent.git"
+GITHUB_REPO = "https://github.com/logapradeep/agal-agent.git"
 VENV_PIP = os.path.join(sys.prefix, "bin", "pip")
 
 
@@ -38,7 +38,7 @@ def perform_update(version: str) -> str:
 
     # Restart the systemd service (runs in background so we can ack first)
     subprocess.Popen(
-        ["sudo", "systemctl", "restart", "menvayal-agent"],
+        ["sudo", "systemctl", "restart", "agal-agent"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

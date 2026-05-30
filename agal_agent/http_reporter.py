@@ -8,6 +8,7 @@ import urllib.error
 logger = logging.getLogger(__name__)
 
 TELEMETRY_INGRESS_URL = "https://telemetryingress-amxy2i3cma-uc.a.run.app"
+BOOT_STATE_URL = "https://getbootstate-amxy2i3cma-uc.a.run.app"
 # Same project hash as provision-amxy2i3cma-uc.a.run.app
 
 
@@ -51,6 +52,30 @@ class HttpReporter:
             payload["error"] = error
 
         self._post({"type": "commandAck", "payload": payload})
+
+    def fetch_boot_state(self, auth_token: str) -> list[dict]:
+        """Fetch desired pin states from the backend for boot reconciliation."""
+        try:
+            body = json.dumps({
+                "nodeUid": self.node_uid,
+                "authToken": auth_token,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                BOOT_STATE_URL,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    return data.get("commands", [])
+                else:
+                    logger.warning("fetch_boot_state failed: %d", resp.status)
+                    return []
+        except Exception as e:
+            logger.warning("fetch_boot_state error: %s", e)
+            return []
 
     def _post(self, data: dict) -> None:
         try:

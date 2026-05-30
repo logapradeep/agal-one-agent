@@ -1,0 +1,41 @@
+name: agal-agent
+type: sw.application
+description: |
+  Menvayal IoT agent — runs on every farmer-installed Raspberry Pi. Owns
+  pump control via relay, current monitoring for dry-run cutoff, water-level
+  reading from ultrasonic sensors, and MQTT bridge to the agal-one Firebase
+  backend.
+
+  Per-device variables (set on each device in the balena dashboard):
+    NODE_UID         — unique node identifier (e.g., node-abc123)
+    AUTH_TOKEN       — shared secret with the cloud backend
+    MQTT_BROKER      — MQTT broker hostname
+    MQTT_PORT        — defaults to 8883 (TLS)
+    NODE_NAME        — human-readable, e.g., "Field 1 — pump"
+    NODE_TYPE        — link_rio (default), lora_gateway, lora_device
+    BOARD_MODEL      — rpi_3b_v1_2 | rpi_4b | rpi_zero_2w (auto-detected if blank)
+    SENTRY_DSN       — optional, enables error reporting to Sentry
+    SENTRY_ENV       — prod | dev (defaults to prod)
+
+  Fleet variables (set once on the fleet):
+    TELEMETRY_INTERVAL_SECONDS    — default 10
+    HEARTBEAT_INTERVAL_SECONDS    — default 30
+
+  See BALENA.md for the full operator workflow.
+
+assets:
+  repository:
+    type: blob.asset
+    data:
+      url: https://github.com/logapradeep/agal-agent
+
+# Pi hardware that v1 supports. Add more as we expand HAT compatibility.
+type-version: 2
+hostApp: balena-rpi
+supported-device-types:
+  - raspberrypi3
+  - raspberrypi3-64
+  - raspberrypi4-64
+  - raspberrypi5
+  - raspberry-pi2
+  - raspberry-pi

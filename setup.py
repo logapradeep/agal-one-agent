@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="menvayal-agent",
+    name="agal-agent",
     version="0.1.5",
     packages=find_packages(),
     install_requires=[
@@ -20,7 +20,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "menvayal-agent=menvayal_agent.main:main",
+            "agal-agent=agal_agent.main:main",
         ],
     },
     python_requires=">=3.9",

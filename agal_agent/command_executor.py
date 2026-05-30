@@ -11,6 +11,19 @@ logger = logging.getLogger(__name__)
 # Protocol → handler mapping (lazy-loaded)
 _handlers: dict = {}
 
+# Sensor pin (physical_pin) → sensor instance. Populated by main.py at startup
+# so the telemetry publisher + protection monitor share the same instance.
+_sensors: dict = {}
+
+
+def register_sensor(pin, instance) -> None:
+    """Wire a sensor instance to its pin so telemetry + protection see the same object."""
+    _sensors[pin.physical_pin] = instance
+
+
+def get_sensor_instance(pin):
+    return _sensors.get(pin.physical_pin)
+
 
 def _get_handler(protocol: str):
     """Lazy-load the appropriate handler for a pin protocol."""
@@ -58,8 +71,13 @@ def _find_pin(config: AgentConfig, command: dict) -> Optional[PinConfig]:
     return None
 
 
-def execute(config: AgentConfig, mqtt_client: MenvayalMqttClient, command: dict) -> None:
-    """Execute a command received from MQTT."""
+def execute(config: AgentConfig, mqtt_client: MenvayalMqttClient, command: dict, protection_monitor=None) -> None:
+    """Execute a command received from MQTT.
+
+    If `protection_monitor` is provided, notify it of relay state changes so the
+    dry-run protection logic can suppress inrush samples on pump-start and reset
+    cut-off state on pump-stop.
+    """
     command_id = command.get("commandId", "unknown")
     cmd_type = command.get("type", "setPower")
     value = command.get("value")
@@ -95,6 +113,12 @@ def execute(config: AgentConfig, mqtt_client: MenvayalMqttClient, command: dict)
 
         if cmd_type == "setPower":
             applied = handler.write(pin, 1 if value else 0)
+            # Notify protection so it knows to suppress inrush + re-arm
+            if protection_monitor is not None and pin.label:
+                if value:
+                    protection_monitor.notify_pump_started(pin.label)
+                else:
+                    protection_monitor.notify_pump_stopped(pin.label)
         elif cmd_type == "setPortValue":
             applied = handler.write(pin, value)
         elif cmd_type == "readSensor":

@@ -6,22 +6,30 @@ import signal
 import sys
 import time
 
-from .config import AgentConfig
+from .config import AgentConfig, PinConfig
 from .mqtt_client import MenvayalMqttClient
-from .command_executor import execute
+from .command_executor import execute, register_sensor, _get_handler
 from .telemetry_publisher import TelemetryPublisher
 from .heartbeat import HeartbeatPublisher
 from .http_reporter import HttpReporter
+from . import boot_reconciler
+from .sentry_setup import init_sentry
+from .sensors import (
+    CurrentSensorACS758,
+    UltrasonicSensorJsnSr04t,
+    ProtectionMonitor,
+)
+from .sensors.protection import ProtectionConfig
 
-logger = logging.getLogger("menvayal_agent")
+logger = logging.getLogger("agal_agent")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Menvayal IoT Agent")
     parser.add_argument(
         "--config", "-c",
-        default="/etc/menvayal/config.yaml",
-        help="Path to YAML config file (default: /etc/menvayal/config.yaml)",
+        default="/etc/agal-agent/config.yaml",
+        help="Path to YAML config file (default: /etc/agal-agent/config.yaml)",
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -43,6 +51,10 @@ def main():
     except Exception as e:
         logger.error("Failed to load config: %s", e)
         sys.exit(1)
+
+    # Initialize Sentry as early as possible AFTER config load, so the node_uid
+    # tag is attached to every event. No-op if SENTRY_DSN is unset (dev / bench).
+    init_sentry(node_uid=config.node.uid, agent_version="0.1.5")
 
     logger.info("Node: %s (%s)", config.node.name, config.node.uid)
     logger.info("Board: %s (%s)", config.board.model, config.board.category)
@@ -90,6 +102,69 @@ def main():
             config.lora.gateway.region,
         )
 
+    # ---- Sensor + edge-protection setup --------------------------------------
+    current_sensors: list[CurrentSensorACS758] = []
+    ultrasonic_sensors: list[UltrasonicSensorJsnSr04t] = []
+    protection_configs: dict[str, ProtectionConfig] = {}
+
+    for pin in config.pins:
+        if not pin.sensor_type:
+            continue
+        try:
+            if pin.sensor_type == "current_acs758":
+                sensor = CurrentSensorACS758(pin)
+                current_sensors.append(sensor)
+                register_sensor(pin, sensor)
+                if pin.protection:
+                    protection_configs[sensor.source_key] = ProtectionConfig(
+                        cut_pin_label=pin.protection["cut_pin_label"],
+                        threshold_pct=float(pin.protection.get("threshold_pct", 20)),
+                        confirm_window_s=float(pin.protection.get("confirm_window_s", 5)),
+                        inrush_ignore_s=float(pin.protection.get("inrush_ignore_s", 2)),
+                        baseline_learn_after_s=float(pin.protection.get("baseline_learn_after_s", 30)),
+                        baseline_window_s=float(pin.protection.get("baseline_window_s", 10)),
+                        auto_restart_after_s=float(pin.protection.get("auto_restart_after_s", 0)),
+                    )
+                logger.info("Sensor wired: %s (current_acs758)", sensor.source_key)
+            elif pin.sensor_type == "ultrasonic_jsn_sr04t":
+                sensor = UltrasonicSensorJsnSr04t(pin)
+                ultrasonic_sensors.append(sensor)
+                register_sensor(pin, sensor)
+                logger.info("Sensor wired: %s (ultrasonic_jsn_sr04t)", sensor.source_key)
+            else:
+                logger.warning("Unknown sensor_type on pin %d: %s", pin.physical_pin, pin.sensor_type)
+        except Exception as e:  # noqa: BLE001
+            logger.error("Failed to wire sensor on pin %d (%s): %s", pin.physical_pin, pin.sensor_type, e)
+
+    def _find_pin_by_label(label: str) -> "PinConfig | None":
+        for p in config.pins:
+            if p.label == label:
+                return p
+        return None
+
+    def relay_writer(pin_label: str, value: int) -> None:
+        """Used by ProtectionMonitor to cut a relay on dry-run trigger."""
+        pin = _find_pin_by_label(pin_label)
+        if not pin:
+            raise ValueError(f"No pin with label {pin_label}")
+        handler = _get_handler(pin.protocol)
+        if not handler:
+            raise RuntimeError(f"No handler for protocol {pin.protocol} (pin {pin_label})")
+        handler.write(pin, value)
+
+    def event_publisher(event: dict) -> None:
+        mqtt_client.publish_event(event)
+
+    protection_monitor: ProtectionMonitor | None = None
+    if current_sensors or ultrasonic_sensors:
+        protection_monitor = ProtectionMonitor(
+            current_sensors=current_sensors,
+            protection_configs=protection_configs,
+            ultrasonic_sensors=ultrasonic_sensors,
+            relay_writer=relay_writer,
+            event_publisher=event_publisher,
+        )
+
     # Command handler
     def on_command(command: dict):
         cmd_type = command.get("type", "")
@@ -129,12 +204,18 @@ def main():
             return
 
         # Regular GPIO/pin commands
-        execute(config, mqtt_client, command)
+        execute(config, mqtt_client, command, protection_monitor=protection_monitor)
 
     mqtt_client.set_command_handler(on_command)
 
     # HTTP reporter for backend status updates
     http_reporter = HttpReporter(config.node.uid)
+
+    # Reconnect handler — reconcile state when MQTT reconnects after a drop
+    def on_reconnect():
+        boot_reconciler.reconcile(config, mqtt_client, http_reporter)
+
+    mqtt_client.set_reconnect_handler(on_reconnect)
 
     # Telemetry & heartbeat
     telemetry = TelemetryPublisher(config, mqtt_client)
@@ -172,6 +253,11 @@ def main():
 
         telemetry.start()
         heartbeat.start()
+        if protection_monitor is not None:
+            protection_monitor.start()
+
+        # Reconcile pin states with cloud on boot
+        boot_reconciler.reconcile(config, mqtt_client, http_reporter)
 
         logger.info("Agent running. Press Ctrl+C to stop.")
 
@@ -184,6 +270,8 @@ def main():
         logger.info("Stopping services...")
         telemetry.stop()
         heartbeat.stop()
+        if protection_monitor is not None:
+            protection_monitor.stop()
         if lora_bridge:
             lora_bridge.stop()
         mqtt_client.disconnect()

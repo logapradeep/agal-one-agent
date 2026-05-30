@@ -5,11 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/menvayal-agent/venv/bin/menvayal-agent --config /etc/menvayal/config.yaml
+ExecStart=/opt/agal-agent/venv/bin/agal-agent --config /etc/agal-agent/config.yaml
 Restart=always
 RestartSec=10
 User=root
-WorkingDirectory=/opt/menvayal-agent
+WorkingDirectory=/opt/agal-agent
 StandardOutput=journal
 StandardError=journal
 
