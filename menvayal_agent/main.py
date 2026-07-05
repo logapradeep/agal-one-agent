@@ -133,8 +133,10 @@ def main():
 
     mqtt_client.set_command_handler(on_command)
 
-    # HTTP reporter for backend status updates
-    http_reporter = HttpReporter(config.node.uid)
+    # HTTP reporter for backend status updates. The ingress URL comes from the
+    # backend-generated config (telemetry.ingress_url); HttpReporter falls back
+    # to its module default when that's empty.
+    http_reporter = HttpReporter(config.node.uid, config.telemetry.ingress_url)
 
     # Telemetry & heartbeat
     telemetry = TelemetryPublisher(config, mqtt_client)

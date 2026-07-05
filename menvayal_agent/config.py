@@ -29,6 +29,10 @@ class MqttConfig:
 class TelemetryConfig:
     interval_seconds: int = 10
     heartbeat_seconds: int = 30
+    # HTTP telemetry/status ingress endpoint, supplied by the backend-generated
+    # config.yaml. Making this config-driven means a backend region move needs
+    # no daemon release. Empty -> the http_reporter module default is used.
+    ingress_url: str = ""
 
 
 @dataclass
@@ -217,6 +221,7 @@ class AgentConfig:
         telemetry = TelemetryConfig(
             interval_seconds=tel_data.get("interval_seconds", 10),
             heartbeat_seconds=tel_data.get("heartbeat_seconds", 30),
+            ingress_url=tel_data.get("ingress_url", ""),
         )
 
         board_data = data.get("board", {})

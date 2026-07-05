@@ -7,16 +7,23 @@ import urllib.error
 
 logger = logging.getLogger(__name__)
 
-TELEMETRY_INGRESS_URL = "https://telemetryingress-amxy2i3cma-uc.a.run.app"
-# Same project hash as provision-amxy2i3cma-uc.a.run.app
+# Fallback only — the backend supplies the live endpoint via config.yaml
+# (telemetry.ingress_url). This default must track the current backend region:
+# the whole agal-one backend is in asia-south1 (the us-central1 deployment was
+# retired). A stale default here is what silently kept nodes offline before
+# ingress_url became config-driven.
+TELEMETRY_INGRESS_URL = "https://asia-south1-agal-one-prod.cloudfunctions.net/telemetryIngress"
 
 
 class HttpReporter:
     """Posts telemetry, status, and command acks to the backend HTTP endpoint."""
 
-    def __init__(self, node_uid: str, base_url: str = TELEMETRY_INGRESS_URL):
+    def __init__(self, node_uid: str, base_url: str = ""):
         self.node_uid = node_uid
-        self.base_url = base_url
+        # Prefer the backend-supplied URL (config.telemetry.ingress_url); fall
+        # back to the module default when the config omits it (older configs or
+        # a bare manual install).
+        self.base_url = base_url or TELEMETRY_INGRESS_URL
 
     def report_status(self, online: bool, uptime: int, firmware_version: str = "0.1.0") -> None:
         self._post({

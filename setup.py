@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="menvayal-agent",
-    version="0.1.5",
+    version="0.1.6",
     packages=find_packages(),
     install_requires=[
         "paho-mqtt>=2.0.0",
@@ -20,6 +20,11 @@ setup(
     },
     entry_points={
         "console_scripts": [
+            # Primary name — the provisioning systemd unit runs `agal-one-agent`
+            # (the ecosystem rebranded Menvayal -> Agal One). The package/module
+            # keep the legacy `menvayal_agent` name; `menvayal-agent` stays as a
+            # back-compat alias.
+            "agal-one-agent=menvayal_agent.main:main",
             "menvayal-agent=menvayal_agent.main:main",
         ],
     },
