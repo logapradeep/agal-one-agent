@@ -2,6 +2,13 @@
 
 ## 0.1.7 (unreleased, 2026-07-06)
 
+- **Telemetry ingress authentication (ADR-013 P0.5):** `HttpReporter` now
+  sends `Authorization: Bearer <auth_token>` (the node's config.yaml
+  authToken — same credential as the MQTT password) on every HTTP report:
+  telemetry, status, commandAck, firmware events, and boot-state fetch.
+  The backend `telemetryIngress` currently accepts tokenless requests with a
+  logged warning (`TELEMETRY_AUTH_ENFORCE=false`) so <= v0.1.6 daemons keep
+  working; enforcement flips server-side once the fleet is on >= v0.1.7.
 - **New sensor driver: BNO055 9-DoF IMU** (`sensor_type: "bno055_9dof"`,
   `agal_one_agent/sensors/bno055.py`). NDOF fusion mode; emits
   `{label}.orientation.heading` / `.orientation.roll` / `.orientation.pitch`

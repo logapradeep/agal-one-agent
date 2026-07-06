@@ -231,8 +231,9 @@ def main():
 
     mqtt_client.set_command_handler(on_command)
 
-    # HTTP reporter for backend status updates
-    http_reporter = HttpReporter(config.node.uid)
+    # HTTP reporter for backend status updates. auth_token → Authorization:
+    # Bearer header on every report (ADR-013 P0.5 telemetryIngress auth).
+    http_reporter = HttpReporter(config.node.uid, auth_token=config.node.auth_token)
 
     # Reconnect handler — reconcile state when MQTT reconnects after a drop
     def on_reconnect():
