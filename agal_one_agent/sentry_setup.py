@@ -8,12 +8,12 @@ Setup:
     1. Sentry project (Python platform).
     2. DSN exported as env var on each RPi:
 
-           # In /etc/systemd/system/agal-agent.service (or balena env vars):
+           # In /etc/systemd/system/agal-one-agent.service (or balena env vars):
            Environment=SENTRY_DSN=https://abc@o0.ingest.sentry.io/0
            Environment=SENTRY_ENV=prod
 
        Or for dev:
-           SENTRY_DSN=... python -m agal_agent.main
+           SENTRY_DSN=... python -m agal_one_agent.main
 
     3. Without SENTRY_DSN, init silently no-ops — no remote capture, no
        crash. Useful for dev / on-bench testing.
@@ -83,13 +83,13 @@ def init_sentry(node_uid: Optional[str] = None, agent_version: str = "0.1.5") ->
         from sentry_sdk.integrations.threading import ThreadingIntegration
 
         environment = os.environ.get("SENTRY_ENV") or (
-            "dev" if os.environ.get("MENVAYAL_DEV") == "1" else "prod"
+            "dev" if os.environ.get("AGAL_ONE_AGENT_DEV") == "1" else "prod"
         )
 
         sentry_sdk.init(
             dsn=dsn,
             environment=environment,
-            release=f"agal-agent@{agent_version}",
+            release=f"agal-one-agent@{agent_version}",
             # No perf tracing yet — keeps event volume bounded.
             traces_sample_rate=0.0,
             sample_rate=1.0,
@@ -110,7 +110,7 @@ def init_sentry(node_uid: Optional[str] = None, agent_version: str = "0.1.5") ->
 
         _initialized = True
         logger.info(
-            "Sentry initialized (env=%s, release=agal-agent@%s)",
+            "Sentry initialized (env=%s, release=agal-one-agent@%s)",
             environment, agent_version,
         )
         return True
@@ -152,7 +152,7 @@ def send_test_event() -> bool:
     try:
         import sentry_sdk
         sentry_sdk.capture_message(
-            "[smoke-test] Menvayal daemon Sentry wired up",
+            "[smoke-test] Agal One daemon Sentry wired up",
             level="info",
         )
         return True

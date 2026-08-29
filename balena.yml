@@ -1,7 +1,7 @@
-name: agal-agent
+name: agal-one-agent
 type: sw.application
 description: |
-  Menvayal IoT agent — runs on every farmer-installed Raspberry Pi. Owns
+  Agal One IoT agent — runs on every farmer-installed Raspberry Pi. Owns
   pump control via relay, current monitoring for dry-run cutoff, water-level
   reading from ultrasonic sensors, and MQTT bridge to the agal-one Firebase
   backend.
@@ -27,7 +27,7 @@ assets:
   repository:
     type: blob.asset
     data:
-      url: https://github.com/logapradeep/agal-agent
+      url: https://github.com/logapradeep/agal-one-agent
 
 # Pi hardware that v1 supports. Add more as we expand HAT compatibility.
 type-version: 2

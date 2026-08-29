@@ -13,7 +13,7 @@ from .config import MqttConfig
 logger = logging.getLogger(__name__)
 
 
-class MenvayalMqttClient:
+class AgalOneMqttClient:
     """Persistent MQTT connection to HiveMQ Cloud."""
 
     def __init__(self, config: MqttConfig):
@@ -82,15 +82,29 @@ class MenvayalMqttClient:
             logger.warning("Cannot publish telemetry: not connected")
             return
 
-        payload = json.dumps({
-            "nodeUid": self.config.username,
-            "readings": readings,
-            "timestamp": int(time.time() * 1000),
+        # Canonical envelope expected by the cloud telemetryIngress webhook:
+        #   const {type, payload} = req.body
+        # then `payload` is destructured for nodeUid / readings / timestamp.
+        # See agal-one/backend/functions/src/modules/mqtt/telemetryIngress.ts
+        # (req-body destructure at line 120; handleTelemetry at line 188).
+        # The HTTPS fallback in http_reporter.py:35 uses the same shape; this
+        # MQTT path was previously emitting a bare payload which the cloud
+        # function would 400 unless a HiveMQ Data Hub policy was injecting
+        # `type` from the topic name (not version-controlled in this repo).
+        # Wrapping here makes the MQTT path independent of any broker-side
+        # policy.
+        wire = json.dumps({
+            "type": "telemetry",
+            "payload": {
+                "nodeUid": self.config.username,
+                "readings": readings,
+                "timestamp": int(time.time() * 1000),
+            },
         })
 
         self._client.publish(
             self.config.telemetry_topic,
-            payload,
+            wire,
             qos=1,
         )
 
@@ -99,16 +113,24 @@ class MenvayalMqttClient:
             logger.warning("Cannot publish status: not connected")
             return
 
-        payload = json.dumps({
+        # Same {type, payload} envelope contract as publish_telemetry above.
+        payload = {
             "nodeUid": self.config.username,
             "online": online,
             "uptime": uptime,
             "firmwareVersion": firmware_version,
-        })
+        }
+        # Report the primary MAC so the cloud can register/​index it (best-effort,
+        # non-authoritative — hardwareSerial is the binding anchor).
+        from .net_info import get_primary_mac
+        mac = get_primary_mac()
+        if mac:
+            payload["mac"] = mac
+        wire = json.dumps({"type": "status", "payload": payload})
 
         self._client.publish(
             self.config.status_topic,
-            payload,
+            wire,
             qos=1,
         )
 
@@ -168,6 +190,41 @@ class MenvayalMqttClient:
             qos=1,
         )
         logger.debug("Published LoRa uplink from devAddr=%s", uplink_data.get("devAddr", "?"))
+
+    def publish_lora_survey_sample(self, sample: dict) -> None:
+        """Publish a placement-survey sample (rssi/snr) for the live signal
+        meter — ADR-011 §10.2 / §10.7 item 4 `lora_survey_sample` ingress type.
+
+        Flat shape (like sensor_event): the cloud reads the whole body. Caller
+        supplies childShortId/rssi/snr/sf/quality/at; nodeUid is stamped here."""
+        if not self._client or not self._connected:
+            logger.warning("Cannot publish LoRa survey sample: not connected")
+            return
+        wrapped = {
+            "nodeUid": self.config.username,
+            "type": "lora_survey_sample",
+            "sample": sample,
+            "timestamp": int(time.time() * 1000),
+        }
+        self._client.publish(self.config.status_topic, json.dumps(wrapped), qos=1)
+        logger.debug("Published LoRa survey sample child=%s",
+                     sample.get("childShortId", "?"))
+
+    def publish_lora_child_status(self, status: dict) -> None:
+        """Publish per-leaf health (battery, rssi/snr, lastSeen, quality) —
+        ADR-011 §6 / §10.4 `lora_child_status` ingress type. Flat shape."""
+        if not self._client or not self._connected:
+            logger.warning("Cannot publish LoRa child status: not connected")
+            return
+        wrapped = {
+            "nodeUid": self.config.username,
+            "type": "lora_child_status",
+            "child": status,
+            "timestamp": int(time.time() * 1000),
+        }
+        self._client.publish(self.config.status_topic, json.dumps(wrapped), qos=1)
+        logger.debug("Published LoRa child status child=%s",
+                     status.get("childShortId", "?"))
 
     def publish_lora_event(self, event: dict) -> None:
         """Publish a LoRa network event (join, leave, error) to the cloud."""

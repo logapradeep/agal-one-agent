@@ -7,13 +7,13 @@ from importlib.metadata import version as pkg_version
 from typing import Optional
 
 from .config import AgentConfig
-from .mqtt_client import MenvayalMqttClient
+from .mqtt_client import AgalOneMqttClient
 from .http_reporter import HttpReporter
 
 
 def _get_agent_version() -> str:
     try:
-        return pkg_version("agal-agent")
+        return pkg_version("agal-one-agent")
     except Exception:
         return "0.1.0"
 
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class HeartbeatPublisher:
     """Publishes online status and uptime at regular intervals."""
 
-    def __init__(self, config: AgentConfig, mqtt_client: MenvayalMqttClient,
+    def __init__(self, config: AgentConfig, mqtt_client: AgalOneMqttClient,
                  http_reporter: Optional[HttpReporter] = None):
         self.config = config
         self.mqtt_client = mqtt_client

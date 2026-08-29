@@ -11,6 +11,9 @@ from .config import AgentConfig, PinConfig
 from .mqtt_client import AgalOneMqttClient
 from .command_executor import execute, register_sensor, _get_handler
 from .telemetry_publisher import TelemetryPublisher
+from .telemetry_buffer import TelemetryBuffer, DEFAULT_DB_PATH
+from .telemetry_uploader import TelemetryUploader
+from .live_cadence import LiveCadenceController
 from .heartbeat import HeartbeatPublisher
 from .http_reporter import HttpReporter
 from . import boot_reconciler
@@ -45,7 +48,7 @@ def main():
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
-    logger.info("Agal One Agent v0.1.7 starting")
+    logger.info("Agal One Agent v0.1.8 starting")
     logger.info("Loading config from %s", args.config)
 
     try:
@@ -56,7 +59,7 @@ def main():
 
     # Initialize Sentry as early as possible AFTER config load, so the node_uid
     # tag is attached to every event. No-op if SENTRY_DSN is unset (dev / bench).
-    init_sentry(node_uid=config.node.uid, agent_version="0.1.7")
+    init_sentry(node_uid=config.node.uid, agent_version="0.1.8")
 
     logger.info("Node: %s (%s)", config.node.name, config.node.uid)
     logger.info("Board: %s (%s)", config.board.model, config.board.category)
@@ -173,6 +176,55 @@ def main():
             event_publisher=event_publisher,
         )
 
+    # ---- ADR-013 P0 durability + adaptive live cadence ----------------------
+    # On-node SQLite ring buffer: every reading is appended durably before the
+    # live publish, so a network outage becomes a delay, not a hole in paid
+    # history. buffer_overflow drops emit a one-time sensor_event.
+    def _on_buffer_overflow(event: dict):
+        mqtt_client.publish_event(event)
+
+    telemetry_buffer = TelemetryBuffer(
+        db_path=config.telemetry.buffer_db_path or DEFAULT_DB_PATH,
+        config=config.telemetry.batch.to_batch_config(),
+        on_overflow=_on_buffer_overflow,
+    )
+
+    # Adaptive live cadence: 10 s while an app watches, else the idle interval
+    # (default 60 s). The watch signal arrives via the `liveWatch` command; the
+    # config default covers bench/dev.
+    cadence = LiveCadenceController(
+        watching_interval_sec=config.telemetry.interval_seconds,
+        idle_interval_sec=config.telemetry.live_idle_seconds,
+        default_watching=config.telemetry.live_watch_default,
+    )
+
+    # ---- Raw-LoRa star listener (ADR-011 v1) — DARK unless enabled -----------
+    lora_listener = None
+    if config.lora is not None:
+        from .lora_listener import LoRaListener
+
+        def _on_lora_readings(child_suffix: str, readings: list[dict]):
+            # LoRa leaf readings enter the SAME telemetry path as wired children
+            # (buffer + live), per ADR-011 §6 "Landing in the existing stack".
+            try:
+                telemetry_buffer.append(readings, ts_uncertain=False)
+            except Exception as e:  # noqa: BLE001
+                logger.error("LoRa buffer append failed: %s", e)
+            mqtt_client.publish_telemetry(readings)
+
+        def _on_lora_survey(sample: dict):
+            mqtt_client.publish_lora_survey_sample(sample)
+
+        def _on_lora_child_status(status: dict):
+            mqtt_client.publish_lora_child_status(status)
+
+        lora_listener = LoRaListener(
+            config.lora,
+            on_readings=_on_lora_readings,
+            on_survey_sample=_on_lora_survey,
+            on_child_status=_on_lora_child_status,
+        )
+
     # Command handler
     def on_command(command: dict):
         cmd_type = command.get("type", "")
@@ -194,6 +246,26 @@ def main():
             except Exception as e:  # noqa: BLE001
                 logger.error("OTA: perform_update failed: %s", e)
                 mqtt_client.publish_command_ack(command_id, "failed", error=str(e))
+            return
+
+        # Adaptive live cadence (ADR-013 §9-D3): the backend forwards a
+        # presence/onSnapshot heartbeat as a `liveWatch` command while an app is
+        # actively watching this node. `watching` refreshes the fast-cadence TTL;
+        # a closed app simply stops sending and the node relaxes to idle.
+        if cmd_type == "liveWatch":
+            watching = bool(command.get("watching", True))
+            cadence.set_watching(watching)
+            mqtt_client.publish_command_ack(command_id, "completed")
+            return
+
+        # Raw-LoRa pairing window (ADR-011 §10.2): backend forwards this on
+        # pairLoraChild. No-op (acked) when the raw-star listener is dark.
+        if cmd_type == "loraPairingWindow":
+            child_short_id = command.get("childShortId")
+            duration = int(command.get("durationSec", 60))
+            if lora_listener is not None and child_short_id is not None:
+                lora_listener.open_pairing_window(int(child_short_id), duration)
+            mqtt_client.publish_command_ack(command_id, "completed")
             return
 
         # Route LoRa downlink commands to the bridge
@@ -233,16 +305,26 @@ def main():
 
     # HTTP reporter for backend status updates. auth_token → Authorization:
     # Bearer header on every report (ADR-013 P0.5 telemetryIngress auth).
-    http_reporter = HttpReporter(config.node.uid, auth_token=config.node.auth_token)
+    # base_url comes from the backend-generated config (telemetry.ingress_url,
+    # v0.1.6 config-driven region); HttpReporter falls back to its module
+    # default when that's empty.
+    http_reporter = HttpReporter(config.node.uid, auth_token=config.node.auth_token,
+                                 base_url=config.telemetry.ingress_url)
 
-    # Reconnect handler — reconcile state when MQTT reconnects after a drop
+    # Reconnect handler — reconcile state when MQTT reconnects after a drop,
+    # and nudge the uploader to drain the backlog accumulated during the outage.
     def on_reconnect():
         boot_reconciler.reconcile(config, mqtt_client, http_reporter)
+        uploader.wake()
 
     mqtt_client.set_reconnect_handler(on_reconnect)
 
-    # Telemetry & heartbeat
-    telemetry = TelemetryPublisher(config, mqtt_client)
+    # Telemetry & heartbeat. The publisher buffers durably + publishes live at
+    # the adaptive cadence; the uploader drains the buffer to the ingress.
+    telemetry = TelemetryPublisher(config, mqtt_client,
+                                   buffer=telemetry_buffer, cadence=cadence)
+    uploader = TelemetryUploader(telemetry_buffer, http_reporter,
+                                 config=config.telemetry.batch.to_batch_config())
     heartbeat = HeartbeatPublisher(config, mqtt_client, http_reporter=http_reporter)
 
     # Graceful shutdown
@@ -270,12 +352,18 @@ def main():
             logger.error("Failed to connect to MQTT broker")
             sys.exit(1)
 
-        # Start LoRa bridge if this is a gateway node
+        # Start LoRa bridge if this is a LoRaWAN gateway node (legacy path)
         if lora_bridge:
             lora_bridge.start()
             logger.info("LoRa bridge started")
 
+        # Start the raw-LoRa star listener (ADR-011 v1). Inert unless a radio is
+        # present + `lora.mode == raw_star` + enabled — DARK by default.
+        if lora_listener is not None:
+            lora_listener.start()
+
         telemetry.start()
+        uploader.start()
         heartbeat.start()
         if protection_monitor is not None:
             protection_monitor.start()
@@ -313,11 +401,20 @@ def main():
     finally:
         logger.info("Stopping services...")
         telemetry.stop()
+        # Final drain attempt so a clean shutdown doesn't strand buffered rows.
+        try:
+            uploader.drain_all()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Final drain on shutdown failed: %s", e)
+        uploader.stop()
         heartbeat.stop()
         if protection_monitor is not None:
             protection_monitor.stop()
+        if lora_listener is not None:
+            lora_listener.stop()
         if lora_bridge:
             lora_bridge.stop()
+        telemetry_buffer.close()
         mqtt_client.disconnect()
         logger.info("Agent stopped.")
 

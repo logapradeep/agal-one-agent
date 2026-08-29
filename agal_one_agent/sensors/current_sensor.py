@@ -23,15 +23,24 @@ responsibility. This class just reads RMS values.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import re
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Union
 
 from .ads1115 import Ads1115, is_hardware_available
 
 logger = logging.getLogger(__name__)
+
+#: Default directory the daemon persists per-sensor baselines under.
+#: Matches the Docker volume mount in `docker-compose.yml` and the install
+#: location written by `scripts/install.sh`. Pass ``baseline_dir=None`` to
+#: ``CurrentSensorACS758`` to disable persistence entirely (used in tests).
+DEFAULT_BASELINE_DIR = Path("/var/lib/agal-one-agent")
 
 
 @dataclass
@@ -47,7 +56,10 @@ class CurrentSensorReading:
 
 @dataclass
 class CurrentSensorState:
-    """In-memory state for one current sensor instance. Persisted to disk for restart resilience."""
+    """In-memory state for one current sensor instance. Baseline values are
+    persisted by ``CurrentSensorACS758`` to ``{baseline_dir}/baseline.{source_key}.json``
+    so a daemon restart does not force a fresh inrush + learning window before
+    dry-run protection re-arms."""
 
     baseline_a: Optional[float] = None
     baseline_learned_at: Optional[float] = None
@@ -71,7 +83,12 @@ class CurrentSensorACS758:
       sensor_label:       str   (defaults to pin.label)
     """
 
-    def __init__(self, pin, state: Optional[CurrentSensorState] = None) -> None:
+    def __init__(
+        self,
+        pin,
+        state: Optional[CurrentSensorState] = None,
+        baseline_dir: Optional[Union[str, Path]] = DEFAULT_BASELINE_DIR,
+    ) -> None:
         self.pin = pin
         params = pin.sensor_params or {}
 
@@ -89,6 +106,22 @@ class CurrentSensorACS758:
 
         self.source_key = pin.label or f"current_pin_{pin.physical_pin}"
         self.state = state or CurrentSensorState()
+
+        # Baseline persistence: defaults to /var/lib/agal-one-agent/baseline.{safe-source-key}.json
+        # but degrades gracefully on any I/O failure (e.g. running on macOS where /var/lib
+        # isn't writable, or before the install script has created the dir). Pass
+        # baseline_dir=None to opt out entirely — tests use this to keep stderr clean.
+        # Per-sensor config can also override via `pin.sensor_params["baseline_dir"]`.
+        self._baseline_path: Optional[Path] = None
+        param_baseline_dir = params.get("baseline_dir")
+        effective_dir = Path(param_baseline_dir) if param_baseline_dir is not None else (
+            Path(baseline_dir) if baseline_dir is not None else None
+        )
+        if effective_dir is not None:
+            # Sanitize source_key for filesystem safety: keep alnum + . _ -, replace anything else.
+            safe_key = re.sub(r"[^A-Za-z0-9._-]", "_", self.source_key) or "current"
+            self._baseline_path = effective_dir / f"baseline.{safe_key}.json"
+            self._load_baseline_if_present()
 
         self._adc = Ads1115(
             bus_number=self.ads_bus,
@@ -192,9 +225,76 @@ class CurrentSensorACS758:
         self.state.baseline_a = current_a
         self.state.baseline_learned_at = time.time()
         logger.info("[%s] baseline learned: %.2f A", self.source_key, current_a)
+        self._save_baseline()
 
     def has_baseline(self) -> bool:
         return self.state.baseline_a is not None
+
+    def clear_baseline(self) -> None:
+        """Drop the in-memory baseline AND delete the persisted file. Used when
+        an operator wants to force re-learning (e.g. after a motor swap)."""
+        self.state.baseline_a = None
+        self.state.baseline_learned_at = None
+        if self._baseline_path is None:
+            return
+        try:
+            self._baseline_path.unlink(missing_ok=True)
+            logger.info("[%s] cleared persisted baseline at %s", self.source_key, self._baseline_path)
+        except OSError as e:
+            logger.warning("[%s] failed to delete baseline file %s: %s",
+                           self.source_key, self._baseline_path, e)
+
+    # ---- Baseline persistence (internal) -------------------------------
+
+    def _load_baseline_if_present(self) -> None:
+        """Read ``{baseline_dir}/baseline.{safe_source_key}.json`` if it exists
+        and populate ``self.state.baseline_a`` + ``baseline_learned_at``. Silent
+        on missing file; warns and continues on corrupt content."""
+        path = self._baseline_path
+        if path is None or not path.exists():
+            return
+        try:
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("[%s] could not load persisted baseline at %s: %s",
+                           self.source_key, path, e)
+            return
+
+        baseline_a = data.get("baseline_a")
+        baseline_learned_at = data.get("baseline_learned_at")
+        if not isinstance(baseline_a, (int, float)) or baseline_a <= 0:
+            logger.warning("[%s] ignoring invalid baseline_a in %s: %r",
+                           self.source_key, path, baseline_a)
+            return
+        self.state.baseline_a = float(baseline_a)
+        if isinstance(baseline_learned_at, (int, float)):
+            self.state.baseline_learned_at = float(baseline_learned_at)
+        logger.info("[%s] loaded persisted baseline: %.2f A (from %s)",
+                    self.source_key, baseline_a, path)
+
+    def _save_baseline(self) -> None:
+        """Atomic-write the current baseline to disk. Best-effort: any I/O
+        failure (no permission on /var/lib, dir missing, full disk) logs a
+        warning and returns. The in-memory baseline still works for this
+        process — only restart resilience is lost."""
+        path = self._baseline_path
+        if path is None or self.state.baseline_a is None:
+            return
+        payload = {
+            "source_key": self.source_key,
+            "baseline_a": float(self.state.baseline_a),
+            "baseline_learned_at": self.state.baseline_learned_at,
+            "schema_version": 1,
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(path)  # atomic on POSIX
+        except OSError as e:
+            logger.warning("[%s] could not persist baseline to %s: %s",
+                           self.source_key, path, e)
 
     # ---- Telemetry shape ------------------------------------------------
 

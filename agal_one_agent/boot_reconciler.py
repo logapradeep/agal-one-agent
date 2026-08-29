@@ -6,14 +6,14 @@ import threading
 from .config import AgentConfig
 from .http_reporter import HttpReporter
 from .command_executor import execute
-from .mqtt_client import MenvayalMqttClient
+from .mqtt_client import AgalOneMqttClient
 
 logger = logging.getLogger(__name__)
 
 
 def reconcile(
     config: AgentConfig,
-    mqtt_client: MenvayalMqttClient,
+    mqtt_client: AgalOneMqttClient,
     http_reporter: HttpReporter,
 ) -> None:
     """Fetch desired pin states from backend and apply them.

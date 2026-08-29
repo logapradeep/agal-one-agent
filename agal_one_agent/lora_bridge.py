@@ -1,4 +1,4 @@
-"""LoRa Gateway Bridge — connects ChirpStack packet forwarder to Menvayal MQTT.
+"""LoRa Gateway Bridge — connects ChirpStack packet forwarder to Agal One MQTT.
 
 Architecture:
   LoRa Radio (SX1301/SX1302 concentrator)
@@ -6,14 +6,14 @@ Architecture:
     → ChirpStack Gateway Bridge (converts UDP to MQTT)
     → Local Mosquitto MQTT broker
     → This bridge subscribes to local MQTT
-    → Forwards uplink data to HiveMQ (Menvayal cloud) as telemetry
+    → Forwards uplink data to HiveMQ (Agal One cloud) as telemetry
     → Receives downlink commands from HiveMQ
     → Publishes downlink to local MQTT for the gateway bridge
 
 This module manages:
 1. Local MQTT connection (to ChirpStack Gateway Bridge)
-2. Uplink forwarding: local LoRa uplinks → Menvayal cloud telemetry
-3. Downlink routing: Menvayal cloud commands → local LoRa downlinks
+2. Uplink forwarding: local LoRa uplinks → Agal One cloud telemetry
+3. Downlink routing: Agal One cloud commands → local LoRa downlinks
 4. End-device registration tracking
 """
 
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 class LoRaBridge:
-    """Bridges between local ChirpStack Gateway Bridge MQTT and Menvayal cloud MQTT."""
+    """Bridges between local ChirpStack Gateway Bridge MQTT and Agal One cloud MQTT."""
 
     def __init__(
         self,
@@ -183,7 +183,7 @@ class LoRaBridge:
         snr = rx_info[0].get("loRaSNR", 0) if rx_info else 0
         frequency = tx_info.get("frequency", 0)
 
-        # Build telemetry-compatible payload for Menvayal cloud
+        # Build telemetry-compatible payload for Agal One cloud
         uplink_data = {
             "type": "lora_uplink",
             "devAddr": dev_addr,

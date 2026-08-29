@@ -1,6 +1,6 @@
 version: '2.4'
 
-# balena-compose for Menvayal Agent fleet.
+# balena-compose for Agal One Agent fleet.
 #
 # Single service. Hardware access via `privileged: true` (simplest for v1;
 # can be tightened to explicit `devices:` + `cap_add:` later).
@@ -17,9 +17,9 @@ services:
     network_mode: host
     volumes:
       # Persisted across container updates — pin config, baseline, telemetry buffer.
-      - agal-state:/var/lib/agal-agent
+      - agal-state:/var/lib/agal-one-agent
       # Rendered config.yaml lives here; entrypoint regenerates on start.
-      - agal-config:/etc/agal-agent
+      - agal-config:/etc/agal-one-agent
     labels:
       io.balena.features.dbus: '1'
       io.balena.features.sysfs: '1'

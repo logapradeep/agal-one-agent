@@ -1,7 +1,7 @@
 """End-to-end test of the edge protection logic without any hardware.
 
 Run with:
-    cd Menvayal/daemon/agal-agent
+    cd Agal/daemon/agal-one-agent
     python -m pytest tests/test_protection_no_hw.py -v
 
 Validates:
@@ -29,22 +29,22 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agal_agent.sensors.current_sensor import (
+from agal_one_agent.sensors.current_sensor import (
     CurrentSensorACS758,
     CurrentSensorReading,
 )
-from agal_agent.sensors.ultrasonic_sensor import (
+from agal_one_agent.sensors.ultrasonic_sensor import (
     UltrasonicSensorJsnSr04t,
     UltrasonicReading,
 )
-from agal_agent.sensors.protection import (
+from agal_one_agent.sensors.protection import (
     ProtectionConfig,
     ProtectionMonitor,
     _SensorBundle,
 )
 
 
-# ----- Fixture pin (mimics agal_agent.config.PinConfig) ----------------
+# ----- Fixture pin (mimics agal_one_agent.config.PinConfig) ----------------
 
 @dataclass
 class FakePin:
@@ -65,13 +65,20 @@ class FakePin:
     assigned_to: Optional[str] = None
 
 
-def make_current_sensor() -> CurrentSensorACS758:
+def make_current_sensor(baseline_dir=None) -> CurrentSensorACS758:
+    """Construct a CurrentSensorACS758 for the protection tests.
+
+    Defaults to ``baseline_dir=None`` so the protection-loop tests don't
+    touch the filesystem (``/var/lib/agal-one-agent`` isn't writable on macOS
+    CI without root, and the warning log would clutter output). The
+    dedicated persistence tests below pass a real ``tmp_path``.
+    """
     pin = FakePin(
         physical_pin=12,
         label="pump1.current",
         sensor_params={"ads1115_address": 0x48, "window_ms": 100},
     )
-    return CurrentSensorACS758(pin)
+    return CurrentSensorACS758(pin, baseline_dir=baseline_dir)
 
 
 def make_protection_config(**overrides) -> ProtectionConfig:
@@ -357,3 +364,125 @@ def test_above_threshold_does_not_fire(monkeypatch):
 
     monitor._step_ultrasonic(sensor)
     event_publisher.assert_not_called()
+
+
+# ----- Baseline persistence tests (closes BENCH_TEST_REPORT §3.1) --------
+#
+# These tests cover the fix for "every Pi reboot loses the baseline and
+# triggers another full 30s+ learning window with no dry-run protection in
+# between." See agal_one_agent/sensors/current_sensor.py:_load_baseline_if_present
+# and ::_save_baseline.
+
+
+import json as _json  # noqa: E402  (kept local to the persistence block)
+
+
+def _make_persistent_sensor(baseline_dir) -> CurrentSensorACS758:
+    pin = FakePin(
+        physical_pin=12,
+        label="pump1.current",
+        sensor_params={"ads1115_address": 0x48, "window_ms": 100},
+    )
+    return CurrentSensorACS758(pin, baseline_dir=baseline_dir)
+
+
+def test_baseline_persists_across_sensor_instances(tmp_path):
+    """learn_baseline() on instance #1 writes to disk; instance #2 loads it on init."""
+    s1 = _make_persistent_sensor(tmp_path)
+    s1.learn_baseline(4.82)
+
+    baseline_file = tmp_path / "baseline.pump1.current.json"
+    assert baseline_file.exists(), "learn_baseline should have written the file"
+    saved = _json.loads(baseline_file.read_text())
+    assert saved["baseline_a"] == pytest.approx(4.82)
+    assert saved["source_key"] == "pump1.current"
+    assert saved["schema_version"] == 1
+    assert isinstance(saved["baseline_learned_at"], (int, float))
+
+    # Fresh sensor instance — should pick up the persisted baseline at init time,
+    # without going through another inrush + learning window.
+    s2 = _make_persistent_sensor(tmp_path)
+    assert s2.has_baseline()
+    assert s2.state.baseline_a == pytest.approx(4.82)
+    assert s2.state.baseline_learned_at is not None
+
+
+def test_baseline_dir_none_disables_persistence(tmp_path):
+    """baseline_dir=None means no read, no write — used in tests + opt-out config."""
+    s = _make_persistent_sensor(None)
+    s.learn_baseline(4.82)
+    # In-memory state still works
+    assert s.has_baseline()
+    # ...but no file lands anywhere we could check; the contract is "no I/O".
+    # We assert by reading: a fresh None-dir sensor should NOT pick anything up.
+    s2 = _make_persistent_sensor(None)
+    assert not s2.has_baseline()
+
+
+def test_corrupt_baseline_file_does_not_crash(tmp_path):
+    """A malformed baseline.json should be logged and ignored, not crash init."""
+    (tmp_path / "baseline.pump1.current.json").write_text("not json at all {{")
+    s = _make_persistent_sensor(tmp_path)
+    assert not s.has_baseline()  # corrupt file → no baseline loaded
+
+
+def test_invalid_baseline_value_rejected(tmp_path):
+    """A baseline_a of 0 or negative or missing must be rejected — those would
+    mis-trigger dry-run protection on the first reading."""
+    (tmp_path / "baseline.pump1.current.json").write_text(
+        _json.dumps({"baseline_a": 0.0, "baseline_learned_at": 1700000000.0})
+    )
+    s = _make_persistent_sensor(tmp_path)
+    assert not s.has_baseline()
+
+    (tmp_path / "baseline.pump1.current.json").write_text(
+        _json.dumps({"baseline_a": -1.5})
+    )
+    s = _make_persistent_sensor(tmp_path)
+    assert not s.has_baseline()
+
+    (tmp_path / "baseline.pump1.current.json").write_text(_json.dumps({}))
+    s = _make_persistent_sensor(tmp_path)
+    assert not s.has_baseline()
+
+
+def test_missing_baseline_dir_does_not_crash():
+    """Unwritable / non-existent default dir (the macOS case for /var/lib/agal-one-agent)
+    must not crash the daemon — learn_baseline still works in-memory; persistence
+    is best-effort. This is the codepath the existing protection tests already
+    exercise with baseline_dir=None; this test asserts the contract explicitly."""
+    bad_dir = "/var/lib/agal-one-agent-nonexistent-xyz-test"
+    s = _make_persistent_sensor(bad_dir)
+    s.learn_baseline(4.82)  # must not raise even though we can't mkdir there
+    assert s.has_baseline()
+    assert s.state.baseline_a == pytest.approx(4.82)
+
+
+def test_source_key_is_sanitized_for_filename(tmp_path):
+    """source_key with awkward characters (slashes, spaces) must yield a safe
+    filename — defends against config typos creating directory-traversal-ish
+    paths or unwritable filenames."""
+    pin = FakePin(
+        physical_pin=12,
+        label="pump/1 weird:key",
+        sensor_params={"ads1115_address": 0x48, "window_ms": 100},
+    )
+    s = CurrentSensorACS758(pin, baseline_dir=tmp_path)
+    s.learn_baseline(3.14)
+    # All non-[A-Za-z0-9._-] runs replaced with _
+    expected = tmp_path / "baseline.pump_1_weird_key.json"
+    assert expected.exists()
+
+
+def test_clear_baseline_deletes_persisted_file(tmp_path):
+    s = _make_persistent_sensor(tmp_path)
+    s.learn_baseline(4.82)
+    baseline_file = tmp_path / "baseline.pump1.current.json"
+    assert baseline_file.exists()
+
+    s.clear_baseline()
+    assert not s.has_baseline()
+    assert not baseline_file.exists()
+
+    # Idempotent — calling again on already-cleared sensor does not raise.
+    s.clear_baseline()

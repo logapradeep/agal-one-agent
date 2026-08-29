@@ -4,7 +4,7 @@ import logging
 from typing import Optional
 
 from .config import AgentConfig, PinConfig
-from .mqtt_client import MenvayalMqttClient
+from .mqtt_client import AgalOneMqttClient
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ def _find_pin(config: AgentConfig, command: dict) -> Optional[PinConfig]:
     return None
 
 
-def execute(config: AgentConfig, mqtt_client: MenvayalMqttClient, command: dict, protection_monitor=None) -> None:
+def execute(config: AgentConfig, mqtt_client: AgalOneMqttClient, command: dict, protection_monitor=None) -> None:
     """Execute a command received from MQTT.
 
     If `protection_monitor` is provided, notify it of relay state changes so the
@@ -112,7 +112,15 @@ def execute(config: AgentConfig, mqtt_client: MenvayalMqttClient, command: dict,
         mqtt_client.publish_command_ack(command_id, "executing")
 
         if cmd_type == "setPower":
-            applied = handler.write(pin, 1 if value else 0)
+            if effective_protocol == "pwm":
+                # On a PWM pin "on" means the configured duty cycle (the
+                # contracted PortTransport.pwm dutyCyclePct — asset.schema
+                # v3.1), not a 1% duty. Runtime duty changes go through
+                # setPortValue below (value = percentage per the contract).
+                on_duty = pin.pwm_duty_cycle_pct if pin.pwm_duty_cycle_pct is not None else 100.0
+                applied = handler.write(pin, on_duty if value else 0.0)
+            else:
+                applied = handler.write(pin, 1 if value else 0)
             # Notify protection so it knows to suppress inrush + re-arm
             if protection_monitor is not None and pin.label:
                 if value:

@@ -1,0 +1,14 @@
+[Unit]
+Description=Agal One Agent — managed-OTA rollback verifier
+# Independent of agal-one-agent.service on purpose: this is the safety net that
+# runs even when the main service is crash-looping on a bad OTA. It reinstalls
+# the previous version + restarts once an unconfirmed update is past its
+# deadline. No-op for any non-probation state (reads one JSON file and exits).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# root: the rollback path reinstalls into the venv and restarts the main unit.
+User=root
+ExecStart=/opt/agal-one-agent/venv/bin/agal-one-agent-ota-verify

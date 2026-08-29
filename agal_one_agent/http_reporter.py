@@ -8,9 +8,13 @@ import urllib.error
 
 logger = logging.getLogger(__name__)
 
-TELEMETRY_INGRESS_URL = "https://telemetryingress-amxy2i3cma-uc.a.run.app"
-BOOT_STATE_URL = "https://getbootstate-amxy2i3cma-uc.a.run.app"
-# Same project hash as provision-amxy2i3cma-uc.a.run.app
+# Fallback only — the backend supplies the live endpoint via config.yaml
+# (telemetry.ingress_url). These defaults must track the current backend region:
+# the whole agal-one backend is in asia-south1 (the us-central1 deployment was
+# retired). A stale default here is what silently kept nodes offline before
+# ingress_url became config-driven.
+TELEMETRY_INGRESS_URL = "https://asia-south1-agal-one-prod.cloudfunctions.net/telemetryIngress"
+BOOT_STATE_URL = "https://asia-south1-agal-one-prod.cloudfunctions.net/getBootState"
 
 
 class HttpReporter:
@@ -25,10 +29,13 @@ class HttpReporter:
     """
 
     def __init__(self, node_uid: str, auth_token: str = "",
-                 base_url: str = TELEMETRY_INGRESS_URL):
+                 base_url: str = ""):
         self.node_uid = node_uid
         self.auth_token = auth_token
-        self.base_url = base_url
+        # Prefer the backend-supplied URL (config.telemetry.ingress_url); fall
+        # back to the module default when the config omits it (older configs or
+        # a bare manual install).
+        self.base_url = base_url or TELEMETRY_INGRESS_URL
 
     def report_status(self, online: bool, uptime: int, firmware_version: str = "0.1.0") -> None:
         payload = {
@@ -51,6 +58,25 @@ class HttpReporter:
                 "readings": readings,
             },
         })
+
+    def report_telemetry_batch(self, batch_id: str, readings: list[dict],
+                               boot_session_id: str = "") -> bool:
+        """POST a durable history batch (ADR-013 §6.2 `telemetry_batch`).
+
+        Distinct from `report_telemetry` (the live channel): this is the
+        durable-history channel drained from the on-node SQLite buffer. Each
+        reading carries its own `tsMs`/`seq` and optional `tsUncertain`. Returns
+        True on HTTP 200 so the uploader only prunes the buffer on confirmed
+        delivery.
+        """
+        payload = {
+            "nodeUid": self.node_uid,
+            "batchId": batch_id,
+            "readings": readings,
+        }
+        if boot_session_id:
+            payload["bootSessionId"] = boot_session_id
+        return self._post({"type": "telemetry_batch", "payload": payload})
 
     def report_command_ack(self, command_id: str, status: str,
                            applied_value=None, error: str = None) -> None:
@@ -131,7 +157,10 @@ class HttpReporter:
             headers["Authorization"] = f"Bearer {self.auth_token}"
         return headers
 
-    def _post(self, data: dict) -> None:
+    def _post(self, data: dict) -> bool:
+        """POST an envelope to the ingress. Returns True iff the server replied
+        200 — the durable batch path relies on this to prune only on confirmed
+        delivery; the fire-and-forget callers ignore the return value."""
         try:
             body = json.dumps(data).encode("utf-8")
             req = urllib.request.Request(
@@ -143,7 +172,10 @@ class HttpReporter:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 if resp.status != 200:
                     logger.warning("HTTP report failed: %d", resp.status)
+                    return False
+                return True
         except urllib.error.URLError as e:
             logger.warning("HTTP report error: %s", e)
         except Exception as e:
             logger.warning("HTTP report unexpected error: %s", e)
+        return False

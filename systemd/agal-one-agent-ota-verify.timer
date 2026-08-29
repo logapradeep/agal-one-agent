@@ -1,0 +1,16 @@
+[Unit]
+Description=Periodic managed-OTA rollback check for Agal One Agent
+
+[Timer]
+# Fire 60s after boot, then every 60s. Cheap (reads ota_state.json) and only
+# acts when a pending_verify update is past its deadline. A healthy update
+# self-confirms within ~PROBATION_WINDOW_S, well before the deadline, so this
+# never rolls back a good version. Worst-case rollback latency after a bad
+# update ≈ deadline + one timer period.
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=10s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.6
 
-# Menvayal Agent container — built for balena fleet deployment.
+# Agal One Agent container — built for balena fleet deployment.
 #
 # The image targets every Raspberry Pi that ships in v1 (Zero 2 W / 3 / 4 / 5)
 # via `%%BALENA_MACHINE_NAME%%`, which the balena builder substitutes per-device
@@ -24,16 +24,16 @@ RUN install_packages \
 ENV INITSYSTEM=off
 ENV UDEV=on
 
-# Application code is installed in /opt/agal-agent (matches the systemd
+# Application code is installed in /opt/agal-one-agent (matches the systemd
 # install path so any future fallback to systemd keeps the same layout).
-WORKDIR /opt/agal-agent
+WORKDIR /opt/agal-one-agent
 
 # Copy dependency manifests first to leverage Docker layer caching.
 COPY requirements.txt setup.py ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the agent source and install in editable mode.
-COPY agal_agent ./agal_agent
+COPY agal_one_agent ./agal_one_agent
 COPY scripts ./scripts
 COPY systemd ./systemd
 RUN pip install --no-cache-dir -e . \
@@ -41,6 +41,6 @@ RUN pip install --no-cache-dir -e . \
 
 # Writable directories that the agent uses at runtime. balena will mount
 # named volumes here per docker-compose.yml so they survive image updates.
-RUN mkdir -p /var/lib/agal-agent /etc/agal-agent
+RUN mkdir -p /var/lib/agal-one-agent /etc/agal-one-agent
 
-ENTRYPOINT ["/opt/agal-agent/scripts/entrypoint.sh"]
+ENTRYPOINT ["/opt/agal-one-agent/scripts/entrypoint.sh"]

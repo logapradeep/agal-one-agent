@@ -1,5 +1,86 @@
 # Changelog — agal-one-agent
 
+## 0.1.8 (unreleased, 2026-07-07)
+
+ADR-013 P0 (telemetry durability) + ADR-011 v1 (raw-LoRa, DARK).
+
+- **Durable telemetry ring buffer (ADR-013 §5, P0):** new
+  `agal_one_agent/telemetry_buffer.py` — a SQLite WAL ring buffer at
+  `/var/lib/agal-one-agent/telemetry.db` (stdlib `sqlite3`, no new dep). Every
+  sampling cycle appends readings (ts + monotonic seq + boot-session id)
+  **before** the live publish, so a network outage becomes a delay, not a hole
+  in *paid* history. Ring bounds: keeps ≥48 h (configurable), hard caps
+  7 days / 64 MB, drop-oldest with a one-time `buffer_overflow` sensor_event on
+  first drop. WAL + `synchronous=NORMAL` = one fsync per batch commit (SD-card
+  wear).
+- **Batch uploader (ADR-013 §5.2/§5.3):** new
+  `agal_one_agent/telemetry_uploader.py` — a background thread drains the buffer
+  to the ingress in `telemetry_batch` payloads (≤500 readings / ≤256 KB, oldest-
+  first within tier priority — raw drains before basic), with exponential
+  backoff + jitter (1 s → 5 min cap) and on-success prune. Rows are marked sent
+  only on HTTP 200. Woken on MQTT reconnect to flush an outage backlog.
+  `HttpReporter.report_telemetry_batch()` emits the `telemetry_batch` envelope
+  and rides the existing `Authorization: Bearer` header (v0.1.7); `_post()` now
+  returns success so the uploader prunes only on confirmed delivery.
+- **Adaptive live cadence (ADR-013 §9-D3, ratified):** new
+  `agal_one_agent/live_cadence.py` — publishes the live snapshot every 10 s
+  while an app is watching, else 60 s (config `telemetry.live_idle_seconds`).
+  The watch signal arrives via a new `liveWatch` MQTT command (backend forwards
+  a presence/onSnapshot heartbeat; a config default covers bench/dev); a watch
+  is held for a TTL then decays back to idle so a closed app relaxes the node
+  automatically. `TelemetryPublisher` re-evaluates the interval each cycle.
+- **Clock discipline (ADR-013 §5.4):** buffered readings carry `ts_uncertain`
+  when the wall clock is pre-NTP; `TelemetryBuffer.heal_uncertain_clock()`
+  re-bases them from the observed correction once time is trusted; whatever
+  stays uncertain uploads with `tsUncertain: true` for the server to stamp
+  receive-time.
+- **Raw-LoRa star listener — DARK (ADR-011 v1, §6/§10):** new
+  `agal_one_agent/lora_listener.py` — an SX127x (SX1276/SX1278) SPI reader
+  scaffold. **Inert by default:** `spidev` is import-guarded (like the BNO055
+  driver) and the listener only goes live when `lora.mode == "raw_star"` AND
+  `lora.enabled` AND spidev is importable — none true on any current node.
+  Implements (testable without hardware): compact leaf-frame header decode
+  (ver+type · childShortId · seq · encrypted CBOR body · MIC), seq dedupe with a
+  16-wide reorder window, 60 s pairing window, `lora_survey_sample` emission for
+  the placement signal meter, `lora_child_status` (battery/rssi/snr/quality),
+  the §10.3 quality-word thresholds (margin formula, SF-independent) and §10.4
+  tri-state link-state freshness. LoRa readings enter the **same** buffer + live
+  path as wired children, sourceKey `lora.<childShortId>.<portKey>`. The
+  register-level SX127x RX driver and the AES-128-CCM body decode are documented
+  TODOs gated on the P0 bench spike (ADR-011 R1); the AES-128 per-farm key is a
+  documented placeholder (`FARM_KEY_PLACEHOLDER`; `K_farm` lives in Secret
+  Manager, only `farmKeyId` on the node doc). New MQTT publishers
+  `publish_lora_survey_sample` / `publish_lora_child_status` and a
+  `loraPairingWindow` command.
+- **Config (ADR-013 §5.7 / ADR-011 §6):** `telemetry.batch{flush_interval_sec,
+  max_readings, buffer_max_mb, retention_hours}`, `telemetry.live_watch_default`,
+  `telemetry.live_idle_seconds`, `telemetry.buffer_db_path`; `lora.{mode,
+  enabled, region, farm_key_id, radio{...}}` for the raw-star block +
+  `is_lora_raw_star` property. All additive with safe defaults; existing
+  configs parse unchanged and stay live-only + LoRa-dark.
+- **setup.py:** bumped to **0.1.8**; `extras_require["rpi"]` gains
+  `cryptography>=42.0` (for the future LoRa AES-CCM path; import-guarded/unused
+  today). `spidev` now also serves the LoRa listener. Core deps unchanged.
+- **Tests:** +67 (58 → **125 passing**) — ring buffer append/drain/prune/
+  overflow/clock-heal/priority (`test_telemetry_buffer.py`), uploader
+  drain/backoff/outage-recovery (`test_telemetry_uploader.py`), LoRa frame
+  decoder/dedupe/survey/quality-word/link-state/dark-gate
+  (`test_lora_listener.py`), cadence switch/TTL (`test_live_cadence.py`), config
+  parsing (`test_config_p0_lora.py`), and P0 wire-shape + buffer-first
+  integration (`test_p0_wire_integration.py`).
+
+> **v0.1.8 OTA still founder-gated:** shipping this to nodes needs the
+> rename-finalize (the uncommitted `agal_agent → agal_one_agent` WIP + the
+> hand-applied v0.1.6 port both still sit in the working tree — see the 0.1.7
+> note below) followed by a `v0.1.8` tag. This P0/LoRa work was added on top of
+> that working tree and mirrors how the v0.1.6 port was handled. Coordinate the
+> ingress side: `telemetryIngress` must gain the `telemetry_batch` handler +
+> authToken check and the `lora_survey_sample` / `lora_child_status` intake
+> (owned by the backend agent this wave) before the buffer's batches land
+> anywhere — until then a v0.1.8 node still publishes the unchanged live channel
+> and simply retains batches in its buffer (no data loss, no server 200 → no
+> prune).
+
 ## 0.1.7 (unreleased, 2026-07-06)
 
 - **Telemetry ingress authentication (ADR-013 P0.5):** `HttpReporter` now
@@ -22,17 +103,32 @@
 - setup.py: added `adafruit-blinka` + `adafruit-circuitpython-bno055` to
   `extras_require["rpi"]`.
 
+- **v0.1.6 provisioning fixes PORTED into this branch (2026-07-06):** a plain
+  `git merge v0.1.6` was not possible — the working tree carries the large
+  uncommitted `agal_agent → agal_one_agent` rename, so the three v0.1.6 code
+  hunks were applied by hand onto the renamed files instead:
+  `TelemetryConfig.ingress_url` (config-driven, parsed from
+  `telemetry.ingress_url`); `HttpReporter(base_url="")` now resolves
+  `base_url or TELEMETRY_INGRESS_URL`; `main.py` passes
+  `config.telemetry.ingress_url`. The module-default URLs were also moved off
+  the retired us-central1 hosts — **both** `TELEMETRY_INGRESS_URL` **and**
+  `BOOT_STATE_URL` now point at `asia-south1-agal-one-prod.cloudfunctions.net`
+  (the latter closes the separately-known dead-`getBootState` `-uc` URL bug).
+  All 58 tests pass with the port + BNO055 + auth-header changes coexisting.
+  NOTE: applied in the working tree but left UNCOMMITTED — it belongs in the
+  founder's rename-finalization commit; commit the rename + this port together
+  before tagging v0.1.7 for OTA. `getBootState`'s asia-south1 deployment should
+  be curl-verified before the OTA (URL format is the canonical gen2 alias, but
+  the endpoint's live presence in that region was not verified here).
+
 ### Version-number reconciliation note
 
 `v0.1.6` ("config-driven telemetry ingress URL + agal-one-agent entry point",
 commit `25cd7f3`, tagged on origin/main and deployed to nodes 2026-07-05) was
-released from the **pre-rename `menvayal_agent` lineage** and is *not yet
-merged* into this `refactor/rename-to-agal-one-agent` branch — the working
-tree here still read `0.1.5` before this change. To avoid colliding with the
-released tag, this branch jumps straight to `0.1.7`. **Before tagging v0.1.7
-for OTA, merge/port the v0.1.6 changes (notably the config-driven
-`telemetry.ingress_url`) into this branch**, or nodes updating 0.1.6 → 0.1.7
-would regress the 2026-07-05 provisioning fixes.
+released from the **pre-rename `menvayal_agent` lineage**. Its changes are now
+ported into this `refactor/rename-to-agal-one-agent` branch (see the entry
+above). To avoid colliding with the released tag, this branch jumps straight
+to `0.1.7`.
 
 ## 0.1.6 (2026-07-05, released from origin/main — not in this branch yet)
 

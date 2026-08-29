@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render /etc/agal-agent/config.yaml from balena environment variables.
+"""Render /etc/agal-one-agent/config.yaml from balena environment variables.
 
 Called by entrypoint.sh on every container start. Idempotent — overwrites
 the file each boot, since per-device balena variables are the source of truth
@@ -44,7 +44,7 @@ def env_bool(name: str, default: bool) -> bool:
 
 
 def main() -> int:
-    out_path = Path(sys.argv[1] if len(sys.argv) > 1 else "/etc/agal-agent/config.yaml")
+    out_path = Path(sys.argv[1] if len(sys.argv) > 1 else "/etc/agal-one-agent/config.yaml")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Preserve runtime-mutable fields (pins, lora) if the file already exists.

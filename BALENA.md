@@ -1,4 +1,4 @@
-# Menvayal Agent — balena fleet operator guide
+# Agal One Agent — balena fleet operator guide
 
 This is the production deployment path for v1 launch. The legacy systemd / git-pull installer (`scripts/install.sh` + `ota_updater.py`) still works for bench / dev workstations but is **not** the launch deployment target.
 
@@ -12,7 +12,7 @@ Per [TECH_DEBT.md P0-4](../../TECH_DEBT.md), balena.io is the v1 OTA mechanism. 
 | `docker-compose.yml` | Single privileged service, `network_mode: host`, persistent named volumes for state + rendered config. |
 | `balena.yml` | Fleet metadata + supported device-type list (RPi 2/3/4/5 + Zero 2 W). |
 | `scripts/entrypoint.sh` | Renders config and launches the agent under PID 1. |
-| `scripts/render_config.py` | Translates balena env vars into `/etc/agal-agent/config.yaml`. Idempotent. Preserves runtime-mutable `pins` from the existing file. |
+| `scripts/render_config.py` | Translates balena env vars into `/etc/agal-one-agent/config.yaml`. Idempotent. Preserves runtime-mutable `pins` from the existing file. |
 | `.dockerignore` | Keeps tests, docs, and venvs out of the image. |
 
 ## One-time fleet setup
@@ -25,8 +25,8 @@ Per [TECH_DEBT.md P0-4](../../TECH_DEBT.md), balena.io is the v1 OTA mechanism. 
    ```
 3. **Create the fleet** (one fleet per environment — `agal-one-prod` and `agal-one-dev`):
    ```sh
-   balena fleet create agal-agent-prod  --type raspberrypi3-64
-   balena fleet create agal-agent-dev   --type raspberrypi3-64
+   balena fleet create agal-one-agent-prod  --type raspberrypi3-64
+   balena fleet create agal-one-agent-dev   --type raspberrypi3-64
    ```
    Picking `raspberrypi3-64` as the canonical type makes Pi 3/4/5 compatible. Pi Zero 2 W needs its own fleet OR you can mix device types in one fleet — pick what's simpler for launch.
 
@@ -44,8 +44,8 @@ Per [TECH_DEBT.md P0-4](../../TECH_DEBT.md), balena.io is the v1 OTA mechanism. 
 
 5. **Push the image** to the fleet from this directory:
    ```sh
-   cd Menvayal/daemon/agal-agent
-   balena push agal-agent-prod
+   cd Agal/daemon/agal-one-agent
+   balena push agal-one-agent-prod
    ```
    balena builds in their cloud, multi-arch for every supported device type, and rolls out to every device in the fleet. First push takes ~5–10 minutes; subsequent pushes are incremental (~1–2 min).
 
@@ -56,7 +56,7 @@ For each Pi installed at a farm:
 1. **Generate a `balena-cloud.img`** (one-time per release / OS version):
    ```sh
    balena os download raspberrypi3-64 --version latest --output ./balena-os.img
-   balena os configure ./balena-os.img --fleet agal-agent-prod --version latest
+   balena os configure ./balena-os.img --fleet agal-one-agent-prod --version latest
    ```
    This produces a bootable SD-card image preconfigured to join the fleet.
 
@@ -72,7 +72,7 @@ For each Pi installed at a farm:
    | `NODE_TYPE` | `link_rio` (default), `lora_gateway`, or `lora_device` | Per asset type |
    | `BOARD_MODEL` | Optional override | Auto-detected via `reportBoard` Cloud Function endpoint if blank |
 
-   The agent reads these on every container start and writes `/etc/agal-agent/config.yaml` accordingly. Pin assignments (`pins:`) are not in env vars — they're pushed via MQTT after the device comes online and the farmer/technician configures the asset wizard in the app.
+   The agent reads these on every container start and writes `/etc/agal-one-agent/config.yaml` accordingly. Pin assignments (`pins:`) are not in env vars — they're pushed via MQTT after the device comes online and the farmer/technician configures the asset wizard in the app.
 
 4. **Power the Pi on at the farm.** It joins the fleet, pulls the latest image, runs the agent. Status visible in balena dashboard. Logs visible via `balena device logs <device-uuid>`.
 
@@ -81,8 +81,8 @@ For each Pi installed at a farm:
 When the agent code changes:
 
 ```sh
-cd Menvayal/daemon/agal-agent
-balena push agal-agent-prod
+cd Agal/daemon/agal-one-agent
+balena push agal-one-agent-prod
 ```
 
 That's it. balena rolls out to every device in the fleet over the next minutes-to-hours (controllable via fleet-level "update strategy" — default is delta-update + auto-restart, no SSH or git-pull involved).
@@ -90,7 +90,7 @@ That's it. balena rolls out to every device in the fleet over the next minutes-t
 To roll back:
 
 ```sh
-balena release tag list --fleet agal-agent-prod      # find a known-good release ID
+balena release tag list --fleet agal-one-agent-prod      # find a known-good release ID
 balena fleet rename <release-id> --release latest  # pin to that release
 ```
 
@@ -100,8 +100,8 @@ Or use the dashboard UI: Releases → click the older one → Make it the latest
 
 Once balena is the deployment target:
 
-- [`agal_agent/ota_updater.py`](agal_agent/ota_updater.py) becomes dead code. The `perform_update` function isn't called from anywhere in the balena container path. Remove when no devices remain on the legacy systemd path.
-- [`scripts/install.sh`](scripts/install.sh) + [`systemd/agal-agent.service`](systemd/agal-agent.service) stay in the repo for **bench / dev** convenience — testing the agent against real hardware on a laptop-attached Pi without involving balena.
+- [`agal_one_agent/ota_updater.py`](agal_one_agent/ota_updater.py) becomes dead code. The `perform_update` function isn't called from anywhere in the balena container path. Remove when no devices remain on the legacy systemd path.
+- [`scripts/install.sh`](scripts/install.sh) + [`systemd/agal-one-agent.service`](systemd/agal-one-agent.service) stay in the repo for **bench / dev** convenience — testing the agent against real hardware on a laptop-attached Pi without involving balena.
 - The `MQTT_OTA_UPDATE_TOPIC` command type can be repurposed for "trigger a fleet check now" or removed entirely.
 
 These cleanups are P1 — leave them after launch.
