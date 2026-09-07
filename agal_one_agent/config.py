@@ -203,6 +203,7 @@ class BlocksConfig:
     legacy_protection: bool = False
     tick_seconds: float = 1.0
     simulated_io: bool = False
+    bench_port: int = 8765
 
 
 @dataclass
@@ -476,6 +477,7 @@ class AgentConfig:
             legacy_protection=bool(blocks_data.get("legacy_protection", False)),
             tick_seconds=float(blocks_data.get("tick_seconds", 1.0)),
             simulated_io=bool(blocks_data.get("simulated_io", False)),
+            bench_port=int(blocks_data.get("bench_port", 8765)),
         )
 
         return cls(

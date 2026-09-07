@@ -13,7 +13,15 @@ Laptop node for the phone tests (rebuild P4 exit test, `_audit/99`).
   plumbing would (valve open + pump on → the plot's flow switch reads flowing
   after 5 s; pump relay on → rated current after 2 s, nominal 4.5 A while the
   rating is 0; three-phase currents and mains-sense inputs present).
-- Tests: 2 new (218 total). See `LAPTOP_NODE.md`.
+- **`blocks/bench_ui.py`** — the bench page: `http://127.0.0.1:<blocks.bench_port>/`
+  (default 8765, loopback only) shows the in-memory ports, the program version
+  and acknowledgement, the plots with their valves and flow switches, and the
+  bench journal; buttons provoke a dry run (current collapses to 30 %), a lost
+  phase (three-phase pumps), no flow on an open plot, flow on a closed plot, a
+  node outage (runtime stops with safe state, reloads the persisted program,
+  boots and resumes — R-14/R-21) and an offline period (no heartbeat, MQTT
+  disconnected — R-28). `HeartbeatPublisher.pause()/resume()` added for it.
+- Tests: 5 new (221 total). See `LAPTOP_NODE.md`.
 
 ## 0.2.0 (2026-09-07)
 

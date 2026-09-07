@@ -54,6 +54,20 @@ class HeartbeatPublisher:
             self.config.telemetry.heartbeat_seconds,
         )
 
+    def pause(self) -> None:
+        """Go silent (a simulated outage / offline period): no offline status is
+        published — the cloud's heartbeat sweep must notice on its own (R-28)."""
+        self._running = False
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None
+
+    def resume(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._send_heartbeat()
+
     def stop(self) -> None:
         self._running = False
         if self._timer:

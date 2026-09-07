@@ -473,8 +473,18 @@ def main():
             logger.info("Automation runtime started (program v%d)", runtime.version)
         if runtime is not None and config.blocks.simulated_io:
             from .blocks.bench import BenchPhysics
+            from .blocks.bench_ui import BenchUI
             bench_physics = BenchPhysics(runtime, runtime.io)
             bench_physics.start()
+            bench_ui = BenchUI(
+                runtime, bench_physics,
+                mqtt_client=None if args.offline else mqtt_client,
+                heartbeat=None if args.offline else heartbeat,
+                program_sync=program_sync, cloud_sink=cloud_sink,
+                node_uid=config.node.uid, node_name=config.node.name,
+                port=config.blocks.bench_port,
+            )
+            bench_ui.start()
         if _legacy_protection_wanted():
             protection_monitor.start()
             legacy_started = True
