@@ -194,11 +194,15 @@ class BlocksConfig:
     legacy_protection  force the old sensors/protection.py thread even when a program
                        is loaded (bench comparison only; default False).
     tick_seconds       evaluation tick (default 1.0; inputs also trigger passes).
+    simulated_io       run with in-memory ports + bench physics instead of GPIO
+                       (a laptop node for the phone tests; default False). Never
+                       set on a real node.
     """
     enabled: bool = True
     state_dir: str = ""
     legacy_protection: bool = False
     tick_seconds: float = 1.0
+    simulated_io: bool = False
 
 
 @dataclass
@@ -471,6 +475,7 @@ class AgentConfig:
             state_dir=blocks_data.get("state_dir", "") or "",
             legacy_protection=bool(blocks_data.get("legacy_protection", False)),
             tick_seconds=float(blocks_data.get("tick_seconds", 1.0)),
+            simulated_io=bool(blocks_data.get("simulated_io", False)),
         )
 
         return cls(

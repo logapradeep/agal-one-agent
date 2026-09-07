@@ -226,8 +226,16 @@ def main():
 
         state_dir = config.blocks.state_dir or DEFAULT_STATE_DIR
         cloud_sink = CloudSink(mqtt_client, http_reporter, telemetry_buffer, firmware_version=__version__)
+        if config.blocks.simulated_io:
+            # A laptop node (rebuild P4 exit test): in-memory ports answered by
+            # bench physics; the cloud side is the real one.
+            from .blocks.io import SimulatedIO
+            block_io = SimulatedIO()
+            logger.warning("blocks.simulated_io is ON — ports are simulated; this must never run on a farm node")
+        else:
+            block_io = build_hardware_io(config, sensors_by_key(config))
         runtime = BlockRuntime(
-            build_hardware_io(config, sensors_by_key(config)),
+            block_io,
             cloud_sink,
             clock=SystemClock(),
             state_dir=state_dir,
@@ -463,6 +471,10 @@ def main():
         if runtime is not None and runtime.nab is not None:
             runtime.start()
             logger.info("Automation runtime started (program v%d)", runtime.version)
+        if runtime is not None and config.blocks.simulated_io:
+            from .blocks.bench import BenchPhysics
+            bench_physics = BenchPhysics(runtime, runtime.io)
+            bench_physics.start()
         if _legacy_protection_wanted():
             protection_monitor.start()
             legacy_started = True
