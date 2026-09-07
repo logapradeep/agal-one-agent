@@ -1,0 +1,4 @@
+[console_scripts]
+agal-one-agent = agal_one_agent.main:main
+agal-one-agent-ota-verify = agal_one_agent.ota_updater:main_verify
+agal-one-agent-sim = agal_one_agent.blocks.simulate:main

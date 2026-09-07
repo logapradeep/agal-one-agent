@@ -1,5 +1,36 @@
 # Changelog — agal-one-agent
 
+## 0.2.0 (2026-09-07)
+
+Automation-block runtime — ADR-017 (contracts v1.5.0); rebuild phase P1 of
+`_audit/99-rebuild-plan.md`. The node now executes the program the cloud
+compiles for it (a Node Automation Block plus every asset's Asset Automation
+Block) and is the single writer of every output; the hard-coded protection
+thread is no longer started when a program is loaded.
+
+- **`agal_one_agent/blocks/`** — `expr` (Python port of the reference expression
+  parser; passes the shared golden vectors), `runtime` (`BlockRuntime`: compile
+  with full semantic validation, 1 s tick + input-driven passes, `when` /
+  `sequence` / `limit` / `on` rules, schedules with sunrise/sunset, plots and the
+  pump interlock, baselines, interruptions, persistence, acknowledgement,
+  safe-state on stop), `io` (`SimulatedIO`, `HardwareIO`), `clock`
+  (`SystemClock` with NTP/RTC probing, `SimClock`), `sun`, `sync`
+  (`ProgramStore`, `ProgramSync`: `getProgram` pull → compile → persist →
+  `programAck`), `cloud` (`CloudSink` fan-out, capabilities, heartbeat extras),
+  `simulate` (`agal-one-agent-sim` CLI — the simulated bench).
+- **Wire (telemetryIngress v1.5.0):** `programAck`, `variables`, `alert`
+  messages over HTTPS (`HttpReporter`) and on the MQTT status topic
+  (`AgalOneMqttClient`); `getProgram` pull; heartbeat `status` carries
+  `programVersion`, `programStatus`, `capabilities`.
+- **Commands:** `syncProgram {version}` (pull + apply + ack), `runPlot`,
+  `stopPlot`, `setVariable`; `setPower` / `setPortValue` on a port the program
+  owns are routed through the runtime (interruption semantics, R-23).
+- **Config:** `blocks: {enabled, state_dir, legacy_protection, tick_seconds}`;
+  `agal-one-agent --offline` runs the persisted program without the cloud.
+- **Tests:** 82 new (expression vectors, simulated-bench scenarios for R-7,
+  R-8, R-10 to R-16, R-19 to R-23, R-25, sync/ack, envelopes); 207 total.
+- Version constants unified on package metadata (`__version__`).
+
 ## 0.1.8 (unreleased, 2026-07-07)
 
 ADR-013 P0 (telemetry durability) + ADR-011 v1 (raw-LoRa, DARK).

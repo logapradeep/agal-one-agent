@@ -2,10 +2,10 @@ from setuptools import setup, find_packages
 
 setup(
     name="agal-one-agent",
-    # NOTE: v0.1.6 was released/deployed from origin/main (commit 25cd7f3, still
-    # on the pre-rename `menvayal_agent` package lineage) and is NOT merged into
-    # this rename branch yet — see CHANGELOG.md. 0.1.7/0.1.8 are on this branch.
-    version="0.1.8",
+    # 0.2.0 (2026-09-07): automation-block runtime (ADR-017, contracts v1.5.0).
+    # NOTE: the fleet provisioner still pins v0.1.6 until the backend side of
+    # ADR-017 (rebuild phase P2) lands; 0.1.7/0.1.8 were never tagged.
+    version="0.2.0",
     packages=find_packages(),
     install_requires=[
         "paho-mqtt>=2.0.0",
@@ -37,6 +37,7 @@ setup(
         "console_scripts": [
             "agal-one-agent=agal_one_agent.main:main",
             "agal-one-agent-ota-verify=agal_one_agent.ota_updater:main_verify",
+            "agal-one-agent-sim=agal_one_agent.blocks.simulate:main",
         ],
     },
     python_requires=">=3.9",

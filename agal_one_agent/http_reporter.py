@@ -5,6 +5,7 @@ import logging
 import time
 import urllib.request
 import urllib.error
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,8 @@ class HttpReporter:
         # a bare manual install).
         self.base_url = base_url or TELEMETRY_INGRESS_URL
 
-    def report_status(self, online: bool, uptime: int, firmware_version: str = "0.1.0") -> None:
+    def report_status(self, online: bool, uptime: int, firmware_version: str = "0.1.0",
+                      extra: Optional[dict] = None) -> None:
         payload = {
             "nodeUid": self.node_uid,
             "online": online,
@@ -48,7 +50,62 @@ class HttpReporter:
         mac = get_primary_mac()
         if mac:
             payload["mac"] = mac
+        if extra:
+            payload.update(extra)  # programVersion / programStatus / capabilities (v0.2.0)
         self._post({"type": "status", "payload": payload})
+
+    # ---- Automation blocks (ADR-017, contracts v1.5.0) -----------------------
+
+    def _sibling_url(self, function_name: str) -> str:
+        """The ingress URL's sibling function on the same host/region."""
+        return self.base_url.rsplit("/", 1)[0] + "/" + function_name
+
+    def fetch_program(self, current_version: Optional[int] = None) -> Optional[dict]:
+        """POST getProgram {nodeUid, currentVersion?} → {version, bundle} or {version, unchanged}.
+        Returns None on transport failure (the caller keeps its current program)."""
+        body: dict = {"nodeUid": self.node_uid}
+        if current_version:
+            body["currentVersion"] = int(current_version)
+        try:
+            req = urllib.request.Request(
+                self._sibling_url("getProgram"),
+                data=json.dumps(body).encode("utf-8"),
+                headers=self._headers(),
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                if resp.status != 200:
+                    logger.warning("getProgram failed: %d", resp.status)
+                    return None
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("getProgram error: %s", e)
+            return None
+
+    def report_program_ack(self, version: int, status: str, reason: Optional[str] = None,
+                           firmware_version: Optional[str] = None) -> bool:
+        payload: dict = {"nodeUid": self.node_uid, "version": int(version), "status": status,
+                         "timestamp": int(time.time() * 1000)}
+        if reason:
+            payload["reason"] = reason[:500]
+        if firmware_version:
+            payload["firmwareVersion"] = firmware_version
+        return self._post({"type": "programAck", "payload": payload})
+
+    def report_variables(self, asset_id: str, values: dict) -> bool:
+        return self._post({"type": "variables", "payload": {
+            "nodeUid": self.node_uid, "assetId": asset_id, "values": values,
+            "ts": int(time.time() * 1000)}})
+
+    def report_alert(self, text: str, severity: str, rule_id: Optional[str] = None,
+                     asset_id: Optional[str] = None) -> bool:
+        payload: dict = {"nodeUid": self.node_uid, "text": text[:200], "severity": severity,
+                         "timestamp": int(time.time() * 1000)}
+        if rule_id:
+            payload["ruleId"] = rule_id
+        if asset_id:
+            payload["assetId"] = asset_id
+        return self._post({"type": "alert", "payload": payload})
 
     def report_telemetry(self, readings: list[dict]) -> None:
         self._post({

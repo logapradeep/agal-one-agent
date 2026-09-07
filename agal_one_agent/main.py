@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 
+from . import __version__
 from .config import AgentConfig, PinConfig
 from .mqtt_client import AgalOneMqttClient
 from .command_executor import execute, register_sensor, _get_handler
@@ -41,6 +42,11 @@ def main():
         action="store_true",
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Run the persisted automation program without the cloud (no MQTT, no ingress); bench/dev only",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -48,7 +54,7 @@ def main():
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
-    logger.info("Agal One Agent v0.1.8 starting")
+    logger.info("Agal One Agent v%s starting%s", __version__, " (OFFLINE)" if args.offline else "")
     logger.info("Loading config from %s", args.config)
 
     try:
@@ -59,7 +65,7 @@ def main():
 
     # Initialize Sentry as early as possible AFTER config load, so the node_uid
     # tag is attached to every event. No-op if SENTRY_DSN is unset (dev / bench).
-    init_sentry(node_uid=config.node.uid, agent_version="0.1.8")
+    init_sentry(node_uid=config.node.uid, agent_version=__version__)
 
     logger.info("Node: %s (%s)", config.node.name, config.node.uid)
     logger.info("Board: %s (%s)", config.board.model, config.board.category)
@@ -72,6 +78,14 @@ def main():
 
     # MQTT client (cloud — HiveMQ)
     mqtt_client = AgalOneMqttClient(config.mqtt)
+
+    # HTTP reporter for backend status updates. auth_token → Authorization:
+    # Bearer header on every report (ADR-013 P0.5 telemetryIngress auth).
+    # base_url comes from the backend-generated config (telemetry.ingress_url,
+    # v0.1.6 config-driven region); HttpReporter falls back to its module
+    # default when that's empty.
+    http_reporter = HttpReporter(config.node.uid, auth_token=config.node.auth_token,
+                                 base_url=config.telemetry.ingress_url)
 
     # LoRa bridge (local — ChirpStack Gateway Bridge)
     lora_bridge = None
@@ -166,6 +180,9 @@ def main():
     def event_publisher(event: dict) -> None:
         mqtt_client.publish_event(event)
 
+    # Legacy hard-coded protection (sensors/protection.py). Started only when no
+    # automation program is loaded (or blocks.legacy_protection forces it): with a
+    # program, the block runtime is the single writer of every output (ADR-017).
     protection_monitor: ProtectionMonitor | None = None
     if current_sensors or ultrasonic_sensors:
         protection_monitor = ProtectionMonitor(
@@ -197,6 +214,37 @@ def main():
         idle_interval_sec=config.telemetry.live_idle_seconds,
         default_watching=config.telemetry.live_watch_default,
     )
+
+    # ---- Automation-block runtime (ADR-017, contracts v1.5.0) ----------------
+    runtime = None
+    program_sync = None
+    cloud_sink = None
+    if config.blocks.enabled:
+        from .blocks import BlockRuntime, SystemClock
+        from .blocks.cloud import CloudSink, build_hardware_io, sensors_by_key
+        from .blocks.sync import ProgramStore, ProgramSync, DEFAULT_STATE_DIR
+
+        state_dir = config.blocks.state_dir or DEFAULT_STATE_DIR
+        cloud_sink = CloudSink(mqtt_client, http_reporter, telemetry_buffer, firmware_version=__version__)
+        runtime = BlockRuntime(
+            build_hardware_io(config, sensors_by_key(config)),
+            cloud_sink,
+            clock=SystemClock(),
+            state_dir=state_dir,
+            tick_seconds=config.blocks.tick_seconds,
+        )
+        program_sync = ProgramSync(runtime, ProgramStore(state_dir), http_reporter)
+        if program_sync.load_persisted():
+            logger.info("Automation program v%d loaded from %s", runtime.version, state_dir)
+        else:
+            logger.info("No automation program persisted yet (state dir %s)", state_dir)
+
+    def _legacy_protection_wanted() -> bool:
+        if protection_monitor is None:
+            return False
+        if config.blocks.legacy_protection:
+            return True
+        return runtime is None or runtime.nab is None
 
     # ---- Raw-LoRa star listener (ADR-011 v1) — DARK unless enabled -----------
     lora_listener = None
@@ -298,24 +346,55 @@ def main():
             mqtt_client.publish_command_ack(command_id, "completed")
             return
 
+        # ---- Automation blocks (ADR-017) -------------------------------------
+        # syncProgram {version}: the cloud recompiled our bundle — pull it,
+        # compile, persist, acknowledge (programAck over HTTPS + MQTT).
+        if cmd_type == "syncProgram":
+            if program_sync is None:
+                mqtt_client.publish_command_ack(command_id, "failed", error="automation blocks disabled")
+                return
+            mqtt_client.publish_command_ack(command_id, "completed")
+            program_sync.pull(expected_version=command.get("version"))
+            return
+
+        if cmd_type in ("runPlot", "stopPlot", "setVariable"):
+            if runtime is None or runtime.nab is None:
+                mqtt_client.publish_command_ack(command_id, "failed", error="no automation program loaded")
+                return
+            result = runtime.apply_command(command)
+            if result.get("accepted"):
+                mqtt_client.publish_command_ack(command_id, "completed")
+            else:
+                mqtt_client.publish_command_ack(command_id, "failed", error=result.get("reason"))
+            return
+
+        # setPower / setPortValue on a port the program owns → the runtime is the
+        # single writer (an app toggle becomes an interruption, R-23). Ports the
+        # program does not own fall through to the legacy executor unchanged.
+        if cmd_type in ("setPower", "setPortValue") and runtime is not None and runtime.nab is not None:
+            if runtime.owns_port(command.get("assetId"), command.get("sourceKey") or "device.power"):
+                mqtt_client.publish_command_ack(command_id, "acknowledged")
+                result = runtime.apply_command(command)
+                if result.get("accepted"):
+                    mqtt_client.publish_command_ack(command_id, "completed", applied_value=command.get("value"))
+                else:
+                    mqtt_client.publish_command_ack(command_id, "failed", error=result.get("reason"))
+                return
+
         # Regular GPIO/pin commands
-        execute(config, mqtt_client, command, protection_monitor=protection_monitor)
+        execute(config, mqtt_client, command,
+                protection_monitor=protection_monitor if _legacy_protection_wanted() else None)
 
     mqtt_client.set_command_handler(on_command)
 
-    # HTTP reporter for backend status updates. auth_token → Authorization:
-    # Bearer header on every report (ADR-013 P0.5 telemetryIngress auth).
-    # base_url comes from the backend-generated config (telemetry.ingress_url,
-    # v0.1.6 config-driven region); HttpReporter falls back to its module
-    # default when that's empty.
-    http_reporter = HttpReporter(config.node.uid, auth_token=config.node.auth_token,
-                                 base_url=config.telemetry.ingress_url)
-
     # Reconnect handler — reconcile state when MQTT reconnects after a drop,
-    # and nudge the uploader to drain the backlog accumulated during the outage.
+    # nudge the uploader to drain the backlog accumulated during the outage,
+    # and pull the program in case a syncProgram poke was missed.
     def on_reconnect():
         boot_reconciler.reconcile(config, mqtt_client, http_reporter)
         uploader.wake()
+        if program_sync is not None:
+            program_sync.pull()
 
     mqtt_client.set_reconnect_handler(on_reconnect)
 
@@ -325,7 +404,15 @@ def main():
                                    buffer=telemetry_buffer, cadence=cadence)
     uploader = TelemetryUploader(telemetry_buffer, http_reporter,
                                  config=config.telemetry.batch.to_batch_config())
-    heartbeat = HeartbeatPublisher(config, mqtt_client, http_reporter=http_reporter)
+
+    def _heartbeat_extra():
+        if runtime is None:
+            return None
+        from .blocks.cloud import heartbeat_extra
+        return heartbeat_extra(runtime, config, cloud_sink)
+
+    heartbeat = HeartbeatPublisher(config, mqtt_client, http_reporter=http_reporter,
+                                   extra_provider=_heartbeat_extra)
 
     # Graceful shutdown
     running = True
@@ -339,21 +426,25 @@ def main():
     signal.signal(signal.SIGINT, shutdown)
 
     # Start
+    legacy_started = False
     try:
-        mqtt_client.connect()
+        if args.offline:
+            logger.warning("OFFLINE: not connecting to MQTT or the ingress; running the persisted program only")
+        else:
+            mqtt_client.connect()
 
-        # Wait for connection
-        for _ in range(30):
-            if mqtt_client.is_connected:
-                break
-            time.sleep(1)
+            # Wait for connection
+            for _ in range(30):
+                if mqtt_client.is_connected:
+                    break
+                time.sleep(1)
 
-        if not mqtt_client.is_connected:
-            logger.error("Failed to connect to MQTT broker")
-            sys.exit(1)
+            if not mqtt_client.is_connected:
+                logger.error("Failed to connect to MQTT broker")
+                sys.exit(1)
 
         # Start LoRa bridge if this is a LoRaWAN gateway node (legacy path)
-        if lora_bridge:
+        if lora_bridge and not args.offline:
             lora_bridge.start()
             logger.info("LoRa bridge started")
 
@@ -362,20 +453,31 @@ def main():
         if lora_listener is not None:
             lora_listener.start()
 
-        telemetry.start()
-        uploader.start()
-        heartbeat.start()
-        if protection_monitor is not None:
-            protection_monitor.start()
+        if not args.offline:
+            telemetry.start()
+            uploader.start()
+            heartbeat.start()
 
-        # Reconcile pin states with cloud on boot
-        boot_reconciler.reconcile(config, mqtt_client, http_reporter)
+        # The block runtime runs with or without the cloud; the legacy protection
+        # thread only when there is no program to replace it.
+        if runtime is not None and runtime.nab is not None:
+            runtime.start()
+            logger.info("Automation runtime started (program v%d)", runtime.version)
+        if _legacy_protection_wanted():
+            protection_monitor.start()
+            legacy_started = True
+
+        if not args.offline:
+            # Reconcile pin states with cloud on boot, then pull the program.
+            boot_reconciler.reconcile(config, mqtt_client, http_reporter)
+            if program_sync is not None:
+                program_sync.pull()
 
         # OTA probation: if we just booted after an OTA install, confirm health
         # once we've stayed connected for the probation window. If we crash or
         # never connect before then, the independent verify-timer rolls us back.
         from . import ota_updater
-        if ota_updater.read_state().get("phase") == "pending_verify":
+        if not args.offline and ota_updater.read_state().get("phase") == "pending_verify":
             logger.info(
                 "OTA: booted in probation (target=%s); self-confirming in %ds if still healthy",
                 ota_updater.read_state().get("target"), ota_updater.PROBATION_WINDOW_S,
@@ -395,11 +497,25 @@ def main():
 
         while running:
             time.sleep(1)
+            # A program that arrives after boot starts the runtime and retires the
+            # legacy protection thread (single writer per output).
+            if runtime is not None and runtime.nab is not None and not runtime._running:
+                runtime.start()
+                logger.info("Automation runtime started (program v%d)", runtime.version)
+                if legacy_started and protection_monitor is not None and not config.blocks.legacy_protection:
+                    protection_monitor.stop()
+                    legacy_started = False
+                    logger.info("Legacy protection thread stopped — the program owns the outputs now")
 
     except KeyboardInterrupt:
         pass
     finally:
         logger.info("Stopping services...")
+        if runtime is not None:
+            try:
+                runtime.stop(safe_state=True)
+            except Exception as e:  # noqa: BLE001
+                logger.error("runtime stop failed: %s", e)
         telemetry.stop()
         # Final drain attempt so a clean shutdown doesn't strand buffered rows.
         try:
@@ -407,8 +523,9 @@ def main():
         except Exception as e:  # noqa: BLE001
             logger.debug("Final drain on shutdown failed: %s", e)
         uploader.stop()
-        heartbeat.stop()
-        if protection_monitor is not None:
+        if not args.offline:
+            heartbeat.stop()
+        if protection_monitor is not None and legacy_started:
             protection_monitor.stop()
         if lora_listener is not None:
             lora_listener.stop()

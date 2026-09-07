@@ -1,0 +1,21 @@
+Metadata-Version: 2.4
+Name: agal-one-agent
+Version: 0.2.0
+Requires-Python: >=3.9
+License-File: LICENSE
+Requires-Dist: paho-mqtt>=2.0.0
+Requires-Dist: PyYAML>=6.0
+Provides-Extra: rpi
+Requires-Dist: RPi.GPIO>=0.7.1; extra == "rpi"
+Requires-Dist: gpiozero>=2.0; extra == "rpi"
+Requires-Dist: smbus2>=0.4.3; extra == "rpi"
+Requires-Dist: spidev>=3.6; extra == "rpi"
+Requires-Dist: pyserial>=3.5; extra == "rpi"
+Requires-Dist: w1thermsensor>=2.3.0; extra == "rpi"
+Requires-Dist: adafruit-blinka>=8.0; extra == "rpi"
+Requires-Dist: adafruit-circuitpython-bno055>=5.4; extra == "rpi"
+Requires-Dist: cryptography>=42.0; extra == "rpi"
+Dynamic: license-file
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: requires-python

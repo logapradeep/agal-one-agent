@@ -183,6 +183,25 @@ class LoRaConfig:
 
 
 @dataclass
+class BlocksConfig:
+    """Automation-block runtime (ADR-017, contracts v1.5.0) — ``blocks:`` section.
+
+    enabled            run the NAB/AAB runtime (default True). With a persisted or
+                       pulled program the runtime is the single writer of every
+                       output; the legacy hard-coded protection thread is not started.
+    state_dir          where program.json / blocks_state.json / baselines live
+                       (default /var/lib/agal-one-agent).
+    legacy_protection  force the old sensors/protection.py thread even when a program
+                       is loaded (bench comparison only; default False).
+    tick_seconds       evaluation tick (default 1.0; inputs also trigger passes).
+    """
+    enabled: bool = True
+    state_dir: str = ""
+    legacy_protection: bool = False
+    tick_seconds: float = 1.0
+
+
+@dataclass
 class AgentConfig:
     node: NodeConfig
     mqtt: MqttConfig
@@ -193,6 +212,7 @@ class AgentConfig:
     cellular: Optional[CellularConfig] = None
     lora: Optional[LoRaConfig] = None
     pins: list[PinConfig] = field(default_factory=list)
+    blocks: BlocksConfig = field(default_factory=BlocksConfig)
 
     @property
     def is_lora_gateway(self) -> bool:
@@ -445,8 +465,16 @@ class AgentConfig:
             for p in pins_data
         ]
 
+        blocks_data = data.get("blocks", {}) or {}
+        blocks = BlocksConfig(
+            enabled=bool(blocks_data.get("enabled", True)),
+            state_dir=blocks_data.get("state_dir", "") or "",
+            legacy_protection=bool(blocks_data.get("legacy_protection", False)),
+            tick_seconds=float(blocks_data.get("tick_seconds", 1.0)),
+        )
+
         return cls(
             node=node, mqtt=mqtt, telemetry=telemetry, board=board,
             connectivity=connectivity, wifi=wifi, cellular=cellular,
-            lora=lora, pins=pins,
+            lora=lora, pins=pins, blocks=blocks,
         )

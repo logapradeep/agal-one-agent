@@ -24,13 +24,26 @@ class HeartbeatPublisher:
     """Publishes online status and uptime at regular intervals."""
 
     def __init__(self, config: AgentConfig, mqtt_client: AgalOneMqttClient,
-                 http_reporter: Optional[HttpReporter] = None):
+                 http_reporter: Optional[HttpReporter] = None,
+                 extra_provider=None):
         self.config = config
         self.mqtt_client = mqtt_client
         self.http_reporter = http_reporter
+        # v0.2.0: callable returning the automation-block status the heartbeat
+        # carries (programVersion, programStatus, capabilities) — ADR-017.
+        self.extra_provider = extra_provider
         self._timer: Optional[threading.Timer] = None
         self._running = False
         self._start_time = time.time()
+
+    def _extra(self) -> Optional[dict]:
+        if self.extra_provider is None:
+            return None
+        try:
+            return self.extra_provider() or None
+        except Exception as e:  # noqa: BLE001
+            logger.debug("heartbeat extra failed: %s", e)
+            return None
 
     def start(self) -> None:
         self._running = True
@@ -57,16 +70,19 @@ class HeartbeatPublisher:
 
     def _send_heartbeat(self) -> None:
         try:
+            extra = self._extra()
             self.mqtt_client.publish_status(
                 online=True,
                 uptime=self.uptime,
                 firmware_version=_get_agent_version(),
+                extra=extra,
             )
             if self.http_reporter:
                 self.http_reporter.report_status(
                     online=True,
                     uptime=self.uptime,
                     firmware_version=_get_agent_version(),
+                    extra=extra,
                 )
         except Exception as e:
             logger.error("Heartbeat error: %s", e)

@@ -108,7 +108,8 @@ class AgalOneMqttClient:
             qos=1,
         )
 
-    def publish_status(self, online: bool, uptime: int, firmware_version: str = "0.1.0") -> None:
+    def publish_status(self, online: bool, uptime: int, firmware_version: str = "0.1.0",
+                       extra: Optional[dict] = None) -> None:
         if not self._client or not self._connected:
             logger.warning("Cannot publish status: not connected")
             return
@@ -126,6 +127,8 @@ class AgalOneMqttClient:
         mac = get_primary_mac()
         if mac:
             payload["mac"] = mac
+        if extra:
+            payload.update(extra)  # programVersion / programStatus / capabilities (v0.2.0)
         wire = json.dumps({"type": "status", "payload": payload})
 
         self._client.publish(
@@ -245,6 +248,43 @@ class AgalOneMqttClient:
             qos=1,
         )
         logger.debug("Published LoRa event: %s", event.get("type", "unknown"))
+
+    # ---- Automation blocks (ADR-017, contracts v1.5.0) -----------------------
+    # Fast path on the status topic; the HTTP reporter is the durable twin. All
+    # three use the {type, payload} envelope the ingress dispatches on.
+
+    def _publish_status_envelope(self, type_: str, payload: dict) -> bool:
+        if not self._client or not self._connected:
+            return False
+        payload = dict(payload)
+        payload.setdefault("nodeUid", self.config.username)
+        self._client.publish(self.config.status_topic,
+                             json.dumps({"type": type_, "payload": payload}), qos=1)
+        return True
+
+    def publish_program_ack(self, version: int, status: str, reason: Optional[str] = None,
+                            firmware_version: Optional[str] = None) -> bool:
+        payload: dict = {"version": int(version), "status": status,
+                         "timestamp": int(time.time() * 1000)}
+        if reason:
+            payload["reason"] = reason[:500]
+        if firmware_version:
+            payload["firmwareVersion"] = firmware_version
+        return self._publish_status_envelope("programAck", payload)
+
+    def publish_variables(self, asset_id: str, values: dict) -> bool:
+        return self._publish_status_envelope("variables", {
+            "assetId": asset_id, "values": values, "ts": int(time.time() * 1000)})
+
+    def publish_alert(self, text: str, severity: str, rule_id: Optional[str] = None,
+                      asset_id: Optional[str] = None) -> bool:
+        payload: dict = {"text": text[:200], "severity": severity,
+                         "timestamp": int(time.time() * 1000)}
+        if rule_id:
+            payload["ruleId"] = rule_id
+        if asset_id:
+            payload["assetId"] = asset_id
+        return self._publish_status_envelope("alert", payload)
 
     def publish_command_ack(
         self,
