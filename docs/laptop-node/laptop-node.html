@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>The laptop node</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Antonio:wght@600;700&family=Inter+Tight:ital,wght@0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --navy: #0F1352; --ink: #1B2032; --slate: #5B6478; --line: #D9DDE6; --ground: #FFFFFF;
+    --tint: #EEF0F7; --green: #2F7D4A; --green-soft: #DDEFE3; --blue: #2E7BD6; --blue-soft: #DCE9F9;
+    --orange: #E8842B; --orange-soft: #FBE7D3; --red: #C4443A; --mono: "JetBrains Mono", "SF Mono", Menlo, monospace;
+  }
+  @page { size: A4; margin: 0; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--ground); color: var(--ink);
+    font-family: "Inter Tight", "Helvetica Neue", Arial, sans-serif; font-size: 10.5pt; line-height: 1.45; }
+  .page { width: 210mm; height: 297mm; padding: 16mm 17mm 14mm; position: relative; page-break-after: always; overflow: hidden; }
+  .page:last-child { page-break-after: auto; }
+  .brand { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8mm; }
+  .brand img { height: 7mm; }
+  .brand .eyebrow { font-family: "Antonio", "Arial Narrow", sans-serif; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; font-size: 9pt; color: var(--slate); }
+  h1 { font-family: "Antonio", "Arial Narrow", sans-serif; font-weight: 700; font-size: 44pt; line-height: 0.98; letter-spacing: 0.005em; color: var(--navy); margin: 0 0 5mm; text-wrap: balance; }
+  h2 { font-family: "Antonio", "Arial Narrow", sans-serif; font-weight: 700; font-size: 22pt; line-height: 1.05; color: var(--navy); margin: 0 0 4mm; letter-spacing: 0.01em; }
+  h3 { font-family: "Antonio", "Arial Narrow", sans-serif; font-weight: 600; font-size: 12.5pt; letter-spacing: 0.04em; text-transform: uppercase; color: var(--navy); margin: 5mm 0 2mm; }
+  p { margin: 0 0 3mm; max-width: 68ch; }
+  .deck { font-size: 13.5pt; line-height: 1.4; color: var(--ink); max-width: 60ch; margin-bottom: 6mm; }
+  .hero { width: 100%; border-radius: 4mm; display: block; }
+  .caption { font-size: 8.5pt; color: var(--slate); margin-top: 2mm; }
+  .footer { position: absolute; left: 17mm; right: 17mm; bottom: 8mm; display: flex; justify-content: space-between; font-size: 8pt; color: var(--slate); border-top: 0.5pt solid var(--line); padding-top: 2mm; font-variant-numeric: tabular-nums; }
+  .callout { background: var(--tint); border-left: 3pt solid var(--navy); padding: 3mm 4mm; border-radius: 0 2mm 2mm 0; margin: 4mm 0; max-width: none; }
+  .callout p { max-width: none; margin: 0; }
+  .warn { background: var(--orange-soft); border-left-color: var(--orange); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6mm; }
+  .steps { display: grid; grid-template-columns: 1fr 1fr; gap: 3.5mm; margin-top: 2mm; }
+  .step { border: 0.6pt solid var(--line); border-radius: 3mm; padding: 3.5mm 4mm 3mm; position: relative; }
+  .step .n { font-family: "Antonio", sans-serif; font-weight: 700; font-size: 19pt; color: var(--navy); line-height: 1; margin-bottom: 1mm; }
+  .step h4 { margin: 0 0 1.2mm; font-size: 10.5pt; font-weight: 600; }
+  .step p { font-size: 9.1pt; line-height: 1.38; margin: 0 0 1.2mm; max-width: none; }
+  .step .ui { display: inline-block; background: var(--tint); border-radius: 1.2mm; padding: 0 1.5mm; font-size: 9pt; font-weight: 500; white-space: nowrap; }
+  pre { font-family: var(--mono); font-size: 8pt; line-height: 1.36; background: #0F1352; color: #E8EAF3; padding: 3.5mm 4.5mm; border-radius: 2.5mm; margin: 3mm 0 2mm; overflow: hidden; white-space: pre; }
+  pre .c { color: #8F97B8; } pre .k { color: #9CC5FF; } pre .v { color: #FFD59A; } pre .w { color: #FFB199; }
+  code { font-family: var(--mono); font-size: 9pt; background: var(--tint); padding: 0 1mm; border-radius: 1mm; }
+  table { width: 100%; border-collapse: collapse; font-size: 8.8pt; line-height: 1.36; margin-top: 1.5mm; }
+  th, td { text-align: left; vertical-align: top; padding: 1.5mm 2mm; border-bottom: 0.5pt solid var(--line); }
+  th { font-family: "Antonio", sans-serif; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; font-size: 8.5pt; color: var(--slate); }
+  td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .pill { display: inline-block; padding: 0.3mm 2mm; border-radius: 3mm; font-size: 8pt; font-weight: 600; letter-spacing: 0.02em; }
+  .pill.g { background: var(--green-soft); color: var(--green); } .pill.b { background: var(--blue-soft); color: var(--blue); } .pill.o { background: var(--orange-soft); color: #9A4F0E; }
+  .legend { display: flex; gap: 5mm; font-size: 8.5pt; color: var(--slate); margin-top: 1.5mm; }
+  .legend span::before { content: ""; display: inline-block; width: 3mm; height: 3mm; border-radius: 1mm; margin-right: 1.2mm; vertical-align: -0.4mm; }
+  .legend .v::before { background: var(--blue); } .legend .pmp::before { background: var(--orange); } .legend .cur::before { background: var(--navy); } .legend .flw::before { background: var(--green); }
+  svg text { font-family: "Inter Tight", "Helvetica Neue", Arial, sans-serif; }
+  svg .lbl { font-size: 9px; fill: var(--slate); }
+  svg .t { font-size: 10.5px; fill: var(--ink); font-weight: 600; }
+  svg .s { font-size: 9px; fill: var(--slate); }
+  svg .mono { font-family: "JetBrains Mono", Menlo, monospace; font-size: 8.4px; fill: var(--ink); }
+  .cover-title { margin-top: 10mm; }
+  .kv { display: grid; grid-template-columns: 34mm 1fr; gap: 1.5mm 4mm; font-size: 9.5pt; }
+  .kv dt { color: var(--slate); } .kv dd { margin: 0; }
+  .kv.wide { grid-template-columns: 42mm 1fr; font-size: 9.2pt; } .kv.wide dt { white-space: nowrap; }
+  .tight p { font-size: 9.6pt; margin-bottom: 2.2mm; }
+</style>
+</head>
+<body>
+
+<!-- ============================================================ COVER -->
+<section class="page">
+  <div class="brand"><img src="wordmark.png" alt="Thuvagai"><span class="eyebrow">Agal One · rebuild P4</span></div>
+  <div class="cover-title">
+    <h1>The laptop node</h1>
+    <p class="deck">A Mac stands in for the reference build, so Agal One AGRI can be tested on the phone against the real cloud — no bench, no wiring, nothing pretended on the cloud side.</p>
+  </div>
+  <img class="hero" src="hero.png" alt="A laptop and a phone on a table at the edge of a field; the pump-house hardware drawn as a dotted outline">
+  <p class="caption">The hardware in the dotted outline does not exist. The laptop answers for it: valves open, the pump starts, water "flows" — and the phone sees exactly what it would see on a farm.</p>
+  <div class="grid2" style="margin-top:6mm">
+    <div>
+      <h3>What it is</h3>
+      <p>The Agal One agent (<code>agal-one-agent</code> 0.2.1) running on a Mac with <code>blocks.simulated_io: true</code>. Its ports live in memory; a small "bench physics" thread answers them the way the plumbing would. Everything else — MQTT, the ingress, program pull and acknowledgement, alerts — is the production path to <code>agal-one-prod</code>.</p>
+    </div>
+    <div>
+      <h3>What it is for</h3>
+      <p>The P4 exit test: R-1 to R-8, R-19, R-22, R-23, R-25, R-27, R-31 and R-32 of the build baseline, run on the phone before any hardware exists. It is not a substitute for the bench of P8 — dry-run, phase loss and the safe-state relay stage still need real parts.</p>
+    </div>
+  </div>
+  <div class="footer"><span>Thuvagai · Agal One</span><span>2026-09-08 · 1</span></div>
+</section>
+
+<!-- ============================================================ HOW IT FITS -->
+<section class="page">
+  <div class="brand"><img src="wordmark.png" alt="Thuvagai"><span class="eyebrow">How it fits</span></div>
+  <h2>Only the ports are simulated. Everything else is real.</h2>
+  <p>The phone talks to the instance the way it always does; the instance talks to the laptop the way it talks to a Raspberry Pi in a pump house. The laptop node is a normal node document in the account, with a normal program, acknowledged and executed by the normal runtime.</p>
+
+  <svg viewBox="0 0 700 330" width="100%" xmlns="http://www.w3.org/2000/svg" aria-label="Architecture: phone, agal.one instance, laptop node">
+    <defs>
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5B6478"/></marker>
+      <marker id="arrN" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0F1352"/></marker>
+    </defs>
+    <!-- Phone -->
+    <rect x="18" y="60" width="150" height="200" rx="12" fill="#FFFFFF" stroke="#0F1352" stroke-width="1.4"/>
+    <rect x="30" y="74" width="126" height="160" rx="6" fill="#EEF0F7"/>
+    <rect x="40" y="86" width="50" height="40" rx="4" fill="#DCE9F9" stroke="#2E7BD6"/>
+    <rect x="96" y="86" width="50" height="40" rx="4" fill="#DDEFE3" stroke="#2F7D4A"/>
+    <rect x="40" y="132" width="106" height="30" rx="4" fill="#FFFFFF" stroke="#D9DDE6"/>
+    <text x="93" y="151" text-anchor="middle" class="s">Run 30 min · Stop</text>
+    <rect x="40" y="170" width="106" height="14" rx="7" fill="#DDEFE3"/>
+    <text x="93" y="180" text-anchor="middle" class="s" fill="#2F7D4A">Applied · v3</text>
+    <text x="93" y="220" text-anchor="middle" class="t">Agal One AGRI</text>
+    <text x="93" y="248" text-anchor="middle" class="lbl">iPhone · the live layout</text>
+
+    <!-- Instance -->
+    <rect x="228" y="40" width="226" height="250" rx="14" fill="#FFFFFF" stroke="#0F1352" stroke-width="1.4"/>
+    <text x="341" y="64" text-anchor="middle" class="t">agal.one instance</text>
+    <text x="341" y="78" text-anchor="middle" class="lbl">GCP project agal-one-prod</text>
+    <rect x="244" y="90" width="194" height="44" rx="6" fill="#EEF0F7"/>
+    <text x="341" y="106" text-anchor="middle" class="t" style="font-size:9.5px">Cloud Functions</text>
+    <text x="341" y="118" text-anchor="middle" class="s" style="font-size:8.3px">runPlot · stopPlot · writeNodeProgram</text>
+    <text x="341" y="128" text-anchor="middle" class="s" style="font-size:8.3px">getProgram · telemetryIngress</text>
+    <rect x="244" y="142" width="194" height="44" rx="6" fill="#EEF0F7"/>
+    <text x="341" y="158" text-anchor="middle" class="t" style="font-size:9.5px">Firestore</text>
+    <text x="341" y="170" text-anchor="middle" class="s" style="font-size:8.3px">assets · plots · nodePrograms</text>
+    <text x="341" y="180" text-anchor="middle" class="s" style="font-size:8.3px">events · iotNodes</text>
+    <rect x="244" y="194" width="194" height="44" rx="6" fill="#EEF0F7"/>
+    <text x="341" y="210" text-anchor="middle" class="t" style="font-size:9.5px">MQTT broker</text>
+    <text x="341" y="222" text-anchor="middle" class="s" style="font-size:8.3px">commands down</text>
+    <text x="341" y="232" text-anchor="middle" class="s" style="font-size:8.3px">status · variables · alerts up</text>
+    <text x="341" y="266" text-anchor="middle" class="lbl">unchanged — the production path</text>
+
+    <!-- Laptop node -->
+    <rect x="540" y="40" width="142" height="250" rx="14" fill="#FFFFFF" stroke="#0F1352" stroke-width="1.4"/>
+    <text x="611" y="64" text-anchor="middle" class="t">Laptop node</text>
+    <text x="611" y="78" text-anchor="middle" class="lbl">agal-one-agent 0.2.1</text>
+    <rect x="552" y="92" width="118" height="34" rx="6" fill="#EEF0F7"/>
+    <text x="611" y="107" text-anchor="middle" class="t" style="font-size:9.5px">Block runtime</text>
+    <text x="611" y="119" text-anchor="middle" class="s" style="font-size:8.3px">NAB + AABs, 1 s tick</text>
+    <rect x="552" y="136" width="118" height="34" rx="6" fill="#FBE7D3" stroke="#E8842B" stroke-dasharray="3 2"/>
+    <text x="611" y="151" text-anchor="middle" class="t" style="font-size:9.5px">Ports in memory</text>
+    <text x="611" y="163" text-anchor="middle" class="s" style="font-size:8.3px">no GPIO is touched</text>
+    <rect x="552" y="180" width="118" height="34" rx="6" fill="#FBE7D3" stroke="#E8842B" stroke-dasharray="3 2"/>
+    <text x="611" y="195" text-anchor="middle" class="t" style="font-size:9.5px">Bench physics</text>
+    <text x="611" y="207" text-anchor="middle" class="s" style="font-size:8.3px">answers valves and pump</text>
+    <rect x="552" y="224" width="118" height="34" rx="6" fill="#EEF0F7"/>
+    <text x="611" y="239" text-anchor="middle" class="t" style="font-size:9.5px">Sync + reporters</text>
+    <text x="611" y="251" text-anchor="middle" class="s" style="font-size:8.3px">HTTPS ingress · MQTT</text>
+    <text x="611" y="278" text-anchor="middle" class="lbl">the only difference</text>
+
+    <!-- arrows phone <-> instance -->
+    <line x1="170" y1="110" x2="226" y2="110" stroke="#0F1352" stroke-width="1.3" marker-end="url(#arrN)"/>
+    <text x="198" y="103" text-anchor="middle" class="s">callables</text>
+    <line x1="226" y1="165" x2="170" y2="165" stroke="#5B6478" stroke-width="1.3" marker-end="url(#arr)"/>
+    <text x="198" y="181" text-anchor="middle" class="s">listeners</text>
+    <!-- arrows instance <-> node -->
+    <line x1="538" y1="112" x2="456" y2="112" stroke="#5B6478" stroke-width="1.3" marker-end="url(#arr)"/>
+    <text x="497" y="105" text-anchor="middle" class="s">getProgram</text>
+    <line x1="538" y1="160" x2="456" y2="160" stroke="#5B6478" stroke-width="1.3" marker-end="url(#arr)"/>
+    <text x="497" y="174" text-anchor="middle" class="s" style="font-size:8.3px">acks · variables</text>
+    <text x="497" y="184" text-anchor="middle" class="s" style="font-size:8.3px">alerts</text>
+    <line x1="456" y1="216" x2="538" y2="216" stroke="#0F1352" stroke-width="1.3" marker-end="url(#arrN)"/>
+    <text x="497" y="209" text-anchor="middle" class="s">commands</text>
+    <!-- baseline -->
+    <text x="18" y="314" class="lbl">A tap on the phone becomes a callable, then an MQTT command; the laptop's answer becomes a variables message,</text>
+    <text x="18" y="326" class="lbl">then a Firestore write, then a change on the screen — within seconds.</text>
+  </svg>
+
+  <div class="callout"><p><strong>The rule of the laptop node.</strong> If something works here, the cloud side and the app side are proven. If something works only here, it is the physics that flatters it — dry-run cutoff, phase loss and the safe-state relay stage are judged on the bench of P8, never on the laptop.</p></div>
+
+  <h3>What the physics answers</h3>
+  <div class="grid2">
+    <div>
+      <p><strong>Valve open + pump on → flow.</strong> Five seconds after a plot's valve output is energised with the pump relay on, that plot's flow switch reads <em>flowing</em>. It clears as soon as the valve closes.</p>
+      <p><strong>Pump relay on → current.</strong> Two seconds after the relay closes, the pump's current sensor reads its rated current (a nominal 4.5 A while the rating is still "learn on first run"), with a little noise; 0 A when the relay opens.</p>
+    </div>
+    <div>
+      <p><strong>Three-phase pumps.</strong> All three current inputs carry current and all mains-sense inputs read <em>present</em>, so the three-phase program runs clean.</p>
+      <p><strong>Nothing else.</strong> Tank levels, wall switches and sensors keep their last written value. The physics is deliberately small: it exists to make R-7, R-8 and R-9 observable, not to model a farm.</p>
+    </div>
+  </div>
+  <div class="footer"><span>Thuvagai · Agal One</span><span>The laptop node · 2</span></div>
+</section>
+
+<!-- ============================================================ WHAT HAPPENS WHEN YOU PRESS RUN -->
+<section class="page">
+  <div class="brand"><img src="wordmark.png" alt="Thuvagai"><span class="eyebrow">A run, second by second</span></div>
+  <h2>What happens when you press Run</h2>
+  <p>The phone sends <code>runPlot</code>; the instance publishes the command; the laptop's runtime opens the plot's valve and lets the default Node Automation Block do the rest. The timings below are the program's and the physics' — the same numbers you will read on the phone.</p>
+
+  <svg viewBox="0 0 700 300" width="100%" xmlns="http://www.w3.org/2000/svg" aria-label="Timeline of a run: valve, pump relay, current, flow, phone">
+    <defs><marker id="arrT" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#5B6478"/></marker></defs>
+    <!-- axis -->
+    <g class="lbl">
+      <line x1="150" y1="30" x2="660" y2="30" stroke="#D9DDE6"/>
+      <g stroke="#D9DDE6" stroke-dasharray="2 3">
+        <line x1="150" y1="30" x2="150" y2="245"/><line x1="235" y1="30" x2="235" y2="245"/><line x1="292" y1="30" x2="292" y2="245"/>
+        <line x1="320" y1="30" x2="320" y2="245"/><line x1="490" y1="30" x2="490" y2="245"/><line x1="547" y1="30" x2="547" y2="245"/><line x1="575" y1="30" x2="575" y2="245"/>
+      </g>
+      <text x="150" y="22" text-anchor="middle">0 s · Run</text>
+      <text x="235" y="22" text-anchor="middle">3 s</text>
+      <text x="292" y="22" text-anchor="middle">5 s</text>
+      <text x="405" y="22" text-anchor="middle" style="font-size:8.5px" fill="#0F1352" font-weight="600">running…</text>
+      <text x="490" y="22" text-anchor="middle">Stop</text>
+      <text x="547" y="22" text-anchor="middle">+2 s</text>
+      <text x="575" y="22" text-anchor="middle">+3 s</text>
+    </g>
+    <!-- rows -->
+    <g class="t" style="font-size:10px">
+      <text x="18" y="62">Valve output</text>
+      <text x="18" y="102">Pump relay</text>
+      <text x="18" y="142">Pump current</text>
+      <text x="18" y="182">Flow switch</text>
+      <text x="18" y="228">On the phone</text>
+    </g>
+    <!-- valve: on 0→Stop+2s -->
+    <rect x="150" y="50" width="397" height="16" rx="3" fill="#2E7BD6"/>
+    <text x="352" y="62" text-anchor="middle" style="font-size:9px" fill="#FFFFFF">open</text>
+    <text x="551" y="76" class="s">closes after the pump stops</text>
+    <!-- pump relay: on 3s→Stop -->
+    <rect x="235" y="90" width="255" height="16" rx="3" fill="#E8842B"/>
+    <text x="362" y="102" text-anchor="middle" style="font-size:9px" fill="#FFFFFF">on</text>
+    <text x="150" y="118" class="s">"Start the pump after the valve has energised" — 3 s</text>
+    <text x="493" y="118" class="s">stops first</text>
+    <!-- current: 5s→Stop -->
+    <rect x="292" y="130" width="198" height="16" rx="3" fill="#0F1352"/>
+    <text x="391" y="142" text-anchor="middle" style="font-size:9px" fill="#FFFFFF">4.5 A (rated)</text>
+    <text x="150" y="158" class="s">physics: 2 s after the relay</text>
+    <text x="493" y="158" class="s">0 A</text>
+    <!-- flow: 5s→Stop+2s -->
+    <rect x="292" y="170" width="255" height="16" rx="3" fill="#2F7D4A"/>
+    <text x="419" y="182" text-anchor="middle" style="font-size:9px" fill="#FFFFFF">flowing</text>
+    <text x="150" y="198" class="s">physics: 5 s after the valve opened, pump on</text>
+    <text x="551" y="198" class="s">clears</text>
+    <!-- phone labels -->
+    <rect x="150" y="212" width="140" height="24" rx="4" fill="#EEF0F7"/>
+    <text x="220" y="227" text-anchor="middle" class="mono">Open · no flow yet</text>
+    <rect x="294" y="212" width="194" height="24" rx="4" fill="#DDEFE3"/>
+    <text x="391" y="227" text-anchor="middle" class="mono">Running · ends 6:32 PM</text>
+    <rect x="492" y="212" width="100" height="24" rx="4" fill="#EEF0F7"/>
+    <text x="542" y="227" text-anchor="middle" class="mono">Closed</text>
+    <!-- protection note -->
+    <line x1="150" y1="262" x2="660" y2="262" stroke="#D9DDE6"/>
+    <text x="18" y="280" class="s">Protection stays live: with no valve open the pump is cut after 3 s ("Pump only while a valve is open");</text>
+    <text x="18" y="292" class="s">a run longer than max_run_seconds is ended by the program, the valves are closed and an alert is written.</text>
+  </svg>
+  <div class="legend"><span class="v">valve output</span><span class="pmp">pump relay</span><span class="cur">measured current</span><span class="flw">flow switch</span></div>
+
+  <div class="grid2" style="margin-top:6mm">
+    <div>
+      <h3>Where each number comes from</h3>
+      <dl class="kv">
+        <dt>3 s to pump</dt><dd><code>settings.valve_energise_seconds</code> in the NAB — the sequence rule <em>start_pump</em>.</dd>
+        <dt>2 s to current</dt><dd>bench physics <code>current_delay</code>.</dd>
+        <dt>5 s to flow</dt><dd>bench physics <code>flow_delay</code>; the flow-switch program then holds it 3 s (<em>flow_hold</em>) before reporting <em>flowing</em>.</dd>
+        <dt>Rated current</dt><dd>the pump's design (rated current) → <code>settings.rated_current</code>; 0 = 4.5 A nominal.</dd>
+      </dl>
+    </div>
+    <div>
+      <h3>And on Stop</h3>
+      <p>The runtime ends the plot: the pump relay opens first, the valve closes after it, the flow clears within a couple of seconds and the current reads 0 A. The phone's history shows the command with who sent it; the plot card returns to "Closed" or "Next … " when a schedule exists.</p>
+    </div>
+  </div>
+  <div class="footer"><span>Thuvagai · Agal One</span><span>The laptop node · 3</span></div>
+</section>
+
+<!-- ============================================================ SET-UP -->
+<section class="page">
+  <div class="brand"><img src="wordmark.png" alt="Thuvagai"><span class="eyebrow">Set-up</span></div>
+  <h2>Four steps, in the app first</h2>
+  <p>The node, its cards and the field are created on the phone like any other; the laptop only needs the node's identity and the broker to connect to.</p>
+  <div class="steps">
+    <div class="step"><div class="n">1</div><h4>Create the node</h4>
+      <p><span class="ui">Assets → Nodes → Add node</span>. The instance creates the node document with its auth token and topics.</p>
+      <p>Open its pin map and add a few pins: GPIO outputs for the pump and each valve, GPIO inputs for the flow switches, one analog input for current. Any numbers — nothing is wired.</p></div>
+    <div class="step"><div class="n">2</div><h4>Create and link the cards</h4>
+      <p>One <strong>Pump</strong>, one <strong>Valve</strong> per plot, one <strong>Flow Switch</strong> per plot. On each card: <span class="ui">Edit → Link to node</span>, pick the laptop node and a pin per port.</p>
+      <p>Linking installs the card's default program on those ports; the card shows <span class="ui">Program: Installed</span>.</p></div>
+    <div class="step"><div class="n">3</div><h4>Design the field</h4>
+      <p>Open the field's <span class="ui">Layout</span>, tap the pencil, place the pump, the valves and the flow switches. Select a plot → <span class="ui">Design</span>: choose its valves and its flow switch (or mark it a hand valve). Select the pump → <span class="ui">Design</span>: phase, rated current, safe state.</p>
+      <p>Save: the program is built from the design and written — <span class="pill o">Pending on node</span> until the laptop pulls it.</p></div>
+    <div class="step"><div class="n">4</div><h4>Run the laptop node</h4>
+      <p>Write <code>config.yaml</code> as below and start the agent. It connects, pulls the program, acknowledges it — the badge turns <span class="pill g">Applied · v1</span> — and runs it.</p>
+      <p>Leave the pencil; the live view is the test bench from here.</p></div>
+  </div>
+
+<pre><span class="c"># config.yaml — laptop node (never on a farm node)</span>
+<span class="k">node</span>:
+  <span class="k">uid</span>: <span class="v">&lt;nodeUid from Assets → Nodes&gt;</span>
+  <span class="k">name</span>: <span class="v">Laptop node</span>
+  <span class="k">auth_token</span>: <span class="v">&lt;the node document's authToken&gt;</span>
+<span class="k">mqtt</span>:
+  <span class="k">broker</span>: <span class="v">&lt;instance broker host&gt;</span>
+  <span class="k">port</span>: <span class="v">8883</span>
+  <span class="k">tls</span>: <span class="v">true</span>
+  <span class="k">username</span>: <span class="v">&lt;broker user&gt;</span>
+  <span class="k">password</span>: <span class="v">&lt;broker password&gt;</span>
+<span class="k">telemetry</span>:
+  <span class="k">ingress_url</span>: <span class="v">https://asia-south1-agal-one-prod.cloudfunctions.net/telemetryIngress</span>
+<span class="k">blocks</span>:
+  <span class="k">enabled</span>: <span class="v">true</span>
+  <span class="k">simulated_io</span>: <span class="w">true</span>      <span class="c"># in-memory ports + bench physics</span>
+  <span class="k">state_dir</span>: <span class="v">./state</span>
+<span class="k">pins</span>: <span class="v">[]</span>                     <span class="c"># simulated: no GPIO is touched</span>
+
+<span class="c"># then, from Agal/daemon/agal-one-agent</span>
+.venv/bin/pip install -e .
+.venv/bin/agal-one-agent --config ./config.yaml</pre>
+  <p class="caption">The broker credentials are the instance's MQTT credentials, held by the founder; they are never written into a repository or this document. The first log lines say <em>blocks.simulated_io is ON — ports are simulated</em> and <em>BENCH PHYSICS</em>.</p>
+  <div class="footer"><span>Thuvagai · Agal One</span><span>The laptop node · 4</span></div>
+</section>
+
+<!-- ============================================================ CHECKLIST -->
+<section class="page">
+  <div class="brand"><img src="wordmark.png" alt="Thuvagai"><span class="eyebrow">The exit test</span></div>
+  <h2>What you should see on the phone</h2>
+  <p>Each line is a requirement of the build baseline, the budget it sets and what the laptop node makes visible. The history sheet keeps the record.</p>
+  <table>
+    <thead><tr><th style="width:14mm">Req.</th><th>Do this</th><th>Expect</th><th style="width:26mm">Budget</th></tr></thead>
+    <tbody>
+      <tr><td class="num">R-1</td><td>Field with two plots, pump + valves + flow switches placed; a valve assigned to its plot.</td><td>The plot's Design shows its valve; the layout node label reads the plot's name.</td><td class="num">—</td></tr>
+      <tr><td class="num">R-2</td><td>Open the field from the field card.</td><td>One <em>Layout</em> button; live view with state, next run, badges, program status; pencil opens editing.</td><td class="num">—</td></tr>
+      <tr><td class="num">R-3</td><td>While a plot runs, pencil → select its valve → delete.</td><td>Refused with a message naming the plot being watered.</td><td class="num">—</td></tr>
+      <tr><td class="num">R-4 / R-5</td><td>Link a valve to a pin twice; link beyond the pins configured.</td><td>The pin picker offers only free pins of the right protocol.</td><td class="num">—</td></tr>
+      <tr><td class="num">R-6</td><td>Change the pump's rated current; save.</td><td><code>settings.rated_current</code> in the pump program; the node re-acknowledges.</td><td class="num">≤ 30 s</td></tr>
+      <tr><td class="num">R-7</td><td>Tap <em>Run 30 min</em> on a plot.</td><td>Valve open; pump on after the energise delay; Stop turns the pump off before the valve closes; a pump toggle with no valve open is refused.</td><td class="num">pump ≤ 5 s</td></tr>
+      <tr><td class="num">R-8</td><td>Same run.</td><td>The plot reads <em>Open · flowing</em>; the flow glyph turns blue; it clears after Stop.</td><td class="num">≤ 15 s (≈ 8 s here)</td></tr>
+      <tr><td class="num">R-9</td><td>Same run, open the pump card.</td><td>Current at the rated value, <em>Running</em>; 0 A after Stop.</td><td class="num">≤ 10 s</td></tr>
+      <tr><td class="num">R-19</td><td>Stop the laptop agent, save any design change, start it again.</td><td><span class="pill o">Pending on node</span> while stopped, <span class="pill g">Applied</span> with the new version after restart.</td><td class="num">≤ 30 s</td></tr>
+      <tr><td class="num">R-22</td><td>Open the node program sheet.</td><td>The default rules are listed; each is editable; three are marked protection.</td><td class="num">—</td></tr>
+      <tr><td class="num">R-23</td><td>Toggle the pump card directly while a run is on.</td><td>An interruption row in history; the plot card shows the badge.</td><td class="num">≤ 10 s</td></tr>
+      <tr><td class="num">R-25</td><td>Add a schedule two minutes ahead (30 min, every day).</td><td>The plot shows <em>Next today …</em>; at the time, it runs without the phone; history shows the schedule.</td><td class="num">start ≤ 1 min</td></tr>
+      <tr><td class="num">R-27</td><td>Watch the live view during a run.</td><td>Glyphs, plot fills and labels change as the node reports.</td><td class="num">≤ 10 s</td></tr>
+      <tr><td class="num">R-28</td><td>In the program text, set <code>max_run_seconds</code> to 120; run a plot for 10 min.</td><td>At 2 min the run ends, valves close; banner and push: "Pump stopped: maximum run time reached".</td><td class="num">≤ 60 s</td></tr>
+      <tr><td class="num">R-31 / R-32</td><td>Ask Assist, in Tamil, to run a plot / add a schedule.</td><td>A confirm card in the chat; on confirm the plot runs / the schedule appears in the program.</td><td class="num">—</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn" style="margin-top:3.5mm"><p><strong>Not provable here.</strong> R-11 dry run, R-13 phase loss, R-14 safe state and R-21 clock discipline through a power cut: the physics never makes the current fall or a phase vanish. Those are bench trials of P8 with the parts list of <em>_audit/99</em> §2.</p></div>
+  <div class="footer"><span>Thuvagai · Agal One</span><span>The laptop node · 5</span></div>
+</section>
+
+<!-- ============================================================ TROUBLESHOOTING -->
+<section class="page">
+  <div class="brand"><img src="wordmark.png" alt="Thuvagai"><span class="eyebrow">Reading the screen</span></div>
+  <h2>When something looks wrong</h2>
+  <table>
+    <thead><tr><th style="width:52mm">You see</th><th>It means</th><th>Do</th></tr></thead>
+    <tbody>
+      <tr><td>Node chip is red</td><td>No heartbeat for three minutes.</td><td>Is the agent running and connected? The log shows the MQTT connect; broker credentials or the node's auth token are the usual cause.</td></tr>
+      <tr><td><span class="pill o">Pending on node</span> for more than a minute</td><td>The laptop has not pulled or has rejected the program.</td><td>Read the agent log: <em>getProgram</em> and the compile result. A rejected program shows the reason on the badge.</td></tr>
+      <tr><td>"No program yet"</td><td>The layout has linked cards but nothing was designed.</td><td>Pencil → select a plot → Design → Save. The program is built from the design.</td></tr>
+      <tr><td>"Not designed yet" on a plot</td><td>The plot has no valves or flow switch assigned.</td><td>Design the plot; a hand valve counts as designed.</td></tr>
+      <tr><td>Run is disabled on a plot card</td><td>No control access, a hand valve, the node offline, or the plot undesigned.</td><td>Check the role on the valve cards (controller or above), the node chip, the design.</td></tr>
+      <tr><td>"This plot is not in any node program yet"</td><td>The design was saved but the program write failed or is stale.</td><td>Save the layout again (rebuilds the program); check the alert shown after saving.</td></tr>
+      <tr><td>Flow never shows</td><td>The plot's flow switch is not the one in its design, or the pump relay never closed.</td><td>Design → flow switch; then open the pump card and check <em>relay</em> / the energise delay.</td></tr>
+      <tr><td>"Pump stopped: no valve open"</td><td>The protection rule fired: the pump was on with every valve closed.</td><td>Expected when the pump is toggled directly; run a plot instead.</td></tr>
+      <tr><td>The program text editor refuses a save</td><td>A validation error (unknown variable, a rule naming another node's asset, a missing plot).</td><td>The issue names the path and the rule; fix or remove the rule.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="tight">
+  <h3>Safety</h3>
+  <p><strong>Never set <code>simulated_io</code> on a farm node.</strong> The agent logs a warning at start and the physics thread announces itself; a node reporting flow with no water is the sign that someone did. The flag lives only in the laptop's config file, never in the fleet provisioner.</p>
+  <p>The laptop node writes ordinary production data — a node, cards, plots, programs, events. Delete the node and its cards when the test is over, or keep it as the demo farm; either is fine, but decide.</p>
+  </div>
+  <h3>Also available</h3>
+  <dl class="kv wide">
+    <dt><code>--offline</code></dt><dd>runs the persisted program with no cloud at all (a bench without network).</dd>
+    <dt><code>agal-one-agent-sim</code></dt><dd>the scripted bench: scenarios for R-7 to R-25 against the default programs, no cloud, no phone.</dd>
+    <dt><code>LAPTOP_NODE.md</code></dt><dd>the text version of this document, next to the agent's code.</dd>
+  </dl>
+  <div class="footer"><span>Thuvagai · Agal One</span><span>The laptop node · 6</span></div>
+</section>
+</body>
+</html>

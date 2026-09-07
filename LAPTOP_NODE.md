@@ -1,5 +1,7 @@
 # Laptop node (simulated bench against the real cloud)
 
+> Illustrated version: [`docs/laptop-node.pdf`](docs/laptop-node.pdf) (six pages: how it fits, a run second by second, set-up, the phone checklist, troubleshooting). Source in `docs/laptop-node/` — render with headless Chrome (`--print-to-pdf`).
+
 For the phone tests of rebuild P4 (`_audit/99-rebuild-plan.md`): the agent runs
 on the Mac with in-memory ports and bench physics, connected to the real
 `agal-one-prod` backend as an ordinary node. The app on the phone sees valves
