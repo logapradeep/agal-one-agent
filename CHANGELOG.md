@@ -1,5 +1,20 @@
 # Changelog — agal-one-agent
 
+## 0.2.1 (unreleased, 2026-09-07)
+
+Laptop node for the phone tests (rebuild P4 exit test, `_audit/99`).
+
+- **`blocks.simulated_io: true`** — the block runtime uses in-memory ports
+  (`SimulatedIO`) instead of GPIO while the cloud side (MQTT, ingress,
+  `getProgram`, acks, variables, alerts) stays real, so a Mac can stand in for
+  the reference build while the app is tested on the phone. `main.py` logs a
+  warning; never set it on a farm node.
+- **`blocks/bench.py`** — `BenchPhysics`: answers the outputs the way the
+  plumbing would (valve open + pump on → the plot's flow switch reads flowing
+  after 5 s; pump relay on → rated current after 2 s, nominal 4.5 A while the
+  rating is 0; three-phase currents and mains-sense inputs present).
+- Tests: 2 new (218 total). See `LAPTOP_NODE.md`.
+
 ## 0.2.0 (2026-09-07)
 
 Automation-block runtime — ADR-017 (contracts v1.5.0); rebuild phase P1 of
