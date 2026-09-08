@@ -38,6 +38,14 @@ Laptop node for the phone tests (rebuild P4 exit test, `_audit/99`).
   30 s passed with anything dirty; `since(...)` timers never trigger a
   report by themselves. Before this every valve rewrote its card every second
   while closed (the phone's asset list kept re-sorting; found 2026-09-08).
+- **Ingress budget respected.** The ingress allows 1000 requests per node
+  per hour; the first laptop-node run spent it in minutes and every report
+  (heartbeats included) got 429 for the rest of the hour. Card snapshots now
+  draw from a token bucket of 600/h (burst 20), timer-only changes never
+  cost a report, and a 429 pauses snapshots for 60 s; `HttpReporter` keeps
+  `last_status`.
+- **Bench page never takes the agent down:** a held port falls back to a free
+  one, and any start-up failure is logged instead of raised.
 - Version constant bumped to 0.2.1 (`setup.py`, `__init__`).
 - Tests: 8 new (224 total). See `LAPTOP_NODE.md`.
 

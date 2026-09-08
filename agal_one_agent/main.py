@@ -484,7 +484,10 @@ def main():
                 node_uid=config.node.uid, node_name=config.node.name,
                 port=config.blocks.bench_port,
             )
-            bench_ui.start()
+            try:
+                bench_ui.start()
+            except Exception as e:  # noqa: BLE001
+                logger.error("bench page could not start (%s) — the agent keeps running without it", e)
         if _legacy_protection_wanted():
             protection_monitor.start()
             legacy_started = True

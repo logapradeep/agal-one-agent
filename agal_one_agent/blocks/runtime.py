@@ -1104,6 +1104,14 @@ class BlockRuntime:
             if now < due:
                 continue
             last = self._var_last_reported.get(aid)
+            # Only non-timer variables count as "dirty" for the keep-alive:
+            # while idle a valve's open_since ticks every second and must not
+            # cost a report (the ingress budget is 1000 requests an hour).
+            real_dirty = [n for n in blk.dirty if (v := blk.vars.get(n)) is not None
+                          and v.kind in ("ui", "local", "node") and not self._is_timer_var(v)]
+            if not real_dirty and last is not None:
+                blk.dirty.clear()
+                continue
             keepalive_due = last is None or now - self._var_last_sent_at.get(aid, -1e9) >= self.REPORT_KEEPALIVE_S
             trigger = keepalive_due
             if not trigger:

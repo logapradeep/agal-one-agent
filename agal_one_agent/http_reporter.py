@@ -37,6 +37,7 @@ class HttpReporter:
         # back to the module default when the config omits it (older configs or
         # a bare manual install).
         self.base_url = base_url or TELEMETRY_INGRESS_URL
+        self.last_status: Optional[int] = None  # HTTP status of the last POST (429 → callers back off)
 
     def report_status(self, online: bool, uptime: int, firmware_version: str = "0.1.0",
                       extra: Optional[dict] = None) -> None:
@@ -227,11 +228,16 @@ class HttpReporter:
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
+                self.last_status = resp.status
                 if resp.status != 200:
                     logger.warning("HTTP report failed: %d", resp.status)
                     return False
                 return True
+        except urllib.error.HTTPError as e:
+            self.last_status = e.code
+            logger.warning("HTTP report error: %s", e)
         except urllib.error.URLError as e:
+            self.last_status = None
             logger.warning("HTTP report error: %s", e)
         except Exception as e:
             logger.warning("HTTP report unexpected error: %s", e)

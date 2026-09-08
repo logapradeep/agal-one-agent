@@ -337,10 +337,58 @@ def test_runtime_does_not_report_timer_ticks_or_small_jitter():
     rt.apply_command({"type": "runPlot", "plotId": "plot-1", "commandId": "c1"})
     clock.advance(1.0); rt.step()
     assert any(aid == "valve-1" and v.get("coil") is True for aid, v in sink.snapshots)
-    # Keep-alive: with only timers ticking, one report per asset within 30 s.
+    # With only timers ticking there is no keep-alive at all (the ingress
+    # budget is 1000 requests an hour per node): 31 s of idle costs nothing.
     sink.snapshots.clear()
     for _ in range(31):
         clock.advance(1.0)
         rt.step()
-    valve_reports = [aid for aid, _ in sink.snapshots if aid == "valve-1"]
-    assert 1 <= len(valve_reports) <= 2
+    assert [aid for aid, _ in sink.snapshots if aid == "valve-1"] == []
+
+
+def test_variables_uploader_backs_off_on_429_and_respects_the_budget():
+    class LimitedHttp(FakeHttp):
+        def __init__(self):
+            super().__init__()
+            self.last_status = None
+            self.reject = 1
+
+        def report_variables(self, asset_id, values):
+            if self.reject:
+                self.reject -= 1
+                self.last_status = 429
+                return False
+            self.last_status = 200
+            return super().report_variables(asset_id, values)
+
+    http = LimitedHttp()
+    sink = CloudSink(FakeMqtt(), http, min_interval=0.01)
+    sink.uploader.RATE_LIMITED_BACKOFF = 0.1
+    sink.variables("valve-1", {"coil": True})
+    assert sink.flush(3.0)
+    assert sink.uploader.failed == 1 and sink.uploader.posted == 1
+    # Budget: after the burst is spent the uploader waits for tokens instead of posting.
+    sink.uploader._tokens = 0.0
+    assert sink.uploader._take_token() > 0
+
+
+def test_bench_page_falls_back_to_a_free_port():
+    import socket
+
+    from agal_one_agent.blocks.bench import BenchPhysics
+    from agal_one_agent.blocks.bench_ui import BenchUI
+    from agal_one_agent.blocks.clock import SimClock
+    from agal_one_agent.blocks.io import SimulatedIO
+
+    holder = socket.socket()
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    busy_port = holder.getsockname()[1]
+    rt = BlockRuntime(SimulatedIO(), FakeMqtt(), clock=SimClock())
+    ui = BenchUI(rt, BenchPhysics(rt, rt.io), port=busy_port)
+    try:
+        url = ui.start()
+        assert url != f"http://127.0.0.1:{busy_port}/" and ui.port != busy_port
+    finally:
+        ui.stop()
+        holder.close()

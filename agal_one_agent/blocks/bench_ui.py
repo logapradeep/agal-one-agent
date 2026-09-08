@@ -77,7 +77,14 @@ class BenchUI:
                 except Exception as e:  # noqa: BLE001
                     self._send(400, json.dumps({"error": str(e)}).encode("utf-8"))
 
-        self._server = ThreadingHTTPServer((self.host, self.port), Handler)
+        try:
+            self._server = ThreadingHTTPServer((self.host, self.port), Handler)
+        except OSError as e:
+            # The port is held (an earlier agent still shutting down, or another
+            # tool): take any free port rather than fail the agent (found on the
+            # laptop node's second restart, 2026-09-08).
+            logger.warning("bench page: port %d unavailable (%s) — using a free port", self.port, e)
+            self._server = ThreadingHTTPServer((self.host, 0), Handler)
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(target=self._server.serve_forever, name="bench-ui", daemon=True)
         self._thread.start()

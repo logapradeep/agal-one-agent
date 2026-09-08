@@ -29,11 +29,22 @@ class _VariableUploader:
     status topic (Cloud Functions cannot subscribe), so the ingress is the
     only path that reaches Firestore — and the phone."""
 
+    # The ingress allows 1000 requests per node per hour (backend RateLimits.
+    # telemetryIngress); heartbeats, acks, alerts and telemetry batches share
+    # it. Card snapshots get a token bucket of 600/h (one every 6 s sustained,
+    # a burst of 20 for start-up) so they can never spend the node's budget —
+    # a snapshot that has to wait is simply coalesced into the next one.
+    BUDGET_PER_HOUR = 600.0
+    BURST = 20
+    RATE_LIMITED_BACKOFF = 60.0
+
     def __init__(self, http, min_interval: float = 1.0, settle: float = 0.15, retry_after: float = 5.0):
         self.http = http
         self.min_interval = min_interval
         self.settle = settle
         self.retry_after = retry_after
+        self._tokens = float(self.BURST)
+        self._tokens_at = time.monotonic()
         self._pending: dict[str, dict] = {}
         self._last_sent: dict[str, float] = {}
         self._lock = threading.Lock()
@@ -63,6 +74,16 @@ class _VariableUploader:
         self._stop.set()
         self._wake.set()
 
+    def _take_token(self) -> float:
+        """0.0 when a post may go out now, else the seconds until a token is back."""
+        now = time.monotonic()
+        self._tokens = min(float(self.BURST), self._tokens + (now - self._tokens_at) * self.BUDGET_PER_HOUR / 3600.0)
+        self._tokens_at = now
+        if self._tokens >= 1.0:
+            self._tokens -= 1.0
+            return 0.0
+        return (1.0 - self._tokens) * 3600.0 / self.BUDGET_PER_HOUR
+
     def _next(self) -> tuple[Optional[str], Optional[dict], float]:
         """The first pending asset that may be sent now, else how long to wait."""
         now = time.monotonic()
@@ -90,6 +111,14 @@ class _VariableUploader:
                         time.sleep(wait)
                         continue
                     break
+                token_wait = self._take_token()
+                if token_wait > 0:
+                    with self._lock:  # put it back, wait for the budget
+                        merged = dict(values)
+                        merged.update(self._pending.pop(aid, {}))
+                        self._pending = {aid: merged, **self._pending}
+                    time.sleep(min(token_wait, 30.0))
+                    continue
                 ok = False
                 try:
                     ok = bool(self.http.report_variables(aid, values))
@@ -100,6 +129,7 @@ class _VariableUploader:
                     self.posted += 1
                 else:
                     self.failed += 1
+                    rate_limited = getattr(self.http, "last_status", None) == 429
                     with self._lock:
                         # newer values (if any) win over the failed snapshot
                         merged = dict(values)
@@ -107,7 +137,11 @@ class _VariableUploader:
                         self._pending[aid] = merged
                         self._pending = {aid: self._pending.pop(aid), **self._pending}
                         self._idle.clear()
-                    time.sleep(self.retry_after)
+                    if rate_limited:
+                        logger.warning("ingress rate-limited (429): card snapshots paused for %.0f s", self.RATE_LIMITED_BACKOFF)
+                        time.sleep(self.RATE_LIMITED_BACKOFF)
+                    else:
+                        time.sleep(self.retry_after)
 
 
 class CloudSink(EventSink):
