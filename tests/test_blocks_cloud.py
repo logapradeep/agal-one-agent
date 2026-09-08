@@ -285,3 +285,62 @@ def test_runtime_reports_full_snapshots_and_everything_after_load():
         clock.advance(1.0)
     valve_after = [v for aid, v in sink.snapshots if aid == "valve-1"]
     assert valve_after and valve_after[-1]["coil"] is True and "open" in valve_after[-1] and "open_since" in valve_after[-1]
+
+
+def test_runtime_does_not_report_timer_ticks_or_small_jitter():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from agal_one_agent.blocks.clock import SimClock
+
+    class SnapSink:
+        def __init__(self):
+            self.snapshots = []
+
+        def variables(self, asset_id, values):
+            self.snapshots.append((asset_id, dict(values)))
+
+        def alert(self, *a, **k): pass
+
+        def event(self, *a, **k): pass
+
+        def log(self, *a, **k): pass
+
+        def reading(self, *a, **k): pass
+
+        def program_ack(self, *a, **k): pass
+
+    sink = SnapSink()
+    clock = SimClock(datetime(2026, 9, 7, 5, 0, tzinfo=ZoneInfo("Asia/Kolkata")))
+    io = SimulatedIO()
+    rt = BlockRuntime(io, sink, clock=clock)
+    rt.compile(build_bundle_from_defaults(DEFAULTS, "farm"))
+    rt.step()
+    sink.snapshots.clear()
+    # Idle for 20 s: the valves' open_since timers tick but nothing is reported.
+    for _ in range(20):
+        clock.advance(1.0)
+        rt.step()
+    assert [aid for aid, _ in sink.snapshots if aid.startswith("valve")] == []
+    # Pump current jitter of 2 % does not report; a 10 % change does.
+    io.set_input("pump-1", "sensor.current", 4.50)
+    clock.advance(1.0); rt.step()
+    sink.snapshots.clear()
+    io.set_input("pump-1", "sensor.current", 4.55)
+    clock.advance(1.0); rt.step()
+    assert [aid for aid, _ in sink.snapshots if aid == "pump-1"] == []
+    io.set_input("pump-1", "sensor.current", 5.2)
+    clock.advance(1.0); rt.step()
+    assert any(aid == "pump-1" and v.get("current") == 5.2 for aid, v in sink.snapshots)
+    # A bool change reports at once.
+    sink.snapshots.clear()
+    rt.apply_command({"type": "runPlot", "plotId": "plot-1", "commandId": "c1"})
+    clock.advance(1.0); rt.step()
+    assert any(aid == "valve-1" and v.get("coil") is True for aid, v in sink.snapshots)
+    # Keep-alive: with only timers ticking, one report per asset within 30 s.
+    sink.snapshots.clear()
+    for _ in range(31):
+        clock.advance(1.0)
+        rt.step()
+    valve_reports = [aid for aid, _ in sink.snapshots if aid == "valve-1"]
+    assert 1 <= len(valve_reports) <= 2

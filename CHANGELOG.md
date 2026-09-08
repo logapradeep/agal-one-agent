@@ -33,6 +33,11 @@ Laptop node for the phone tests (rebuild P4 exit test, `_audit/99`).
   (`_VariableUploader`: latest snapshot per asset wins, ≥ 1 s apart per
   asset, failed posts retried) so the runtime never waits on the network.
   MQTT keeps every change as before.
+- **Reporting policy:** a card's snapshot goes to the cloud when a bool /
+  text value changed, a number moved by ≥ 5 % of its last reported value, or
+  30 s passed with anything dirty; `since(...)` timers never trigger a
+  report by themselves. Before this every valve rewrote its card every second
+  while closed (the phone's asset list kept re-sorting; found 2026-09-08).
 - Version constant bumped to 0.2.1 (`setup.py`, `__init__`).
 - Tests: 8 new (224 total). See `LAPTOP_NODE.md`.
 

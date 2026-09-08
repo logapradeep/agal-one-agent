@@ -220,6 +220,8 @@ class BlockRuntime:
         self._alert_last: dict[str, float] = {}
         self._datalog_next: dict[tuple[str, str], float] = {}
         self._var_report_next: dict[str, float] = {}
+        self._var_last_reported: dict[str, dict] = {}
+        self._var_last_sent_at: dict[str, float] = {}
         self._active_runs: dict[str, dict] = {}  # plotId → {end, started}
         self._clock_was_ok = True
         self._last_pass_mono: Optional[float] = None
@@ -1077,6 +1079,22 @@ class BlockRuntime:
             except Exception as e:  # noqa: BLE001
                 logger.error("write %s.%s failed: %s", blk.asset_id, v.port.source_key, e)
 
+    # Cloud reporting policy (R-27 vs. cost): a card's snapshot goes to the
+    # cloud when something worth showing changed — a bool / text / choice
+    # value, or a number by at least REPORT_DEADBAND of its last reported
+    # value — and at least every REPORT_KEEPALIVE_S while anything is dirty.
+    # Timers (`since(...)` locals such as a valve's open_since) tick every
+    # second and never trigger a report on their own; they ride along inside
+    # the next snapshot. Without this every valve rewrote its card every
+    # second even while closed (found on the laptop node, 2026-09-08).
+    REPORT_DEADBAND = 0.05
+    REPORT_KEEPALIVE_S = 30.0
+
+    @staticmethod
+    def _is_timer_var(v) -> bool:
+        expr = v.d.get("expression") if isinstance(v.d, dict) else None
+        return isinstance(expr, str) and "since(" in expr
+
     def _report_variables(self, now: float) -> None:
         for aid in self.aab_order:
             blk = self.aabs[aid]
@@ -1085,14 +1103,36 @@ class BlockRuntime:
             due = self._var_report_next.get(aid, 0.0)
             if now < due:
                 continue
+            last = self._var_last_reported.get(aid)
+            keepalive_due = last is None or now - self._var_last_sent_at.get(aid, -1e9) >= self.REPORT_KEEPALIVE_S
+            trigger = keepalive_due
+            if not trigger:
+                for n in blk.dirty:
+                    v = blk.vars.get(n)
+                    if v is None or v.kind not in ("ui", "local", "node") or self._is_timer_var(v):
+                        continue
+                    prev = last.get(n) if last else None
+                    cur = v.value
+                    if isinstance(cur, bool) or isinstance(prev, bool) or not isinstance(cur, (int, float)):
+                        if cur != prev:
+                            trigger = True
+                            break
+                    else:
+                        base = max(abs(float(prev)) if isinstance(prev, (int, float)) else 0.0, 1e-9)
+                        if prev is None or abs(float(cur) - float(prev)) >= self.REPORT_DEADBAND * base:
+                            trigger = True
+                            break
+            blk.dirty.clear()
+            if not trigger:
+                continue
             # A full snapshot of the card's reportable variables, not only the
             # ones that changed: the cloud keeps the last snapshot it received,
-            # so a lost message can never leave a stale value behind (the
-            # phone reads these — R-27).
+            # so a lost message can never leave a stale value behind.
             values = {n: v.value for n, v in blk.vars.items() if v.kind in ("ui", "local", "node")}
-            blk.dirty.clear()
             if values:
                 self.sink.variables(aid, values)
+                self._var_last_reported[aid] = dict(values)
+                self._var_last_sent_at[aid] = now
             self._var_report_next[aid] = now + 1.0
 
     def _datalog(self, now: float) -> None:
