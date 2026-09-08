@@ -277,8 +277,8 @@
       <p>Open the field's <span class="ui">Layout</span>, tap the pencil, place the pump, the valves and the flow switches. Select a plot → <span class="ui">Design</span>: choose its valves and its flow switch (or mark it a hand valve). Select the pump → <span class="ui">Design</span>: phase, rated current, safe state.</p>
       <p>Save: the program is built from the design and written — <span class="pill o">Pending on node</span> until the laptop pulls it.</p></div>
     <div class="step"><div class="n">4</div><h4>Run the laptop node</h4>
-      <p>Write <code>config.yaml</code> as below and start the agent. It connects, pulls the program, acknowledges it — the badge turns <span class="pill g">Applied · v1</span> — and runs it.</p>
-      <p>Leave the pencil; the live view is the test bench from here.</p></div>
+      <p>Write <code>config.yaml</code> as below and start the agent. It connects, pulls the program, acknowledges it — the badge turns <span class="pill g">Applied · v1</span> — and runs it. Open <code>http://127.0.0.1:8765/</code>: the bench page (next pages).</p>
+      <p>Or skip steps 1–3: <code>npm run seed:laptop-node -- --uid …</code> in the backend repo creates all of it under your account and writes this file.</p></div>
   </div>
 
 <pre><span class="c"># config.yaml — laptop node (never on a farm node)</span>
@@ -332,8 +332,80 @@
       <tr><td class="num">R-31 / R-32</td><td>Ask Assist, in Tamil, to run a plot / add a schedule.</td><td>A confirm card in the chat; on confirm the plot runs / the schedule appears in the program.</td><td class="num">—</td></tr>
     </tbody>
   </table>
-  <div class="callout warn" style="margin-top:3.5mm"><p><strong>Not provable here.</strong> R-11 dry run, R-13 phase loss, R-14 safe state and R-21 clock discipline through a power cut: the physics never makes the current fall or a phase vanish. Those are bench trials of P8 with the parts list of <em>_audit/99</em> §2.</p></div>
+  <div class="callout" style="margin-top:3.5mm"><p><strong>Faults are on the next page.</strong> Dry run (R-11), a lost phase (R-13), the safe state and a node outage (R-14, R-21), flow faults (R-23) and node offline (R-28) are provoked from the bench page on the Mac.</p></div>
   <div class="footer"><span>Thuvagai · Agal One</span><span>The laptop node · 5</span></div>
+</section>
+
+
+<!-- ============================================================ THE BENCH PAGE -->
+<section class="page">
+  <div class="brand"><img src="wordmark.png" alt="Thuvagai"><span class="eyebrow">The bench page</span></div>
+  <h2>Faults, on request</h2>
+  <p>The agent serves a page on the Mac at <code>http://127.0.0.1:8765/</code> (loopback only, only with <code>simulated_io</code>). It shows the ports, the program and the plots live, and its buttons make the physics misbehave — each one turns a "bench only" line into a phone test.</p>
+
+  <svg viewBox="0 0 700 280" width="100%" xmlns="http://www.w3.org/2000/svg" aria-label="Mock of the bench page">
+    <rect x="0" y="0" width="700" height="280" rx="10" fill="#FFFFFF" stroke="#D9DDE6"/>
+    <rect x="0" y="0" width="700" height="34" rx="10" fill="#0F1352"/>
+    <rect x="0" y="20" width="700" height="14" fill="#0F1352"/>
+    <text x="16" y="22" fill="#FFFFFF" font-size="12" font-weight="700" font-family="Antonio, Arial Narrow, sans-serif" letter-spacing="0.06em">AGAL ONE · BENCH</text>
+    <rect x="150" y="10" width="112" height="16" rx="8" fill="#FFFFFF" fill-opacity="0.14"/><circle cx="160" cy="18" r="3.5" fill="#5BD17C"/><text x="168" y="22" fill="#FFFFFF" font-size="9">Laptop node · Sew0diIV</text>
+    <rect x="270" y="10" width="220" height="16" rx="8" fill="#FFFFFF" fill-opacity="0.14"/><text x="279" y="22" fill="#FFFFFF" font-size="9">program v1 · applied · 5 assets · 11 rules · 1 schedule</text>
+    <!-- plots column -->
+    <text x="16" y="56" class="lbl" style="font-size:8.5px;letter-spacing:.1em">PLOTS</text>
+    <rect x="16" y="62" width="330" height="58" rx="6" fill="#FFFFFF" stroke="#D9DDE6"/>
+    <text x="26" y="78" class="t" style="font-size:10px">North plot</text>
+    <text x="26" y="92" class="s">Valve · North <tspan fill="#2F7D4A" font-weight="600">ON</tspan> · Flow switch · North <tspan fill="#2E7BD6" font-weight="600">FLOWING</tspan></text>
+    <rect x="26" y="99" width="96" height="15" rx="4" fill="#FFFFFF" stroke="#D9DDE6"/><text x="74" y="110" text-anchor="middle" class="s" style="font-size:8px">No flow when open</text>
+    <rect x="128" y="99" width="88" height="15" rx="4" fill="#FFFFFF" stroke="#D9DDE6"/><text x="172" y="110" text-anchor="middle" class="s" style="font-size:8px">Flow while closed</text>
+    <rect x="16" y="126" width="330" height="58" rx="6" fill="#FFFFFF" stroke="#D9DDE6"/>
+    <text x="26" y="142" class="t" style="font-size:10px">South plot</text>
+    <text x="26" y="156" class="s">Valve · South <tspan fill="#5B6478">off</tspan> · Flow switch · South <tspan fill="#5B6478">no flow</tspan></text>
+    <rect x="26" y="163" width="96" height="15" rx="4" fill="#FFFFFF" stroke="#D9DDE6"/><text x="74" y="174" text-anchor="middle" class="s" style="font-size:8px">No flow when open</text>
+    <rect x="128" y="163" width="88" height="15" rx="4" fill="#E8842B" stroke="#E8842B"/><text x="172" y="174" text-anchor="middle" fill="#FFFFFF" style="font-size:8px;font-weight:600">Flow while closed</text>
+    <text x="16" y="206" class="lbl" style="font-size:8.5px;letter-spacing:.1em">PORTS (IN MEMORY)</text>
+    <g class="s" style="font-size:8.5px">
+      <text x="16" y="222">Bore pump · motor_controller</text>
+      <text x="30" y="236" class="mono">device.power</text><text x="150" y="236">out</text><text x="200" y="236" fill="#2F7D4A" font-weight="600">ON</text>
+      <text x="30" y="249" class="mono">sensor.current</text><text x="150" y="249">in</text><text x="200" y="249">4.47</text>
+      <text x="16" y="264">Valve · North · valve_controller</text>
+      <text x="230" y="222">Flow switch · North · flow_switch</text>
+      <text x="244" y="236" class="mono">sensor.flow</text><text x="320" y="236">in</text><text x="340" y="236" fill="#2F7D4A" font-weight="600">ON</text>
+    </g>
+    <!-- faults column -->
+    <text x="372" y="56" class="lbl" style="font-size:8.5px;letter-spacing:.1em">NODE FAULTS</text>
+    <rect x="372" y="62" width="312" height="22" rx="5" fill="#FBE7D3"/><text x="380" y="76" class="s" style="font-size:8px">Simulated node. Faults are sticky until cleared; the program reacts as it would on a farm.</text>
+    <g style="font-size:8px">
+      <rect x="372" y="92" width="78" height="15" rx="4" fill="#FFFFFF" stroke="#D9DDE6"/><text x="411" y="103" text-anchor="middle" class="s">Node outage 30 s</text>
+      <rect x="456" y="92" width="62" height="15" rx="4" fill="#FFFFFF" stroke="#D9DDE6"/><text x="487" y="103" text-anchor="middle" class="s">Outage 2 min</text>
+      <rect x="524" y="92" width="62" height="15" rx="4" fill="#FFFFFF" stroke="#D9DDE6"/><text x="555" y="103" text-anchor="middle" class="s">Offline 200 s</text>
+      <rect x="592" y="92" width="76" height="15" rx="4" fill="#FFFFFF" stroke="#C4443A"/><text x="630" y="103" text-anchor="middle" fill="#C4443A">Clear all faults</text>
+    </g>
+    <rect x="372" y="116" width="312" height="52" rx="6" fill="#FFFFFF" stroke="#D9DDE6"/>
+    <text x="382" y="131" class="t" style="font-size:10px">Bore pump <tspan class="s" font-weight="400">pump · on for 41 s</tspan></text>
+    <rect x="382" y="138" width="126" height="15" rx="4" fill="#FFFFFF" stroke="#D9DDE6"/><text x="445" y="149" text-anchor="middle" class="s" style="font-size:8px">Dry run (current collapses)</text>
+    <text x="382" y="163" class="s" style="font-size:7.5px">Dry run needs a learned baseline: run a plot ≥ 15 s first. The cutoff fires after 5 s below 80 % of it.</text>
+    <text x="372" y="190" class="lbl" style="font-size:8.5px;letter-spacing:.1em">JOURNAL</text>
+    <g class="mono" style="font-size:8px">
+      <text x="372" y="206"><tspan fill="#5B6478">05:12:40</tspan>  fault ON: flow_on_closed:South plot</text>
+      <text x="372" y="219"><tspan fill="#5B6478">05:12:31</tspan>  North plot: water flowing</text>
+      <text x="372" y="232"><tspan fill="#5B6478">05:12:28</tspan>  pump Bore pump: current flowing</text>
+      <text x="372" y="245"><tspan fill="#5B6478">05:12:26</tspan>  bench physics started</text>
+      <text x="372" y="258"><tspan fill="#5B6478">05:12:26</tspan>  bench page at http://127.0.0.1:8765/</text>
+    </g>
+  </svg>
+  <p class="caption">A mock of the page: plots with their fault buttons, the ports as the program sees them, node-level faults, and the journal of what the physics did.</p>
+
+  <table>
+    <thead><tr><th style="width:14mm">Req.</th><th style="width:34mm">Press</th><th>On the node</th><th>Expect on the phone</th><th style="width:20mm">Budget</th></tr></thead>
+    <tbody>
+      <tr><td class="num">R-11</td><td>Dry run (current collapses)</td><td>The pump's current falls to 30 % of the running value. Needs a learned baseline: run a plot for 15 s first.</td><td>The pump's own program cuts the relay; valves close; alert "Pump stopped: running dry"; the pump card shows <em>Dry run</em>.</td><td class="num">cut ≤ 8 s</td></tr>
+      <tr><td class="num">R-13</td><td>Lose phase R / Y / B</td><td>That phase's current reads 0 and its mains sense reads absent. Three-phase pumps only — the seeded pump is single-phase; add a three-phase pump card to test.</td><td>Phase-loss cutoff while running; with the pump stopped, a start is refused.</td><td class="num">≤ 5 s</td></tr>
+      <tr><td class="num">R-23</td><td>No flow when open · Flow while closed</td><td>The plot's flow switch is held off while its valve is open, or on while it is closed.</td><td>"valve open but no flow" after 20 s; "water flowing while the valve is closed" after 10 s; one push each.</td><td class="num">≤ 60 s</td></tr>
+      <tr><td class="num">R-14 / R-21</td><td>Node outage 30 s</td><td>The runtime stops with safe state, the heartbeat goes silent; then the persisted program reloads, the boot pass runs, an interrupted run resumes.</td><td>Pump off at once (safe state <em>off</em>); after the node returns, history shows the run resumed (within 15 min) or cut short; the badge stays <span class="pill g">Applied</span>.</td><td class="num">≤ 10 s</td></tr>
+      <tr><td class="num">R-28</td><td>Offline 200 s</td><td>No heartbeat and no MQTT for 200 s; the program keeps running on the node.</td><td>"Node offline" push and the red node chip; green again when it reconnects.</td><td class="num">≤ 3 min</td></tr>
+    </tbody>
+  </table>
+  <div class="footer"><span>Thuvagai · Agal One</span><span>The laptop node · 6</span></div>
 </section>
 
 <!-- ============================================================ TROUBLESHOOTING -->
@@ -364,9 +436,10 @@
   <dl class="kv wide">
     <dt><code>--offline</code></dt><dd>runs the persisted program with no cloud at all (a bench without network).</dd>
     <dt><code>agal-one-agent-sim</code></dt><dd>the scripted bench: scenarios for R-7 to R-25 against the default programs, no cloud, no phone.</dd>
+    <dt><code>127.0.0.1:8765</code></dt><dd>the bench page (previous page); <code>blocks.bench_port</code> changes the port.</dd>
     <dt><code>LAPTOP_NODE.md</code></dt><dd>the text version of this document, next to the agent's code.</dd>
   </dl>
-  <div class="footer"><span>Thuvagai · Agal One</span><span>The laptop node · 6</span></div>
+  <div class="footer"><span>Thuvagai · Agal One</span><span>The laptop node · 7</span></div>
 </section>
 </body>
 </html>
