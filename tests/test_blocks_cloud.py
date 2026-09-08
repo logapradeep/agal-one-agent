@@ -69,7 +69,7 @@ class FakeHttp:
 
 def test_cloud_sink_fans_out():
     mqtt, http = FakeMqtt(), FakeHttp()
-    sink = CloudSink(mqtt, http, telemetry_buffer=None, firmware_version="0.2.0")
+    sink = CloudSink(mqtt, http, telemetry_buffer=None, firmware_version="0.2.0", http_async=False)
     sink.variables("pump-1", {"current": 4.2})
     sink.alert("Pump stopped", "critical", "dry_run_alert", None)
     sink.event("run_missed", {"scheduleId": "s1"})
@@ -85,7 +85,7 @@ def test_cloud_sink_fans_out():
 
 def test_cloud_sink_uses_http_when_mqtt_down():
     mqtt, http = FakeMqtt(connected=False), FakeHttp()
-    sink = CloudSink(mqtt, http)
+    sink = CloudSink(mqtt, http, http_async=False)
     sink.variables("pump-1", {"current": 4.2})
     sink.variables("pump-1", {"current": 4.3})
     assert [c for c in http.calls if c[0] == "variables"] == [("variables", "pump-1", {"current": 4.2}), ("variables", "pump-1", {"current": 4.3})]
@@ -202,3 +202,86 @@ def test_mqtt_envelopes_for_program_messages():
         assert topic == "agal/node-1/status" and qos == 1 and body["payload"]["nodeUid"] == "node-1"
     assert published[0][1]["payload"] == {"version": 3, "status": "applied", "timestamp": published[0][1]["payload"]["timestamp"], "firmwareVersion": "0.2.0", "nodeUid": "node-1"}
     assert published[2][1]["payload"]["ruleId"] == "dry_run_alert"
+
+
+def test_variables_uploader_posts_every_change_in_order_and_coalesces_bursts():
+    import time as _t
+    mqtt, http = FakeMqtt(), FakeHttp()
+    sink = CloudSink(mqtt, http, min_interval=0.05)
+    sink.variables("valve-1", {"coil": True, "open": True})
+    sink.variables("valve-1", {"coil": False, "open": False})  # a burst: the latest snapshot wins
+    assert sink.flush(3.0)
+    posts = [c for c in http.calls if c[0] == "variables"]
+    assert posts[-1] == ("variables", "valve-1", {"coil": False, "open": False})
+    assert len(posts) == 1, "both MQTT-fast-path calls collapse into the one HTTPS snapshot"
+    _t.sleep(0.06)
+    sink.variables("valve-1", {"coil": True, "open": True})
+    sink.variables("pump-1", {"relay": True})
+    assert sink.flush(3.0)
+    posts = [c for c in http.calls if c[0] == "variables"]
+    assert posts[-2:] == [("variables", "valve-1", {"coil": True, "open": True}), ("variables", "pump-1", {"relay": True})]
+    assert [c[0] for c in mqtt.calls].count("variables") == 4, "MQTT still gets every change"
+    sink.close()
+
+
+def test_variables_uploader_retries_a_failed_post():
+    class FlakyHttp(FakeHttp):
+        def __init__(self):
+            super().__init__()
+            self.fail_next = 1
+
+        def report_variables(self, asset_id, values):
+            if self.fail_next:
+                self.fail_next -= 1
+                return False
+            return super().report_variables(asset_id, values)
+
+    http = FlakyHttp()
+    sink = CloudSink(FakeMqtt(), http, min_interval=0.01)
+    sink.uploader.retry_after = 0.05
+    sink.variables("flow-1", {"flow": True})
+    assert sink.flush(3.0)
+    assert ("variables", "flow-1", {"flow": True}) in http.calls
+    assert sink.uploader.failed == 1 and sink.uploader.posted == 1
+    sink.close()
+
+
+def test_runtime_reports_full_snapshots_and_everything_after_load():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from agal_one_agent.blocks.clock import SimClock
+
+    class SnapSink:
+        def __init__(self):
+            self.snapshots = []
+
+        def variables(self, asset_id, values):
+            self.snapshots.append((asset_id, dict(values)))
+
+        def alert(self, *a, **k): pass
+
+        def event(self, *a, **k): pass
+
+        def log(self, *a, **k): pass
+
+        def reading(self, *a, **k): pass
+
+        def program_ack(self, *a, **k): pass
+
+    sink = SnapSink()
+    clock = SimClock(datetime(2026, 9, 7, 5, 0, tzinfo=ZoneInfo("Asia/Kolkata")))
+    rt = BlockRuntime(SimulatedIO(), sink, clock=clock)
+    rt.compile(build_bundle_from_defaults(DEFAULTS, "farm"))
+    rt.step()
+    first = {aid for aid, _ in sink.snapshots}
+    assert {"pump-1", "valve-1", "valve-2", "flow-1", "flow-2"} <= first, "every card reported after the program loaded"
+    valve_first = next(v for aid, v in sink.snapshots if aid == "valve-1")
+    assert {"coil", "open", "open_since"} <= set(valve_first), "a snapshot carries every reportable variable"
+    sink.snapshots.clear()
+    rt.apply_command({"type": "runPlot", "plotId": "plot-1", "commandId": "c1"})
+    for _ in range(3):
+        rt.step()
+        clock.advance(1.0)
+    valve_after = [v for aid, v in sink.snapshots if aid == "valve-1"]
+    assert valve_after and valve_after[-1]["coil"] is True and "open" in valve_after[-1] and "open_since" in valve_after[-1]

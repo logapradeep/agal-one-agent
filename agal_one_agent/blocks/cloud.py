@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 import time
 from typing import Any, Optional
 
@@ -17,32 +18,131 @@ from .runtime import EventSink
 logger = logging.getLogger(__name__)
 
 
+class _VariableUploader:
+    """Posts card variable snapshots to the ingress from its own thread — in
+    order, one asset at a time, coalescing bursts (the latest snapshot of an
+    asset wins while an earlier post is in flight), at most one post per asset
+    per ``min_interval``. A failed post keeps the snapshot pending and retries
+    after ``retry_after``. The runtime thread never waits on the network.
+
+    Why HTTPS on every change: the instance has no MQTT consumer for the
+    status topic (Cloud Functions cannot subscribe), so the ingress is the
+    only path that reaches Firestore — and the phone."""
+
+    def __init__(self, http, min_interval: float = 1.0, settle: float = 0.15, retry_after: float = 5.0):
+        self.http = http
+        self.min_interval = min_interval
+        self.settle = settle
+        self.retry_after = retry_after
+        self._pending: dict[str, dict] = {}
+        self._last_sent: dict[str, float] = {}
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._idle = threading.Event()
+        self._idle.set()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.posted = 0
+        self.failed = 0
+
+    def submit(self, asset_id: str, values: dict) -> None:
+        with self._lock:
+            merged = dict(self._pending.pop(asset_id, {}))
+            merged.update(values)
+            self._pending[asset_id] = merged
+            self._idle.clear()
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._loop, name="variables-upload", daemon=True)
+                self._thread.start()
+        self._wake.set()
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        return self._idle.wait(timeout)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+
+    def _next(self) -> tuple[Optional[str], Optional[dict], float]:
+        """The first pending asset that may be sent now, else how long to wait."""
+        now = time.monotonic()
+        with self._lock:
+            wait = self.settle
+            for aid, values in self._pending.items():
+                due = self._last_sent.get(aid, 0.0) + self.min_interval
+                if due <= now:
+                    del self._pending[aid]
+                    return aid, values, 0.0
+                wait = min(wait, due - now)
+            if not self._pending:
+                self._idle.set()
+            return None, None, wait
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            self._wake.wait(timeout=self.settle)
+            self._wake.clear()
+            time.sleep(self.settle)  # let a burst settle into one snapshot
+            while not self._stop.is_set():
+                aid, values, wait = self._next()
+                if aid is None:
+                    if wait > 0 and self._pending:
+                        time.sleep(wait)
+                        continue
+                    break
+                ok = False
+                try:
+                    ok = bool(self.http.report_variables(aid, values))
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("variables http: %s", e)
+                self._last_sent[aid] = time.monotonic()
+                if ok:
+                    self.posted += 1
+                else:
+                    self.failed += 1
+                    with self._lock:
+                        # newer values (if any) win over the failed snapshot
+                        merged = dict(values)
+                        merged.update(self._pending.pop(aid, {}))
+                        self._pending[aid] = merged
+                        self._pending = {aid: self._pending.pop(aid), **self._pending}
+                        self._idle.clear()
+                    time.sleep(self.retry_after)
+
+
 class CloudSink(EventSink):
     """Runtime → cloud. MQTT is the fast path when connected; HTTPS is the durable
-    twin for acks and alerts; readings ride the existing buffer + live channel."""
+    twin for acks and alerts; readings ride the existing buffer + live channel.
+    Card variables go to the ingress on every change (see _VariableUploader)."""
 
-    def __init__(self, mqtt_client, http_reporter, telemetry_buffer=None, firmware_version: str = ""):
+    def __init__(self, mqtt_client, http_reporter, telemetry_buffer=None, firmware_version: str = "",
+                 http_async: bool = True, min_interval: float = 1.0):
         self.mqtt = mqtt_client
         self.http = http_reporter
         self.buffer = telemetry_buffer
         self.firmware_version = firmware_version
         self.last_ack: Optional[dict] = None
-        self._last_var_http: dict[str, float] = {}
+        self.uploader: Optional[_VariableUploader] = _VariableUploader(http_reporter, min_interval=min_interval) if http_async else None
 
     def variables(self, asset_id: str, values: dict[str, Any]) -> None:
-        sent = False
         try:
-            sent = self.mqtt.publish_variables(asset_id, values)
+            self.mqtt.publish_variables(asset_id, values)
         except Exception as e:  # noqa: BLE001
             logger.debug("variables mqtt: %s", e)
-        # HTTPS at most every 30 s per asset (the MQTT path is the live one).
-        now = time.monotonic()
-        if not sent or now - self._last_var_http.get(asset_id, 0.0) >= 30.0:
-            self._last_var_http[asset_id] = now
-            try:
-                self.http.report_variables(asset_id, values)
-            except Exception as e:  # noqa: BLE001
-                logger.debug("variables http: %s", e)
+        if self.uploader is not None:
+            self.uploader.submit(asset_id, values)
+            return
+        try:
+            self.http.report_variables(asset_id, values)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("variables http: %s", e)
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        return self.uploader.flush(timeout) if self.uploader is not None else True
+
+    def close(self) -> None:
+        if self.uploader is not None:
+            self.uploader.stop()
 
     def alert(self, text: str, severity: str, rule_id: Optional[str], asset_id: Optional[str] = None) -> None:
         logger.warning("ALERT [%s] %s (rule %s)", severity, text, rule_id)

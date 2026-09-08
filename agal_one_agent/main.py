@@ -538,6 +538,9 @@ def main():
                 runtime.stop(safe_state=True)
             except Exception as e:  # noqa: BLE001
                 logger.error("runtime stop failed: %s", e)
+        if cloud_sink is not None:
+            cloud_sink.flush(timeout=3.0)
+            cloud_sink.close()
         telemetry.stop()
         # Final drain attempt so a clean shutdown doesn't strand buffered rows.
         try:

@@ -21,7 +21,20 @@ Laptop node for the phone tests (rebuild P4 exit test, `_audit/99`).
   node outage (runtime stops with safe state, reloads the persisted program,
   boots and resumes — R-14/R-21) and an offline period (no heartbeat, MQTT
   disconnected — R-28). `HeartbeatPublisher.pause()/resume()` added for it.
-- Tests: 5 new (221 total). See `LAPTOP_NODE.md`.
+- **Card variables reach the cloud on every change.** The instance has no MQTT
+  consumer for the status topic (Cloud Functions cannot subscribe), so the
+  HTTPS ingress is the only path to Firestore and the phone — and the sink
+  used it only every 30 s per asset, with only the values that changed in
+  the last second. A valve closing between two HTTPS samples stayed "open"
+  on the phone (found on the first laptop-node run, 2026-09-08). Now the
+  runtime reports a full snapshot of a card's UI / local / node variables
+  whenever any of them changes (and every card once after a program loads),
+  and `CloudSink` posts them from an ordered, coalescing uploader thread
+  (`_VariableUploader`: latest snapshot per asset wins, ≥ 1 s apart per
+  asset, failed posts retried) so the runtime never waits on the network.
+  MQTT keeps every change as before.
+- Version constant bumped to 0.2.1 (`setup.py`, `__init__`).
+- Tests: 8 new (224 total). See `LAPTOP_NODE.md`.
 
 ## 0.2.0 (2026-09-07)
 

@@ -5,7 +5,7 @@ setup(
     # 0.2.0 (2026-09-07): automation-block runtime (ADR-017, contracts v1.5.0).
     # NOTE: the fleet provisioner still pins v0.1.6 until the backend side of
     # ADR-017 (rebuild phase P2) lands; 0.1.7/0.1.8 were never tagged.
-    version="0.2.0",
+    version="0.2.1",
     packages=find_packages(),
     install_requires=[
         "paho-mqtt>=2.0.0",

@@ -246,6 +246,10 @@ class BlockRuntime:
             self._restore_state(old_state)  # carry baselines / schedule state across versions
             self._load_persisted()
             self._applied_pending = True
+            # First pass after a (re)load reports every card in full, so the
+            # cloud's copy is corrected right after a restart.
+            for blk in self.aabs.values():
+                blk.dirty.update(blk.vars.keys())
             self._active_runs = {p: r for p, r in self._active_runs.items() if p in (nab.plots if nab else {})}
         logger.info("program v%d compiled: %d assets, NAB %d rules / %d schedules", self.version, len(order), len(nab.rules) if nab else 0, len(nab.schedules) if nab else 0)
 
@@ -1081,7 +1085,11 @@ class BlockRuntime:
             due = self._var_report_next.get(aid, 0.0)
             if now < due:
                 continue
-            values = {n: blk.vars[n].value for n in sorted(blk.dirty) if blk.vars[n].kind in ("ui", "local", "node")}
+            # A full snapshot of the card's reportable variables, not only the
+            # ones that changed: the cloud keeps the last snapshot it received,
+            # so a lost message can never leave a stale value behind (the
+            # phone reads these — R-27).
+            values = {n: v.value for n, v in blk.vars.items() if v.kind in ("ui", "local", "node")}
             blk.dirty.clear()
             if values:
                 self.sink.variables(aid, values)
