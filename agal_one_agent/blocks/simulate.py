@@ -49,6 +49,46 @@ def build_bundle_from_defaults(defaults_dir: str, kit: str = "farm") -> dict:
             {"assetId": "flow-1", "assetType": "flow_switch", "name": "Flow 1", "aab": load("aab_flow_switch.json"), "ports": {"sensor.flow": {"kind": "gpio", "gpioNumber": 5, "direction": "in"}}},
             {"assetId": "flow-2", "assetType": "flow_switch", "name": "Flow 2", "aab": load("aab_flow_switch.json"), "ports": {"sensor.flow": {"kind": "gpio", "gpioNumber": 6, "direction": "in"}}},
         ]
+    elif kit == "farm3":
+        # The first three-phase install (_audit/103 §7): a three-phase pump with every port
+        # of the maximal template linked (relay, three currents, three mains-sense, three
+        # voltages) and four solenoid valves with no flow switches. The NAB is nab_farm.json
+        # rebuilt for four plots, the way the app's NodeProgramBuilder does it per site.
+        nab = load("nab_farm.json")
+        valves = [1, 2, 3, 4]
+        nab["variables"] = [v for v in nab["variables"] if not v["name"].startswith(("valve_", "flow_")) and v["name"] != "any_valve_open"]
+        alert_var = nab["variables"].pop()  # keep the alert variable last, as in the template
+        for n in valves:
+            nab["variables"].append({"name": f"valve_{n}", "kind": "asset", "type": "bool", "settable": True,
+                                     "asset": {"assetId": f"$valve{n}", "variable": "coil", "access": "write"}})
+        nab["variables"].append({"name": "any_valve_open", "kind": "local", "type": "bool",
+                                 "expression": " or ".join(f"valve_{n}" for n in valves)})
+        nab["variables"].append(alert_var)
+        nab["plots"] = [{"plotId": f"$plot{n}", "name": f"Plot {n}", "valveVariables": [f"valve_{n}"]} for n in valves]
+        close_all = [{"type": "set", "variable": f"valve_{n}", "value": False} for n in valves]
+        rules = []
+        for r in nab["rules"]:
+            if r["id"].startswith(("no_flow_plot_", "unexpected_flow_plot_")):
+                continue  # no flow switches on this site
+            if r["id"] in ("max_run", "dry_run_alert", "pump_fault_stop", "boot_safe"):
+                kept = [a for a in r["actions"] if not (a.get("type") == "set" and str(a.get("variable", "")).startswith("valve_"))]
+                first_other = next((i for i, a in enumerate(kept) if a.get("type") != "set"), len(kept))
+                r = dict(r, actions=kept[:first_other] + close_all + kept[first_other:])
+            if r["id"] == "interruption_log":
+                r = dict(r, actions=[{"type": "log", "text": "Interruption: pump {pump_relay}"}])
+            rules.append(r)
+        nab["rules"] = rules
+        subst = {"$pump": "pump-1", **{f"$valve{n}": f"valve-{n}" for n in valves}, **{f"$plot{n}": f"plot-{n}" for n in valves}}
+        pump_ports = {"device.power": {"kind": "gpio", "gpioNumber": 17, "direction": "out"}}
+        for i, ph in enumerate("ryb"):
+            pump_ports[f"sensor.current.{ph}"] = {"kind": "i2c", "busId": 1, "addr": 72, "channel": i}
+            pump_ports[f"sensor.voltage.{ph}"] = {"kind": "i2c", "busId": 1, "addr": 73, "channel": i}
+            pump_ports[f"sensor.mains.{ph}"] = {"kind": "gpio", "gpioNumber": 5 + i, "direction": "in"}
+        assets = [{"assetId": "pump-1", "assetType": "motor_controller", "name": "Pump", "phaseType": "three_phase",
+                   "aab": load("aab_pump_three_phase.json"), "ports": pump_ports}]
+        for n, gpio in zip(valves, (27, 22, 23, 24)):
+            assets.append({"assetId": f"valve-{n}", "assetType": "valve_controller", "name": f"Valve {n}", "aab": load("aab_valve.json"),
+                           "ports": {"device.power": {"kind": "gpio", "gpioNumber": gpio, "direction": "out"}}})
     else:
         nab = load("nab_building.json")
         subst = {"$tank": "tank-1", "$pump": "pump-1", "$light1": "light-1"}
@@ -108,7 +148,7 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description="Run an automation-block bundle against a scenario (no hardware)")
     ap.add_argument("--bundle", help="compiled bundle JSON (default: farm kit built from contracts defaults)")
     ap.add_argument("--defaults", help="Agal/contracts/programs/defaults directory (when --bundle is not given)")
-    ap.add_argument("--kit", default="farm", choices=["farm", "building"])
+    ap.add_argument("--kit", default="farm", choices=["farm", "farm3", "building"])
     ap.add_argument("--scenario", required=True)
     ap.add_argument("--tick", type=float, default=1.0)
     ap.add_argument("--json", action="store_true", help="print the final snapshot as JSON only")

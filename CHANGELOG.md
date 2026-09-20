@@ -46,6 +46,16 @@ Laptop node for the phone tests (rebuild P4 exit test, `_audit/99`).
   `last_status`.
 - **Bench page never takes the agent down:** a held port falls back to a free
   one, and any start-up failure is logged instead of raised.
+- **Three-phase bench (`--kit farm3`, 2026-09-20):** `build_bundle_from_defaults` composes the
+  first three-phase site — a three-phase pump with every port of the maximal v2 template
+  linked (relay, three currents, three mains-sense, three voltages) and four solenoid valves
+  without flow switches, the NAB rebuilt for four plots the way the app's builder does.
+  `tests/test_blocks_three_phase.py` (17): phase loss, start refused on a missing phase,
+  imbalance, dry run, overload (inert until a rated current is set), voltage range and start
+  refused on bad voltage, did-not-start reported as such and not as a dry run, a run started
+  at the starter panel, trip flags cleared on the next start, and the NAB's response — any
+  pump fault closes the valves and raises one critical alert; a hand-start with every valve
+  closed is critical. The three-phase template had no bench coverage before. 244 tests.
 - Version constant bumped to 0.2.1 (`setup.py`, `__init__`).
 - Tests: 8 new (224 total). See `LAPTOP_NODE.md`.
 
