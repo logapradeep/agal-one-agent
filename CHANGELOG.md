@@ -1,5 +1,29 @@
 # Changelog — agal-one-agent
 
+## 0.3.1 (2026-09-20)
+
+An analog input is read from what its PORT says (contracts v1.9.1).
+
+- **`ports/analog.py`** — an AI port is an ADC channel plus two facts that travel with its
+  transport (in the compiled bundle and in a `testPort` command): `measure`
+  `{mode: dc | ac_rms, windowMs}` and `transform` `{scale = units per volt, offset,
+  clampMin, clampMax}`. A current sensor on a mains motor is therefore **not a driver** and
+  needs no `config.pins` entry: it is `ac_rms` and a scale on an ADS1115 channel. `ac_rms`
+  removes the window's mean before it squares, so a Hall sensor idling at half its supply
+  or a current transformer on a mid-rail bias needs no zero calibration, and a drifting
+  supply does not read as current. One driver today: `ads1115` on I2C, at its widest range
+  (a 5 V sensor idles at 2.5 V). A channel is sampled at most twice a second, so three
+  phase currents do not stretch a program pass. Nothing is simulated: a port the agent
+  cannot read answers `None` and a test says so in words.
+- **The running program** reads such a port through `HardwareIO` (the value arrives in the
+  port's unit — amps, not volts); the older `config.pins` sensor drivers keep working.
+- **`testPort` `read` on an AI port** watches it for a few seconds and answers in the
+  port's unit with the volts behind it: `11.8 A now; 11.6–12.0 A over 5 s (AC RMS,
+  0.472 V at the channel)`. An ADC that does not answer fails the test with its address.
+- **Fix — a GPIO chip was reported twice.** Raspberry Pi OS keeps `/dev/gpiochip4` as a
+  link to `gpiochip0`; chips are now listed once, by their real device (seen on the first
+  real board, a Pi 3 Model B, 2026-09-20).
+
 ## 0.3.0 (2026-09-20)
 
 Node linking (ADR-024, contracts v1.9.0 — `Agal/contracts/nodes/README.md`): a board is

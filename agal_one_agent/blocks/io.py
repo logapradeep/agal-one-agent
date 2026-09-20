@@ -120,13 +120,14 @@ class HardwareIO(IOAdapter):
     """
 
     def __init__(self, configured_gpios: Optional[set[int]] = None,
-                 sensor_by_key: Optional[dict[str, Any]] = None, lines=None):
+                 sensor_by_key: Optional[dict[str, Any]] = None, lines=None, analog=None):
         from ..command_executor import _get_handler
         self._get_handler = _get_handler
         self._configured = configured_gpios
         self._sensors = sensor_by_key or {}
         self._lock = threading.Lock()
         self._lines = lines  # ports.gpiochip.LineIO — the character-device path (ADR-024)
+        self._analog = analog  # ports.analog.AnalogReader — an AI port read from its own wiring facts (v1.9.1)
 
     def has_port(self, port: PortRef) -> bool:
         if port.kind == "gpio" and port.line is not None:
@@ -138,6 +139,8 @@ class HardwareIO(IOAdapter):
                 return False
             return self._configured is None or port.gpio in self._configured
         if port.kind in ("i2c", "spi", "uart", "onewire", "virtual"):
+            if self._analog is not None and self._analog.supports(port.transport):
+                return True
             return port.source_key in self._sensors or port.kind != "virtual"
         return False
 
@@ -155,6 +158,14 @@ class HardwareIO(IOAdapter):
                     return r
             except Exception as e:  # noqa: BLE001
                 logger.debug("sensor read %s failed: %s", port.source_key, e)
+                return None
+        if self._analog is not None and self._analog.supports(port.transport):
+            # An AI port of the node's table: the channel, how it is read and its scale all
+            # come with the transport — the value is already in the port's unit (amps, bar …).
+            try:
+                return self._analog.read(port.transport)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("analog read %s failed: %s", port.source_key, e)
                 return None
         if port.kind == "gpio" and port.line is not None and self._lines is not None:
             try:

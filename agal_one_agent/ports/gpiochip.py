@@ -85,7 +85,14 @@ def read_chip(path: str, ioctl: Callable[[str, int, bytearray], None] = _default
 def list_chips(dev_glob: str = "/dev/gpiochip*", ioctl: Callable[[str, int, bytearray], None] = _default_ioctl,
                with_lines: bool = True) -> list[ChipInfo]:
     chips: list[ChipInfo] = []
+    seen: set[str] = set()
     for path in sorted(glob.glob(dev_glob), key=lambda p: (len(p), p)):
+        # Raspberry Pi OS keeps /dev/gpiochip4 as a LINK to gpiochip0 for older software: the
+        # same chip under two names (the first real board reported it twice, 2026-09-20).
+        real = os.path.realpath(path)
+        if real in seen:
+            continue
+        seen.add(real)
         try:
             chips.append(read_chip(path, ioctl, with_lines))
         except OSError as e:

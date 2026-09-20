@@ -227,14 +227,14 @@ class CloudSink(EventSink):
             logger.debug("ack mqtt: %s", e)
 
 
-def build_hardware_io(config, sensor_by_key: Optional[dict] = None, lines=None):
+def build_hardware_io(config, sensor_by_key: Optional[dict] = None, lines=None, analog=None):
     """HardwareIO gated on the node's configured BCM numbers, with the registered
     sensor drivers keyed by their pin label (= PortBinding.sourceKey). ``lines`` is the
     character-device path (ports.gpiochip.LineIO): ports that name a chip LABEL + line
     (contracts v1.9.0, ADR-024) go through it, on every Linux board."""
     from .io import HardwareIO
     gpios = {p.gpio_number for p in config.pins if p.gpio_number is not None}
-    return HardwareIO(configured_gpios=gpios or None, sensor_by_key=sensor_by_key or {}, lines=lines)
+    return HardwareIO(configured_gpios=gpios or None, sensor_by_key=sensor_by_key or {}, lines=lines, analog=analog)
 
 
 def sensors_by_key(config) -> dict:

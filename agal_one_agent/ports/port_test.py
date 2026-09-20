@@ -12,6 +12,7 @@ import logging
 import time
 from typing import Callable, Optional
 
+from .analog import scaled
 from .gpiochip import LineIO, PortUnavailable
 
 logger = logging.getLogger(__name__)
@@ -19,17 +20,51 @@ MAX_PULSE_S = 5
 MAX_READ_S = 30
 
 
+def _num(v: float) -> str:
+    return f"{v:.3f}" if abs(v) < 10 else f"{v:.2f}" if abs(v) < 100 else f"{v:.1f}"
+
+
+def _read_analog(command: dict, transport: dict, analog, sleep: Callable[[float], None]) -> dict:
+    """Watch an AI port: what the program would see (in the port's unit) and the volts behind it."""
+    unit = str(command.get("unit") or "").strip()
+    seconds = max(1, min(MAX_READ_S, int(command.get("seconds") or 5)))
+    values: list[float] = []
+    volts: list[float] = []
+    waited = 0.0
+    while waited < seconds:
+        v = analog.read_volts(transport, fresh=True)
+        if v is not None:
+            volts.append(v)
+            values.append(scaled(v, transport.get("transform")))
+        sleep(0.4)
+        waited += 0.5  # a window (~0.1 s) plus the pause
+    if not values:
+        where = f"0x{int(transport.get('addr', 0)):02x} on I2C-{transport.get('busId', 1)}"
+        return {"result": "failed", "detail": f"nothing answered at {where} — check the wiring and the address"}
+    last = values[-1]
+    u = f" {unit}" if unit else ""
+    how = "AC RMS" if (transport.get("measure") or {}).get("mode") == "ac_rms" else "steady value"
+    return {"result": "passed", "value": round(last, 4),
+            "detail": f"{_num(last)}{u} now; {_num(min(values))}–{_num(max(values))}{u} over {seconds} s "
+                      f"({how}, {_num(volts[-1])} V at the channel)"}
+
+
 def run_port_test(command: dict, lines: LineIO, busy: Optional[Callable[[str, int], bool]] = None,
-                  sleep: Callable[[float], None] = time.sleep) -> dict:
+                  sleep: Callable[[float], None] = time.sleep, analog=None) -> dict:
     """Returns {portId, result: passed|failed, detail?, value?}. Never raises."""
     port_id = str(command.get("portId") or "")
     action = command.get("action")
     transport = command.get("transport") or {}
     out: dict = {"portId": port_id}
     try:
+        if analog is not None and analog.supports(transport):
+            if action != "read":
+                return {**out, "result": "failed", "detail": "an analog input is watched, not pulsed"}
+            return {**out, **_read_analog(command, transport, analog, sleep)}
         if transport.get("kind") != "gpio" or not transport.get("chip") or transport.get("line") is None:
             return {**out, "result": "failed",
-                    "detail": f"this agent cannot test a {transport.get('kind', 'unknown')} port yet — header pins only"}
+                    "detail": f"this agent cannot test a {transport.get('driver') or transport.get('kind', 'unknown')} port yet — "
+                              "header pins and ADS1115 channels only"}
         label, line = str(transport["chip"]), int(transport["line"])
         active_low = bool(transport.get("activeLow") or command.get("activeLow"))
         if busy and busy(label, line):

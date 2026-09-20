@@ -89,11 +89,13 @@ def main():
 
     # ---- Node linking (ADR-024): one GPIO path for every Linux board, and the
     # report of what this board is and has. Nothing here names a board.
+    from .ports.analog import AnalogReader
     from .ports.gpiochip import LineIO
     from .ports.inventory import hardware_report
     from .ports.port_test import run_port_test
     from .ports.bus_scan import run_bus_scan
     line_io = LineIO()
+    analog_io = AnalogReader()  # AI ports, read from their own wiring facts (contracts v1.9.1)
 
     def _report_hardware():
         try:
@@ -252,7 +254,7 @@ def main():
             block_io = SimulatedIO()
             logger.warning("blocks.simulated_io is ON — ports are simulated; this must never run on a farm node")
         else:
-            block_io = build_hardware_io(config, sensors_by_key(config), lines=line_io)
+            block_io = build_hardware_io(config, sensors_by_key(config), lines=line_io, analog=analog_io)
         runtime = BlockRuntime(
             block_io,
             cloud_sink,
@@ -405,7 +407,8 @@ def main():
                               "detail": f"through the running program: on for {seconds} s, then off" if on.get("accepted")
                               else str(on.get("reason") or "the program refused it")[:200]}
                 else:
-                    result = run_port_test(command, line_io, busy=(lambda label, line: _runtime_port(label, line) is not None))
+                    result = run_port_test(command, line_io, busy=(lambda label, line: _runtime_port(label, line) is not None),
+                                           analog=analog_io)
                 http_reporter.report_port_test(command_id, result)
                 mqtt_client.publish_command_ack(command_id, "completed" if result["result"] == "passed" else "failed",
                                                 error=None if result["result"] == "passed" else result.get("detail"))

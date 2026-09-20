@@ -163,7 +163,7 @@ def test_a_port_the_program_is_driving_a_missing_chip_and_a_bus_port_fail_with_a
     assert "pause automation first" in run_port_test({"portId": "DO1", "action": "pulse", "transport": gpio}, lines, busy=lambda c, l: True)["detail"]
     assert log == []
     assert "no GPIO chip labelled gpio9" in run_port_test({"portId": "DO1", "action": "pulse", "transport": {**gpio, "chip": "gpio9"}}, lines)["detail"]
-    assert "header pins only" in run_port_test({"portId": "DO9", "action": "pulse", "transport": {"kind": "modbus_rtu"}}, lines)["detail"]
+    assert "cannot test a modbus_rtu port yet" in run_port_test({"portId": "DO9", "action": "pulse", "transport": {"kind": "modbus_rtu"}}, lines)["detail"]
     assert run_port_test({"portId": "DO1", "action": "toggle", "transport": gpio}, lines)["result"] == "failed"
 
 
@@ -266,3 +266,25 @@ def test_a_modbus_scan_reports_the_units_that_answer_and_only_suggests():
     assert bus_scan.scan_modbus("/dev/nope", {}, opener=lambda d, s: (_ for _ in ()).throw(OSError("no such device"))) is None
     r = bus_scan.run_bus_scan({"bus": {"id": "SPI-0", "kind": "spi", "device": "/dev/spidev0.0"}})
     assert r["answered"] == [] and "cannot be scanned" in r["error"]
+
+
+def test_a_chip_that_appears_under_two_device_names_is_listed_once(tmp_path):
+    """Raspberry Pi OS links /dev/gpiochip4 → gpiochip0; the first real board reported the chip twice."""
+    from agal_one_agent.ports import gpiochip
+
+    real = tmp_path / "gpiochip0"
+    real.write_bytes(b"")
+    (tmp_path / "gpiochip4").symlink_to(real)
+    opened: list[str] = []
+
+    def fake_read_chip(path, ioctl, with_lines):
+        opened.append(path)
+        return gpiochip.ChipInfo(path=path, name="gpiochip0", label="pinctrl-bcm2835", lines=54, used_lines=[])
+
+    original = gpiochip.read_chip
+    gpiochip.read_chip = fake_read_chip
+    try:
+        chips = gpiochip.list_chips(dev_glob=str(tmp_path / "gpiochip*"))
+    finally:
+        gpiochip.read_chip = original
+    assert len(chips) == 1 and len(opened) == 1
