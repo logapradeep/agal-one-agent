@@ -1,6 +1,6 @@
 # Changelog — agal-one-agent
 
-## 0.3.0 (unreleased, 2026-09-20)
+## 0.3.0 (2026-09-20)
 
 Node linking (ADR-024, contracts v1.9.0 — `Agal/contracts/nodes/README.md`): a board is
 data in the cloud, and the agent does the same three things on every Linux board. Nothing
