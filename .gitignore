@@ -1,0 +1,7 @@
+# Build and run-time artefacts — never source (they made the tree dirty after every test run)
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.pytest_cache/
+state/
