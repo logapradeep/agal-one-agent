@@ -1,5 +1,40 @@
 # Changelog — agal-one-agent
 
+## 0.3.0 (unreleased, 2026-09-20)
+
+Node linking (ADR-024, contracts v1.9.0 — `Agal/contracts/nodes/README.md`): a board is
+data in the cloud, and the agent does the same three things on every Linux board. Nothing
+in the agent names a board.
+
+- **`ports/gpiochip.py`** — GPIO through the kernel **character device**, addressed by the
+  chip's **label** and a line offset (`pinctrl-bcm2835` line 17), never by chip number
+  (it differs between OS images) or Broadcom pin number (it exists on one board family).
+  Chip and line information — including **which lines the kernel holds** — comes from two
+  ioctls (v2 ABI, falling back to v1); line I/O from `python-periphery`. All pure Python:
+  nothing compiles on any board or architecture. `LineIO` keeps one request per line.
+- **`ports/inventory.py`** — the **hardware report**, posted to `reportHardware` at start
+  and after every `syncPorts`: what the board is (model from the device tree, serial, SoC,
+  OS, kernel, memory, Python, agent version, the interface of the default route) and what
+  it has (GPIO chips with kernel-held lines, I2C / SPI / serial devices with the stable
+  `/dev/serial/by-id` path of a USB adapter, RTC, IIO ADCs, the I2C addresses that answer).
+  The cloud checks a port table against THIS, not against a list of boards.
+- **`testPort`** (`ports/port_test.py`) — the commissioning check of one port: pulse an
+  output (at most 5 s; off and released even when interrupted; active-low honoured) or
+  watch an input. The command carries the port's own transport, so it works before any
+  card or program exists — the first check on a new board is an LED on `DIO1`. A port
+  the running program drives is pulsed **through the runtime**: there is one writer.
+- **`scanBus`** (`ports/bus_scan.py`) — what answers on I2C, or on a short range of
+  Modbus units over RS-485 (one read-coils request each; a reply **or an exception**
+  proves a device is there). A scan only suggests; the app asks the person what it is.
+- **`syncPorts`** — the port table changed: pull the program, report the hardware again.
+- **Block runtime I/O** — `HardwareIO` drives ports that name a chip label + line through
+  `LineIO`; a bundle naming a chip this board does not have is rejected at compile time.
+  Ports with a Broadcom number keep working through the old handlers.
+- Not yet: the generic Modbus RTU driver for relay boxes and meters, the MCP23017 /
+  PCF8574 expander drivers, per-port health reports, and the v2 block runtime
+  (`capabilities.blockLanguage` stays absent = 1).
+- Tests: `tests/test_ports_node_linking.py` (19, all against fakes); suite 263.
+
 ## 0.2.1 (unreleased, 2026-09-07)
 
 Laptop node for the phone tests (rebuild P4 exit test, `_audit/99`).

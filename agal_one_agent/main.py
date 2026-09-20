@@ -87,6 +87,25 @@ def main():
     http_reporter = HttpReporter(config.node.uid, auth_token=config.node.auth_token,
                                  base_url=config.telemetry.ingress_url)
 
+    # ---- Node linking (ADR-024): one GPIO path for every Linux board, and the
+    # report of what this board is and has. Nothing here names a board.
+    from .ports.gpiochip import LineIO
+    from .ports.inventory import hardware_report
+    from .ports.port_test import run_port_test
+    from .ports.bus_scan import run_bus_scan
+    line_io = LineIO()
+
+    def _report_hardware():
+        try:
+            answer = http_reporter.report_hardware(hardware_report(__version__))
+            if answer:
+                logger.info("Hardware reported: board profile %s (%s); port table v%s",
+                            answer.get("boardProfileId") or "none", answer.get("boardMatch"), answer.get("portsVersion"))
+        except Exception as e:  # noqa: BLE001 — never takes the agent down
+            logger.warning("hardware report failed: %s", e)
+
+    threading.Thread(target=_report_hardware, name="hardware-report", daemon=True).start()
+
     # LoRa bridge (local — ChirpStack Gateway Bridge)
     lora_bridge = None
     if config.is_lora_gateway and config.lora and config.lora.gateway:
@@ -233,7 +252,7 @@ def main():
             block_io = SimulatedIO()
             logger.warning("blocks.simulated_io is ON — ports are simulated; this must never run on a farm node")
         else:
-            block_io = build_hardware_io(config, sensors_by_key(config))
+            block_io = build_hardware_io(config, sensors_by_key(config), lines=line_io)
         runtime = BlockRuntime(
             block_io,
             cloud_sink,
@@ -282,6 +301,18 @@ def main():
         )
 
     # Command handler
+    def _runtime_port(label, line):
+        """(assetId, sourceKey) of the program variable that drives this chip line, if any."""
+        if runtime is None or runtime.nab is None or label is None or line is None:
+            return None
+        for aid, blk in runtime.aabs.items():
+            for v in blk.vars.values():
+                port = getattr(v, "port", None)
+                t = getattr(port, "transport", None) or {}
+                if t.get("chip") == label and t.get("line") is not None and int(t["line"]) == int(line):
+                    return (aid, port.source_key)
+        return None
+
     def on_command(command: dict):
         cmd_type = command.get("type", "")
         command_id = command.get("commandId", "")
@@ -352,6 +383,55 @@ def main():
                 pwm_handler.release(gpio)
             logger.info("Pin config updated: %d pins active", len(config.pins))
             mqtt_client.publish_command_ack(command_id, "completed")
+            return
+
+        # ---- Node linking (ADR-024) ------------------------------------------
+        # testPort: the commissioning check of ONE port. The command carries the
+        # port's own transport, so it works before any card or program exists
+        # (the first check on a new board is an LED on DIO1). A port the running
+        # program drives is pulsed THROUGH the runtime — there is one writer.
+        if cmd_type == "testPort":
+            mqtt_client.publish_command_ack(command_id, "acknowledged")
+
+            def _test():
+                t = command.get("transport") or {}
+                owned = _runtime_port(t.get("chip"), t.get("line"))
+                if owned and command.get("action") == "pulse":
+                    seconds = max(1, min(5, int(command.get("seconds") or 2)))
+                    on = runtime.apply_command({"type": "setPower", "assetId": owned[0], "sourceKey": owned[1], "value": 1})
+                    time.sleep(seconds)
+                    runtime.apply_command({"type": "setPower", "assetId": owned[0], "sourceKey": owned[1], "value": 0})
+                    result = {"portId": command.get("portId"), "result": "passed" if on.get("accepted") else "failed",
+                              "detail": f"through the running program: on for {seconds} s, then off" if on.get("accepted")
+                              else str(on.get("reason") or "the program refused it")[:200]}
+                else:
+                    result = run_port_test(command, line_io, busy=(lambda label, line: _runtime_port(label, line) is not None))
+                http_reporter.report_port_test(command_id, result)
+                mqtt_client.publish_command_ack(command_id, "completed" if result["result"] == "passed" else "failed",
+                                                error=None if result["result"] == "passed" else result.get("detail"))
+
+            threading.Thread(target=_test, name="port-test", daemon=True).start()
+            return
+
+        if cmd_type == "scanBus":
+            mqtt_client.publish_command_ack(command_id, "acknowledged")
+
+            def _scan():
+                result = run_bus_scan(command)
+                http_reporter.report_bus_scan(result)
+                mqtt_client.publish_command_ack(command_id, "failed" if result.get("error") else "completed", error=result.get("error"))
+
+            threading.Thread(target=_scan, name="bus-scan", daemon=True).start()
+            return
+
+        # syncPorts {portsVersion}: the port table changed. The ports a program uses
+        # arrive inside its bundle, so this is a program pull; and the board says
+        # again what it has (a bus may have been turned on since).
+        if cmd_type == "syncPorts":
+            mqtt_client.publish_command_ack(command_id, "completed")
+            if program_sync is not None:
+                program_sync.pull()
+            threading.Thread(target=_report_hardware, name="hardware-report", daemon=True).start()
             return
 
         # ---- Automation blocks (ADR-017) -------------------------------------

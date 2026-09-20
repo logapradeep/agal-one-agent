@@ -39,6 +39,13 @@ class PortRef:
         g = self.transport.get("gpioNumber")
         return int(g) if g is not None else None
 
+    @property
+    def line(self) -> Optional[tuple[str, int]]:
+        """(chip LABEL, line) — how a port names a GPIO since contracts v1.9.0 (ADR-024).
+        Broadcom numbers (``gpio``) exist on one board family; this works on every Linux board."""
+        chip, line = self.transport.get("chip"), self.transport.get("line")
+        return (str(chip), int(line)) if chip and line is not None else None
+
 
 class IOAdapter:
     def has_port(self, port: PortRef) -> bool:
@@ -113,14 +120,19 @@ class HardwareIO(IOAdapter):
     """
 
     def __init__(self, configured_gpios: Optional[set[int]] = None,
-                 sensor_by_key: Optional[dict[str, Any]] = None):
+                 sensor_by_key: Optional[dict[str, Any]] = None, lines=None):
         from ..command_executor import _get_handler
         self._get_handler = _get_handler
         self._configured = configured_gpios
         self._sensors = sensor_by_key or {}
         self._lock = threading.Lock()
+        self._lines = lines  # ports.gpiochip.LineIO — the character-device path (ADR-024)
 
     def has_port(self, port: PortRef) -> bool:
+        if port.kind == "gpio" and port.line is not None:
+            # The cloud has already checked the line against this node's own inventory;
+            # here it is enough that the chip label exists on this board.
+            return self._lines is not None and self._lines.has(port.line[0])
         if port.kind in ("gpio", "pwm"):
             if port.gpio is None:
                 return False
@@ -144,6 +156,12 @@ class HardwareIO(IOAdapter):
             except Exception as e:  # noqa: BLE001
                 logger.debug("sensor read %s failed: %s", port.source_key, e)
                 return None
+        if port.kind == "gpio" and port.line is not None and self._lines is not None:
+            try:
+                return self._lines.read(port.line[0], port.line[1], bool(port.transport.get("activeLow")))
+            except Exception as e:  # noqa: BLE001
+                logger.debug("line read %s failed: %s", port.source_key, e)
+                return None
         if port.kind == "gpio" and port.gpio is not None:
             with self._lock:
                 handler = self._get_handler("gpio_input")
@@ -164,8 +182,11 @@ class HardwareIO(IOAdapter):
             if handler:
                 handler.write(pin, float(value))
             return
+        if port.kind == "gpio" and port.line is not None and self._lines is not None:
+            self._lines.write(port.line[0], port.line[1], bool(value), bool(port.transport.get("activeLow")))
+            return
         if port.gpio is None:
-            raise ValueError(f"port {port.source_key} has no GPIO number")
+            raise ValueError(f"port {port.source_key} names neither a chip label + line nor a GPIO number")
         out = bool(value)
         if port.transport.get("activeLow"):
             out = not out

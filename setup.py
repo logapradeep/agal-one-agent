@@ -5,11 +5,14 @@ setup(
     # 0.2.0 (2026-09-07): automation-block runtime (ADR-017, contracts v1.5.0).
     # NOTE: the fleet provisioner still pins v0.1.6 until the backend side of
     # ADR-017 (rebuild phase P2) lands; 0.1.7/0.1.8 were never tagged.
-    version="0.2.1",
+    version="0.3.0",
     packages=find_packages(),
     install_requires=[
         "paho-mqtt>=2.0.0",
         "PyYAML>=6.0",
+        # Node linking (ADR-024): GPIO through the kernel character device, by chip
+        # LABEL + line — pure Python, so nothing compiles on any board or architecture.
+        "python-periphery>=2.4.1",
         # NOTE: the ADR-013 P0 durable ring buffer uses the stdlib `sqlite3`
         # (WAL) — no third-party dependency added on the core path.
     ],

@@ -93,6 +93,38 @@ class HttpReporter:
             payload["firmwareVersion"] = firmware_version
         return self._post({"type": "programAck", "payload": payload})
 
+    # ---- Node linking (ADR-024, contracts v1.9.0) -----------------------------
+
+    def report_hardware(self, hardware: dict) -> Optional[dict]:
+        """POST reportHardware {nodeUid, hardware} → {boardMatch, boardProfileId?, agent, portsVersion}.
+        None on failure; a 409 (this board is already another live node) is logged loudly."""
+        try:
+            req = urllib.request.Request(
+                self._sibling_url("reportHardware"),
+                data=json.dumps({"nodeUid": self.node_uid, "hardware": hardware}).encode("utf-8"),
+                headers=self._headers(), method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return json.loads(resp.read().decode("utf-8")) if resp.status == 200 else None
+        except urllib.error.HTTPError as e:
+            if e.code == 409:
+                logger.error("reportHardware: this board is already linked to another node — unlink it there first")
+            else:
+                logger.warning("reportHardware failed: %s", e)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("reportHardware error: %s", e)
+        return None
+
+    def report_port_test(self, command_id: str, result: dict) -> bool:
+        return self._post({"type": "port_test", "payload": {"nodeUid": self.node_uid, "commandId": command_id, **result}})
+
+    def report_bus_scan(self, result: dict) -> bool:
+        return self._post({"type": "bus_scan", "payload": {"nodeUid": self.node_uid, **result}})
+
+    def report_port_health(self, ports: list[dict], devices: Optional[list[dict]] = None) -> bool:
+        return self._post({"type": "port_health", "payload": {
+            "nodeUid": self.node_uid, "ports": ports, "devices": devices or []}})
+
     def report_variables(self, asset_id: str, values: dict) -> bool:
         return self._post({"type": "variables", "payload": {
             "nodeUid": self.node_uid, "assetId": asset_id, "values": values,
