@@ -1,7 +1,8 @@
 """testPort — the commissioning check of ONE port (functions.yaml 1.6.0).
 
 The command carries the port's own transport, so a port can be tested before any
-card or program exists: the first check on a new board is an LED on DIO1.
+card or program exists: the first check on a new board is one uncommitted DIO
+(what is wired to it for the test is the installer's own — contracts v1.10.3).
 ``pulse`` switches an output on for a moment and off again; ``read`` watches an
 input. The answer goes back as the ``port_test`` ingress message.
 """

@@ -390,7 +390,7 @@ def main():
         # ---- Node linking (ADR-024) ------------------------------------------
         # testPort: the commissioning check of ONE port. The command carries the
         # port's own transport, so it works before any card or program exists
-        # (the first check on a new board is an LED on DIO1). A port the running
+        # (the first check on a new board is one uncommitted DIO). A port the running
         # program drives is pulsed THROUGH the runtime — there is one writer.
         if cmd_type == "testPort":
             mqtt_client.publish_command_ack(command_id, "acknowledged")
