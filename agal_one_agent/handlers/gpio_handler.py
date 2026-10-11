@@ -19,13 +19,18 @@ _setup_pins: dict[int, int] = {}  # gpio -> mode (GPIO.IN or GPIO.OUT)
 
 
 class GpioHandler:
-    def _setup(self, pin, mode):
+    def _setup(self, pin, mode, initial=None):
         gpio = pin.gpio_number
         if gpio is None:
             raise ValueError(f"No GPIO number for physical pin {pin.physical_pin}")
         if _setup_pins.get(gpio) != mode:
             if _GPIO_AVAILABLE:
-                GPIO.setup(gpio, mode)
+                if initial is None:
+                    GPIO.setup(gpio, mode)
+                else:
+                    # An output starts at the level it is about to be given, not at whatever the
+                    # pin latch holds — LOW is ON to an active-low relay board.
+                    GPIO.setup(gpio, mode, initial=initial)
             _setup_pins[gpio] = mode
 
     def read(self, pin) -> Optional[int]:
@@ -42,8 +47,8 @@ class GpioHandler:
         gpio = pin.gpio_number
         if gpio is None:
             raise ValueError(f"No GPIO number for physical pin {pin.physical_pin}")
-        self._setup(pin, GPIO.OUT if _GPIO_AVAILABLE else None)
         out = 1 if value else 0
+        self._setup(pin, GPIO.OUT if _GPIO_AVAILABLE else None, initial=out)
         if _GPIO_AVAILABLE:
             GPIO.output(gpio, out)
         logger.info("GPIO%d set to %d", gpio, out)

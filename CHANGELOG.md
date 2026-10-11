@@ -1,5 +1,29 @@
 # Changelog — agal-one-agent
 
+## 0.3.2 (unreleased)
+
+**Fix — an active-low output was switched ON for a moment whenever its line was opened.**
+Low-cost opto-isolated relay boards (HW-281 class, JQC3F relays) close a relay when their
+input is LOW, and a port says so with `activeLow`. `LineIO` requested every output line
+with python-periphery's `"out"`, which the kernel starts LOW (`gpio_cdev1` / `gpio_cdev2`
+`_reopen`), and only then wrote the inverted level. So the first write after start-up, the
+safe-state write on a clean stop, and the first write after a port test let go of a line all
+pulsed the relay ON before switching it OFF, long enough to tick a contactor or a valve.
+
+- **`ports/gpiochip.py`**: an output line is requested AT the level it is about to be given
+  (`"high"` / `"low"`), never `"out"`. Nothing else changes: one request per line,
+  `PortUnavailable` in words, the inversion applied at the line.
+- **`handlers/gpio_handler.py`** (ports still named by Broadcom number): the same, through
+  `GPIO.setup(…, initial=)`, instead of whatever the pin latch held.
+- 6 new tests, with a fake that starts a line where python-periphery does: no LOW reaches an
+  active-low line that is OFF, whether on the first write, after a release, after a read,
+  after a restart, on the runtime's first pass, or on a clean stop. The pulse of `testPort`
+  is the only LOW (286 tests).
+
+On the board: every relay output port of such a board has `activeLow: true`, and
+`/boot/firmware/config.txt` keeps the outputs HIGH from power-on until the agent opens them
+(`gpio=17,27,22,23,24,25,5,6=op,dh` on the pump-house panel's Pi 3B).
+
 ## 0.3.1 (2026-09-20)
 
 An analog input is read from what its PORT says (contracts v1.9.1).

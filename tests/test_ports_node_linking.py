@@ -8,10 +8,15 @@ from __future__ import annotations
 import errno
 import os
 import struct
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
+from agal_one_agent.blocks.clock import SimClock
 from agal_one_agent.blocks.io import HardwareIO, PortRef
+from agal_one_agent.blocks.runtime import BlockRuntime, RecordingSink
+from agal_one_agent.blocks.simulate import build_bundle_from_defaults
 from agal_one_agent.ports import bus_scan
 from agal_one_agent.ports.gpiochip import (
     GPIO_GET_CHIPINFO_IOCTL, GPIO_GET_LINEINFO_IOCTL, GPIO_V2_GET_LINEINFO_IOCTL, ChipInfo, LineIO, PortUnavailable, list_chips,
@@ -19,12 +24,17 @@ from agal_one_agent.ports.gpiochip import (
 from agal_one_agent.ports.inventory import hardware_report, identity, inventory
 from agal_one_agent.ports.port_test import run_port_test
 
+DEFAULTS = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "contracts", "programs", "defaults"))
+
 
 # ------------------------------------------------------------------ fakes
 
 class FakeLine:
+    """python-periphery's GPIO as far as levels go (gpio_cdev1 / gpio_cdev2 ``_reopen``): an output
+    requested as "high" starts HIGH; "out" and "low" start LOW."""
+
     def __init__(self, log, chip, line, direction):
-        self.log, self.key, self.direction, self.level = log, (chip, line), direction, False
+        self.log, self.key, self.direction, self.level = log, (chip, line), direction, direction == "high"
         log.append(("open", chip, line, direction))
 
     def write(self, level):
@@ -90,7 +100,7 @@ def test_chip_label_lines_and_kernel_held_lines_are_read_with_either_abi(tmp_pat
 def test_a_line_is_addressed_by_chip_LABEL_never_by_chip_number():
     lines, log = fake_lines()
     lines.write("raspberrypi-exp-gpio", 2, True)
-    assert log == [("open", "/dev/gpiochip1", 2, "out"), ("write", "/dev/gpiochip1", 2, True)]
+    assert log == [("open", "/dev/gpiochip1", 2, "high"), ("write", "/dev/gpiochip1", 2, True)]
 
 
 def test_active_low_is_a_wiring_fact_applied_at_the_line():
@@ -116,6 +126,50 @@ def test_a_chip_label_this_board_does_not_have_and_a_kernel_held_line_are_refuse
         lines.write("pinctrl-bcm2835", 2, True)
 
 
+# ------------------------------------------- active-low outputs: OFF is never LOW
+
+def driven(log, chip="/dev/gpiochip0", line=17):
+    """Every level one line was driven at, in order — the level its output request started at included."""
+    levels = []
+    for e in log:
+        if e[1:3] != (chip, line):
+            continue
+        if e[0] == "open" and e[3] != "in":
+            levels.append(e[3] == "high")
+        elif e[0] == "write":
+            levels.append(e[3])
+    return levels
+
+
+def test_an_active_low_output_switched_off_at_start_up_is_requested_HIGH_and_never_driven_LOW():
+    lines, log = fake_lines()  # a fresh agent: no line open yet
+    lines.write("pinctrl-bcm2835", 17, False, active_low=True)
+    assert log[0] == ("open", "/dev/gpiochip0", 17, "high")
+    assert driven(log) == [True, True]
+
+
+def test_every_reopen_of_an_active_low_output_that_is_off_starts_HIGH():
+    lines, log = fake_lines()
+    off = lambda: lines.write("pinctrl-bcm2835", 17, False, active_low=True)  # noqa: E731
+    off()
+    lines.release("pinctrl-bcm2835", 17)  # a port test let go of the line
+    off()
+    lines.read("pinctrl-bcm2835", 17)     # the line was read as an input
+    off()
+    lines.close()                         # the agent restarts
+    off()
+    assert [e[3] for e in log if e[0] == "open"] == ["high", "high", "in", "high", "high"]
+    assert False not in driven(log)
+
+
+def test_any_output_starts_at_the_level_it_is_given_and_is_never_requested_as_out():
+    lines, log = fake_lines()
+    lines.write("pinctrl-bcm2835", 17, False)                 # active-high, off
+    lines.write("pinctrl-bcm2835", 27, True)                  # active-high, on
+    lines.write("pinctrl-bcm2835", 22, True, active_low=True)  # active-low, on
+    assert {e[2]: e[3] for e in log if e[0] == "open"} == {17: "low", 27: "high", 22: "low"}
+
+
 # --------------------------------------------------------------- port test
 
 def test_the_led_check_pulses_DIO1_and_leaves_the_line_as_it_found_it():
@@ -125,7 +179,7 @@ def test_the_led_check_pulses_DIO1_and_leaves_the_line_as_it_found_it():
                        "transport": {"kind": "gpio", "chip": "pinctrl-bcm2835", "line": 17, "direction": "out"}}, lines, sleep=slept.append)
     assert r == {"portId": "DIO1", "result": "passed", "detail": "on for 2 s, then off"}
     assert slept == [2]
-    assert log == [("open", "/dev/gpiochip0", 17, "out"), ("write", "/dev/gpiochip0", 17, True),
+    assert log == [("open", "/dev/gpiochip0", 17, "high"), ("write", "/dev/gpiochip0", 17, True),
                    ("write", "/dev/gpiochip0", 17, False), ("close", "/dev/gpiochip0", 17)]
 
 
@@ -145,9 +199,14 @@ def test_a_pulse_is_never_longer_than_five_seconds_and_goes_off_even_when_the_wa
 
 def test_an_active_low_relay_is_pulsed_LOW_and_released_HIGH():
     lines, log = fake_lines()
-    run_port_test({"portId": "DO1", "action": "pulse", "activeLow": True,
-                   "transport": {"kind": "gpio", "chip": "pinctrl-bcm2835", "line": 17}}, lines, sleep=lambda s: None)
+    pulse = {"portId": "DO1", "action": "pulse", "activeLow": True,
+             "transport": {"kind": "gpio", "chip": "pinctrl-bcm2835", "line": 17}}
+    run_port_test(pulse, lines, sleep=lambda s: None)
     assert [e[3] for e in log if e[0] == "write"] == [False, True]
+    # The only LOW is the pulse itself: the line is requested at ON, ends HIGH, then is let go.
+    assert driven(log) == [False, False, True] and log[-1] == ("close", "/dev/gpiochip0", 17)
+    lines.write("pinctrl-bcm2835", 17, False, active_low=True)  # the next owner of the line switches it off
+    assert driven(log)[3:] == [True, True]
 
 
 def test_watching_an_input_reports_its_state():
@@ -180,9 +239,69 @@ def test_the_block_runtime_drives_a_port_named_by_chip_label_and_line():
     assert io.has_port(other_board) is False, "a bundle naming a chip this board does not have is rejected at compile time"
 
 
+def _relay_board_bundle():
+    """The contracts' default farm program with every GPIO port named by chip label + line,
+    its outputs on an active-low relay board."""
+    if not os.path.isdir(DEFAULTS):
+        pytest.skip(f"defaults not found at {DEFAULTS}")
+    bundle = build_bundle_from_defaults(DEFAULTS, "farm")
+    for a in bundle["assets"]:
+        for t in a["ports"].values():
+            if t.get("kind") == "gpio":
+                t.update(chip="pinctrl-bcm2835", line=t.pop("gpioNumber"))
+                if t["direction"] == "out":
+                    t["activeLow"] = True
+    return bundle
+
+
+def test_the_runtime_start_up_pass_and_a_clean_stop_never_drive_an_active_low_output_LOW_while_it_is_off():
+    lines, log = fake_lines()
+    rt = BlockRuntime(HardwareIO(sensor_by_key={}, lines=lines), RecordingSink(),
+                      clock=SimClock(datetime(2026, 9, 7, 5, 0, tzinfo=ZoneInfo("Asia/Kolkata"))))
+    rt.compile(_relay_board_bundle())
+    outputs = (17, 27, 22)  # pump-1, valve-1, valve-2
+    rt.step()  # the first pass after start-up writes every output: all off
+    assert {line: driven(log, line=line) for line in outputs} == {line: [True, True] for line in outputs}
+    rt.stop(safe_state=True)
+    assert all(False not in driven(log, line=line) for line in outputs)
+
+
+def test_a_safe_state_write_on_a_line_nothing_has_opened_yet_starts_HIGH():
+    lines, log = fake_lines()
+    rt = BlockRuntime(HardwareIO(sensor_by_key={}, lines=lines), RecordingSink(), clock=SimClock())
+    rt.compile(_relay_board_bundle())
+    rt.stop(safe_state=True)  # stopped before its first pass: the pump's line is opened by the safe-state write
+    assert driven(log, line=17) == [True, True]
+
+
 def test_a_legacy_port_with_a_broadcom_number_is_still_accepted():
     io = HardwareIO(configured_gpios={17}, sensor_by_key={}, lines=None)
     assert io.has_port(PortRef("pump-1", "device.power", {"kind": "gpio", "gpioNumber": 17, "direction": "out"})) is True
+
+
+def test_a_legacy_broadcom_output_is_set_up_at_the_level_it_is_given(monkeypatch):
+    from agal_one_agent.handlers import gpio_handler
+    calls = []
+
+    class FakeRPiGPIO:
+        IN, OUT = 1, 0
+
+        @staticmethod
+        def setup(gpio, mode, initial=None):
+            calls.append(("setup", gpio, mode, initial))
+
+        @staticmethod
+        def output(gpio, level):
+            calls.append(("output", gpio, level))
+
+    monkeypatch.setattr(gpio_handler, "GPIO", FakeRPiGPIO, raising=False)
+    monkeypatch.setattr(gpio_handler, "_GPIO_AVAILABLE", True)
+    monkeypatch.setattr(gpio_handler, "_setup_pins", {})
+    io = HardwareIO(configured_gpios={17}, sensor_by_key={}, lines=None)
+    pump = PortRef("pump-1", "device.power", {"kind": "gpio", "gpioNumber": 17, "direction": "out", "activeLow": True})
+    io.write_output(pump, False)
+    io.write_output(pump, True)
+    assert calls == [("setup", 17, FakeRPiGPIO.OUT, 1), ("output", 17, 1), ("output", 17, 0)]
 
 
 # ------------------------------------------------------------ hardware report

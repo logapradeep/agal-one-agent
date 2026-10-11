@@ -109,6 +109,9 @@ class LineIO:
 
     ``opener(chip_path, line, direction)`` returns an object with ``read() -> bool``,
     ``write(bool)`` and ``close()`` — ``periphery.GPIO`` in production, a fake in tests.
+    ``direction`` is ``"in"``, or ``"high"`` / ``"low"``: an output requested AT that level.
+    Never ``"out"`` — python-periphery requests that LOW, and an active-low relay board
+    (HW-281 class) reads LOW as ON: a relay click before the first write.
     """
 
     def __init__(self, chips: Optional[Callable[[], list[ChipInfo]]] = None,
@@ -140,7 +143,8 @@ class LineIO:
         except PortUnavailable:
             return False
 
-    def _line(self, label: str, line: int, direction: str):
+    def _line(self, label: str, line: int, direction: str, level: bool = False):
+        """``direction`` is "in" or "out"; an output (re)opened here is requested at ``level``."""
         key = (label, int(line))
         with self._lock:
             held = self._lines.get(key)
@@ -149,8 +153,9 @@ class LineIO:
             if held:
                 held[1].close()
                 del self._lines[key]
+            request = direction if direction == "in" else ("high" if level else "low")
             try:
-                handle = self._opener(self.chip_path(label), int(line), direction)
+                handle = self._opener(self.chip_path(label), int(line), request)
             except PortUnavailable:
                 raise
             except Exception as e:  # noqa: BLE001 — EBUSY (held by the kernel or another process), EINVAL (no such line)
@@ -160,7 +165,9 @@ class LineIO:
 
     def write(self, label: str, line: int, value: bool, active_low: bool = False) -> None:
         level = (not bool(value)) if active_low else bool(value)
-        self._line(label, line, "out").write(level)
+        # A line opened by this write starts at the level it is given — the first write after
+        # start-up, after a port test let go of the line, or after it was read as an input.
+        self._line(label, line, "out", level).write(level)
 
     def read(self, label: str, line: int, active_low: bool = False, pull: Optional[str] = None) -> bool:
         level = bool(self._line(label, line, "in").read())
