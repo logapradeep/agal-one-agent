@@ -4,7 +4,6 @@ envelopes (programAck / variables / alert) — no network, fake transports."""
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -17,8 +16,9 @@ from agal_one_agent.blocks.sync import ProgramStore, ProgramSync
 from agal_one_agent.config import MqttConfig
 from agal_one_agent.mqtt_client import AgalOneMqttClient
 
-HERE = os.path.dirname(__file__)
-DEFAULTS = os.path.normpath(os.path.join(HERE, "..", "..", "..", "contracts", "programs", "defaults"))
+import _contracts  # noqa: E402 — tests/ is on sys.path (pytest rootdir insertion)
+
+DEFAULTS = _contracts.DEFAULTS
 
 
 class FakeMqtt:

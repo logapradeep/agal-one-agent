@@ -11,8 +11,9 @@ import pytest
 
 from agal_one_agent.blocks import expr as E
 
-HERE = os.path.dirname(__file__)
-VECTORS = os.path.normpath(os.path.join(HERE, "..", "..", "..", "contracts", "programs", "test-vectors", "expressions.json"))
+import _contracts  # noqa: E402 — tests/ is on sys.path (pytest rootdir insertion)
+
+VECTORS = _contracts.EXPRESSION_VECTORS
 
 
 def _load():

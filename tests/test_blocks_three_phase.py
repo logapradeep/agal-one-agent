@@ -19,8 +19,9 @@ from agal_one_agent.blocks.io import SimulatedIO
 from agal_one_agent.blocks.runtime import BlockRuntime, RecordingSink
 from agal_one_agent.blocks.simulate import build_bundle_from_defaults
 
-HERE = os.path.dirname(__file__)
-DEFAULTS = os.path.normpath(os.path.join(HERE, "..", "..", "..", "contracts", "programs", "defaults"))
+import _contracts  # noqa: E402 — tests/ is on sys.path (pytest rootdir insertion)
+
+DEFAULTS = _contracts.DEFAULTS
 TZ = ZoneInfo("Asia/Kolkata")
 PUMP = "pump-1"
 

@@ -24,7 +24,9 @@ from agal_one_agent.ports.gpiochip import (
 from agal_one_agent.ports.inventory import hardware_report, identity, inventory
 from agal_one_agent.ports.port_test import run_port_test
 
-DEFAULTS = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "contracts", "programs", "defaults"))
+import _contracts  # noqa: E402 — tests/ is on sys.path (pytest rootdir insertion)
+
+DEFAULTS = _contracts.DEFAULTS
 
 
 # ------------------------------------------------------------------ fakes

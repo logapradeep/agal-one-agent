@@ -6,7 +6,6 @@ SimulatedIO, physics stepped by hand."""
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -17,8 +16,9 @@ from agal_one_agent.blocks.runtime import BlockRuntime, RecordingSink
 from agal_one_agent.blocks.simulate import build_bundle_from_defaults
 from agal_one_agent.config import AgentConfig
 
-HERE = os.path.dirname(__file__)
-DEFAULTS = os.path.normpath(os.path.join(HERE, "..", "..", "..", "contracts", "programs", "defaults"))
+import _contracts  # noqa: E402 — tests/ is on sys.path (pytest rootdir insertion)
+
+DEFAULTS = _contracts.DEFAULTS
 TZ = ZoneInfo("Asia/Kolkata")
 
 
