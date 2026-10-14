@@ -17,14 +17,18 @@ def reconcile(
     mqtt_client: AgalOneMqttClient,
     http_reporter: HttpReporter,
     guard: Optional[Callable[[dict], Optional[str]]] = None,
+    wait_for: Optional[Callable[[], object]] = None,
 ) -> None:
     """Fetch desired pin states from backend and apply them.
 
     Called on daemon startup (after MQTT connects) and on MQTT reconnection.
     Runs in a background thread to avoid blocking the main loop. ``guard`` answers why a
-    command must not be applied (``ports.links.LinkGuard.check_boot_command``) or None.
+    command must not be applied (``ports.links.LinkGuard.check_boot_command``) or None;
+    ``wait_for`` is called first, in the thread (the node learning whether it runs a port table).
     """
     def _run():
+        if wait_for is not None:
+            wait_for()
         logger.info("Boot reconciliation: fetching desired state from cloud")
         commands = http_reporter.fetch_boot_state(config.node.auth_token)
 

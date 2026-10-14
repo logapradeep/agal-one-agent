@@ -99,7 +99,9 @@ class ProgramSync:
                 self.runtime.compile(bundle)
                 self.store.save(bundle)
                 logger.info("program v%d applied", version)
-            except CompileError as e:
+            except Exception as e:  # noqa: BLE001 — CompileError, or anything else: never a silent dead pull
+                if not isinstance(e, CompileError):
+                    logger.error("program v%d: compile failed unexpectedly", version, exc_info=True)
                 logger.error("program v%d rejected: %s", version, e)
                 self.http.report_program_ack(version, "rejected", reason=str(e))
                 if self._sink_ack:

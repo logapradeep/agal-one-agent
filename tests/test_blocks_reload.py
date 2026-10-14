@@ -19,7 +19,8 @@ import pytest
 
 from agal_one_agent.blocks.clock import SimClock
 from agal_one_agent.blocks.io import HardwareIO, SimulatedIO
-from agal_one_agent.blocks.runtime import BlockRuntime, RecordingSink
+from agal_one_agent.blocks.runtime import BlockRuntime, CompileError, RecordingSink
+from agal_one_agent.blocks.sync import ProgramStore, ProgramSync
 from agal_one_agent.blocks.simulate import build_bundle_from_defaults
 from agal_one_agent.ports.gpiochip import ChipInfo, LineIO
 
@@ -259,15 +260,28 @@ def test_an_output_the_new_program_no_longer_has_is_switched_off_and_released(ch
     assert b.io.writes[mark:] == [("valve-b", "device.power", False)], "and only once"
 
 
-def test_an_output_whose_safe_state_is_last_state_is_left_as_it_is():
-    b = Bench(_two_valves(safeState="last_state"))
+def test_an_output_that_leaves_the_program_is_switched_off_whatever_its_safe_state():
+    """safeState (R-14) is what a pump does when the node's software stops or its power goes. An
+    output the program no longer has is supervised by no rule any more (no maximum run, no dry-run
+    protection) and, on a port-table node, not even its own card can switch it: it never stays on.
+    Before, a last_state motor was left running, and its owner's OFF was refused."""
+    b = Bench(_two_valves(safeState="last_state", assetType="motor_controller"))
     _open_both(b)
     mark = len(b.io.writes)
     b.reload(_drop_card)
     b.run(3)
-    assert b.io.writes[mark:] == [] and b.io.released == []
-    assert b.out("valve-b") is True
-    assert {"type": "output_released", "assetId": "valve-b", "sourceKey": "device.power", "level": "kept"} in b.sink.events
+    assert b.io.writes[mark:] == [("valve-b", "device.power", False)]
+    assert [r[0] for r in b.io.released] == ["valve-b"]
+    assert {"type": "output_released", "assetId": "valve-b", "sourceKey": "device.power", "level": "off"} in b.sink.events
+    assert b.out("valve-a") is True
+
+
+def test_on_a_clean_stop_a_last_state_output_still_keeps_its_level():
+    """... while a software stop still honours safeState, as before."""
+    b = Bench(_two_valves(safeState="last_state"))
+    _open_both(b)
+    b.rt.stop(safe_state=True)
+    assert b.out("valve-b") is True and b.out("valve-a") is False
 
 
 def test_a_clean_stop_lets_go_of_an_output_a_reload_took_out_before_any_pass():
@@ -402,3 +416,280 @@ def test_a_program_loaded_after_a_stop_starts_cold_as_after_a_restart():
     b.rt.stop(safe_state=True)
     b.rt.compile(b.bundle)  # what the bench's outage button does
     assert b.rt.snapshot()["assets"]["pump-1"]["relay"] is False, "nothing is carried over a stop"
+
+
+# ------------------------------------------- several runs ended by one reload
+
+@pytest.mark.parametrize("minutes", [None, 1], ids=["untimed runs", "timed runs"])
+def test_two_running_plots_taken_out_in_one_reload_both_end_and_the_program_goes_on(minutes):
+    """Review G1 blocker: ending the first removed run looked the second one up in the new
+    program (KeyError), after the program had been swapped in — half-loaded, never acked, and
+    with timed runs every later pass failed before writing any output."""
+    b = Bench(_farm())
+    b.run(2)
+    for pid in ("plot-1", "plot-2"):
+        cmd = {"type": "runPlot", "plotId": pid, **({"durationMinutes": minutes} if minutes else {})}
+        assert b.rt.apply_command(cmd)["accepted"]
+    b.io.set_input("flow-1", "sensor.flow", True)
+    b.io.set_input("flow-2", "sensor.flow", True)
+    b.run(12)
+    assert (b.out("pump-1"), b.out("valve-1"), b.out("valve-2")) == (True, True, True)
+    mark = len(b.io.writes)
+
+    def no_plots(bundle):
+        bundle["nab"]["plots"] = []
+        bundle["nab"]["schedules"] = []
+
+    b.reload(no_plots)
+    assert b.rt.version == 2 and b.rt.snapshot()["activeRuns"] == {}
+    b.run(1)
+    assert b.sink.acks[-1] == {"version": 2, "status": "applied", "reason": None}
+    assert (b.out("pump-1"), b.out("valve-1"), b.out("valve-2")) == (False, False, False)
+    offs = [w[0] for w in b.io.writes[mark:] if w[2] is False]
+    assert offs[0] == "pump-1" and sorted(offs[1:]) == ["valve-1", "valve-2"], "pump before valves"
+    ended = sorted(e["plotId"] for e in b.events("plot_run_ended") if e["source"] == "program")
+    assert ended == ["plot-1", "plot-2"]
+    b.run(150)  # past the end the timed runs had: every pass runs (rt.step raises if one fails)
+    assert b.rt.apply_command({"type": "setPower", "assetId": "valve-1", "sourceKey": "device.power", "value": 1})["accepted"]
+    b.run(1)
+    assert b.out("valve-1") is True, "outputs are still written"
+
+
+def test_a_take_over_that_fails_leaves_the_running_program_as_it_was(monkeypatch):
+    """compile is atomic: if taking over fails half-way, everything is put back, nothing is
+    announced, and the bundle is rejected (a CompileError, which ProgramSync acks as such)."""
+    b = Bench(_farm())
+    b.run(1)
+    b.rt.apply_command({"type": "runPlot", "plotId": "plot-1"})
+    b.io.set_input("flow-1", "sensor.flow", True)
+    b.run(10)
+    before, mark, events = b.rt.snapshot(), len(b.io.writes), len(b.sink.events)
+
+    def boom(old_outputs):
+        raise RuntimeError("half-way")
+
+    def no_plot_1(bundle):
+        bundle["nab"]["plots"] = [p for p in bundle["nab"]["plots"] if p["plotId"] != "plot-1"]
+        bundle["nab"]["schedules"] = []
+
+    monkeypatch.setattr(b.rt, "_plan_releases", boom)
+    with pytest.raises(CompileError, match="could not take over from the running program: half-way"):
+        b.reload(no_plot_1)
+    assert b.rt.version == 1
+    snap = b.rt.snapshot()
+    assert snap["assets"] == before["assets"] and snap["nab"] == before["nab"]
+    assert list(snap["activeRuns"]) == ["plot-1"], "the run the failed reload had ended is back"
+    assert b.sink.events[events:] == [], "nothing was announced"
+    b.run(5)
+    assert (b.out("pump-1"), b.out("valve-1")) == (True, True) and b.io.writes[mark:] == []
+
+
+def test_program_sync_rejects_a_bundle_whose_take_over_failed_and_keeps_the_old_one(tmp_path, monkeypatch):
+    class Http:
+        def __init__(self, bundle):
+            self.bundle, self.acks = bundle, []
+
+        def fetch_program(self, current_version=None):
+            return {"bundle": self.bundle}
+
+        def report_program_ack(self, version, status, reason=None, firmware_version=None):
+            self.acks.append((version, status, reason))
+
+    b = Bench(_farm())
+    b.run(1)
+    monkeypatch.setattr(b.rt, "_carry_over", lambda *a: (_ for _ in ()).throw(KeyError("plot-2")))
+    http = Http(_next(b.bundle))
+    ProgramSync(b.rt, ProgramStore(str(tmp_path)), http)._pull()
+    assert http.acks == [(2, "rejected", "could not take over from the running program: 'plot-2'")]
+    assert b.rt.version == 1 and not (tmp_path / "program.json").exists()
+
+    class Exploding:
+        version = 1
+
+        def compile(self, bundle):
+            raise ValueError("not a CompileError")
+
+    http = Http(_next(b.bundle))
+    ProgramSync(Exploding(), ProgramStore(str(tmp_path)), http)._pull()
+    assert http.acks == [(2, "rejected", "not a CompileError")], "an unexpected error is a rejection, not a dead pull"
+
+
+# ---------------------------------------- what a removed plot leaves behind
+
+def test_a_plot_taken_out_with_its_valve_variable_closes_the_valve_card_it_opened():
+    """Deleting a field: the plot and its valve variable leave the NAB, the valve card stays on
+    the node. Before, the pump was switched off, the run reported ended — and the valve left open."""
+    b = Bench(_farm())
+    b.run(1)
+    b.rt.apply_command({"type": "runPlot", "plotId": "plot-2"})
+    b.io.set_input("flow-2", "sensor.flow", True)
+    b.run(12)
+    assert (b.out("pump-1"), b.out("valve-2")) == (True, True)
+    mark = len(b.io.writes)
+
+    def drop_field_2(bundle):
+        nab = bundle["nab"]
+        nab["plots"] = [p for p in nab["plots"] if p["plotId"] != "plot-2"]
+        nab["variables"] = [v for v in nab["variables"] if v["name"] not in ("valve_2", "flow_2")]
+        for v in nab["variables"]:
+            if v.get("expression"):
+                v["expression"] = v["expression"].replace(" or valve_2", "").replace("valve_2 or ", "")
+        nab["rules"] = [r for r in nab["rules"] if not any(t in json.dumps(r) for t in ("valve_2", "flow_2", "plot-2"))]
+
+    b.reload(drop_field_2)
+    b.run(3)
+    assert (b.out("pump-1"), b.out("valve-2")) == (False, False)
+    assert [w[0] for w in b.io.writes[mark:] if w[2] is False] == ["pump-1", "valve-2"], "pump before valve"
+    assert b.rt.snapshot()["assets"]["valve-2"]["coil"] is False
+
+
+# --------------------------------------------- schedules a reload took out
+
+def _schedule_on_a(**extra):
+    bundle = _flow_and_two_valves()
+    bundle["nab"]["rules"] = []
+    bundle["nab"]["schedules"] = [{
+        "id": "valve_a_morning", "title": "Valve A every morning", "enabled": True,
+        "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"], "start": "06:00", "durationMinutes": 30,
+        "startWindowMinutes": 60, "actions": [{"type": "set", "variable": "a", "value": True}],
+        "endActions": [{"type": "set", "variable": "a", "value": False}], **extra}]
+    return bundle
+
+
+def _at_six():
+    return datetime(2026, 9, 7, 5, 59, tzinfo=TZ)
+
+
+def test_a_running_schedule_taken_out_still_ends_when_it_would_have():
+    """Before, it never ended: what its start switched on stayed on (the reload kept the level)."""
+    b = Bench(_schedule_on_a(), start=_at_six())
+    b.run(120)
+    assert b.out("valve-a") is True
+    b.reload(lambda bundle: bundle["nab"].__setitem__("schedules", []))
+    b.run(27 * 60, tick=10)  # 06:28
+    assert b.out("valve-a") is True, "the reload neither ends it early nor restarts it"
+    b.run(3 * 60, tick=10)  # 06:31
+    assert b.out("valve-a") is False
+    assert [e["type"] for e in b.sink.events if e["type"].startswith("schedule_")] == ["schedule_started", "schedule_ended"]
+    b.run(3 * 3600, tick=60)
+    assert b.out("valve-a") is False and len(b.events("schedule_ended")) == 1
+
+
+def test_a_running_schedule_taken_out_ends_through_the_names_it_was_written_with():
+    """The valve's NAB variable is renamed in the same reload: the end still closes the same valve."""
+    b = Bench(_schedule_on_a(), start=_at_six())
+    b.run(120)
+
+    def rename(bundle):
+        bundle["nab"]["schedules"] = []
+        next(v for v in bundle["nab"]["variables"] if v["name"] == "a")["name"] = "valve_a"
+
+    b.reload(rename)
+    b.run(32 * 60, tick=10)
+    assert b.out("valve-a") is False
+
+
+@pytest.mark.parametrize("named", ["plotId", "run_plot only"])
+def test_a_running_plot_schedule_taken_out_stops_its_plot_on_time(named):
+    bundle = _farm()
+    s = bundle["nab"]["schedules"][0]
+    s["enabled"] = True
+    if named == "run_plot only":
+        s.pop("plotId")  # its actions name the plot: run_plot plot-1 … stop_plot plot-1
+    b = Bench(bundle, start=_at_six())
+    b.io.set_input("flow-1", "sensor.flow", True)
+    b.run(120)
+    assert (b.out("pump-1"), b.out("valve-1")) == (True, True)
+    b.reload(lambda bundle: bundle["nab"].__setitem__("schedules", []))
+    b.run(27 * 60, tick=10)
+    assert (b.out("pump-1"), b.out("valve-1")) == (True, True)
+    b.run(3 * 60, tick=10)
+    assert (b.out("pump-1"), b.out("valve-1")) == (False, False), "06:30, not when a protection rule fires"
+    assert {"type": "plot_run_ended", "plotId": "plot-1", "source": "plot_1_morning"} in b.sink.events
+
+
+def test_a_running_schedule_whose_end_changed_still_switches_off_what_it_started():
+    b = Bench(_schedule_on_a(), start=_at_six())
+    b.run(120)
+    assert b.out("valve-a") is True
+
+    def now_on_b(bundle):
+        s = bundle["nab"]["schedules"][0]
+        s["actions"] = [{"type": "set", "variable": "b", "value": True}]
+        s["endActions"] = [{"type": "set", "variable": "b", "value": False}]
+
+    b.reload(now_on_b)
+    b.run(32 * 60, tick=10)
+    assert b.out("valve-a") is False, "the end it was started with ran too"
+    assert len(b.events("schedule_ended")) == 1
+
+
+def test_a_running_schedule_taken_out_and_put_back_is_the_same_run():
+    original = _schedule_on_a()
+    b = Bench(original, start=_at_six())
+    b.run(120)
+    schedules = copy.deepcopy(b.bundle["nab"]["schedules"])
+    b.reload(lambda bundle: bundle["nab"].__setitem__("schedules", []))
+    b.run(60)
+    b.reload(lambda bundle: bundle["nab"].__setitem__("schedules", schedules))
+    b.run(27 * 60, tick=10)
+    assert b.out("valve-a") is True
+    b.run(3 * 60, tick=10)
+    assert b.out("valve-a") is False
+    kinds = [e["type"] for e in b.sink.events if e["type"].startswith("schedule_")]
+    assert kinds == ["schedule_started", "schedule_ended"], "started once, ended once, at 06:30"
+
+
+# ------------------------------------------------ releases and other lines
+
+def _line_bench(extra_assets=()):
+    log: list = []
+    chips = [ChipInfo("/dev/gpiochip0", "gpiochip0", "pinctrl-bcm2835", 54)]
+    lines = LineIO(chips=lambda: chips, opener=lambda path, line, direction: _Line(log, line, direction))
+    bundle = _two_valves()
+    for card, line in zip(bundle["assets"], (27, 22)):
+        card["ports"]["device.power"] = {"kind": "gpio", "chip": "pinctrl-bcm2835", "line": line, "direction": "out"}
+    bundle["assets"].extend(copy.deepcopy(list(extra_assets)))
+    return Bench(bundle, io=HardwareIO(sensor_by_key={}, lines=lines)), log
+
+
+def test_two_reloads_before_a_pass_never_switch_off_a_line_the_program_holds_on():
+    """Reload 1 takes valve-b (line 22) out; reload 2, before any pass, moves valve-a onto line 22.
+    Before, reload 1's release still ran: line 22 OFF and closed, then reopened ON."""
+    b, log = _line_bench()
+    b.run(1)
+    for aid in ("valve-a", "valve-b"):
+        assert b.rt.apply_command({"type": "setPower", "assetId": aid, "sourceKey": "device.power", "value": 1})["accepted"]
+    b.run(2)
+    assert ("write", 27, True) in log and ("write", 22, True) in log
+    mark = len(log)
+    b.reload(_drop_card)
+
+    def a_to_22(bundle):
+        bundle["assets"][0]["ports"]["device.power"]["line"] = 22
+
+    b.reload(a_to_22)
+    b.run(3)
+    assert log[mark:] == [("write", 27, False), ("close", 27), ("write", 22, True)]
+
+
+def test_an_output_line_re_stamped_as_an_input_is_never_driven_again():
+    """valve-a moves from line 27 to 23 and the flow switch is now read on line 27. Before, the
+    release requested line 27 as an output and drove it LOW for one pass, against the sensor."""
+    flow = {"assetId": "flow-1", "assetType": "flow_switch", "aab": _template("aab_flow_switch.json"),
+            "ports": {"sensor.flow": {"kind": "gpio", "chip": "pinctrl-bcm2835", "line": 5, "direction": "in"}}}
+    b, log = _line_bench([flow])
+    b.run(1)
+    assert b.rt.apply_command({"type": "setPower", "assetId": "valve-a", "sourceKey": "device.power", "value": 1})["accepted"]
+    b.run(2)
+    mark = len(log)
+
+    def rewire(bundle):
+        bundle["assets"][0]["ports"]["device.power"]["line"] = 23
+        bundle["assets"][2]["ports"]["sensor.flow"]["line"] = 27
+
+    b.reload(rewire)
+    b.run(3)
+    on_27 = [e for e in log[mark:] if e[1] == 27]
+    assert [e for e in on_27 if e[0] == "write" or (e[0] == "open" and e[2] != "in")] == [], on_27
+    assert ("open", 23, "high") in log[mark:] and ("write", 23, True) in log[mark:]

@@ -58,6 +58,30 @@ def port_identity(transport: dict) -> tuple:
     return tuple(sorted((k, str(v)) for k, v in (transport or {}).items() if k not in _WIRING_FACTS))
 
 
+def physical_port(transport: dict) -> tuple:
+    """The physical port a transport uses, whatever it is used as: a GPIO line is the same line
+    whether a card names it as a ``gpio`` or a ``pwm`` port. Other kinds: :func:`port_identity`.
+    (A chip label + line and a Broadcom number are not related here: nothing names a board.)"""
+    t = transport or {}
+    if str(t.get("kind", "gpio")) in ("gpio", "pwm"):
+        if t.get("chip") and t.get("line") is not None:
+            return ("line", str(t["chip"]), int(t["line"]))
+        if t.get("gpioNumber") is not None:
+            return ("gpio", int(t["gpioNumber"]))
+    return port_identity(t)
+
+
+def describe_port(transport: dict) -> str:
+    """A port in words, for a refusal: ``line 17 of pinctrl-bcm2835``, ``GPIO 17``, ``i2c bus 1 …``."""
+    p = physical_port(transport)
+    if p and p[0] == "line":
+        return f"line {p[2]} of {p[1]}"
+    if p and p[0] == "gpio":
+        return f"GPIO {p[1]}"
+    t = transport or {}
+    return " ".join(f"{k} {v}" for k, v in sorted(t.items()) if k not in _WIRING_FACTS)[:80]
+
+
 class IOAdapter:
     def has_port(self, port: PortRef) -> bool:
         return True
@@ -149,8 +173,10 @@ class HardwareIO(IOAdapter):
 
     def has_port(self, port: PortRef) -> bool:
         if port.kind == "gpio" and port.line is not None:
-            # The cloud has already checked the line against this node's own inventory;
-            # here it is enough that the chip label exists on this board.
+            # Only that the chip label exists on this board is checked here. That one line is
+            # claimed by one card only is checked when the program is built (BlockRuntime._build);
+            # that the line is a port of this node's table and linked to that card is the cloud's
+            # half of RBAC-01 — a card's own portBindings[].transport is stamped as it is today.
             return self._lines is not None and self._lines.has(port.line[0])
         if port.kind in ("gpio", "pwm"):
             if port.gpio is None:

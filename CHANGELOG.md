@@ -23,23 +23,48 @@ over from it:
   a new or changed rule starts afresh, as at load, and only that rule. Baselines being learnt
   go on learning;
 - **runs and schedules** carry on: a running schedule ends at its planned time, a timed plot
-  run at its own; a plot taken out of the program while it runs ends its run and closes its
-  valves (pump first); a schedule taken out leaves its plot run to end when it would have;
+  run at its own. Plots taken out of the program while they run — one or several in the same
+  reload — end their runs and close their valves (pump first), found through the program the
+  run was started in: when a field is deleted its valve variables leave the NAB with it while
+  the valve cards stay on the node, and those cards are switched off;
+- **a running schedule taken out still ends when it would have**: its end actions (or the
+  default `stop_plot` of its plot) run at its planned end, each on what it named when it was
+  written (a NAB variable is resolved to its card variable, so a renamed or removed NAB
+  variable still reaches the valve), with `schedule_ended`. A running schedule whose end
+  actions a reload changed runs the end it was started with too, so what its start switched on
+  is switched off. A schedule taken out and put back before its end is the same run. An
+  orphaned end only ends: it never starts a plot or a sequence the schedule would have chained to;
 - **only an output the new program no longer has is let go of**, on the next pass, in the R-7
-  order (motors before valves), to its asset's safe state: `off` (the default) switches it off
-  and frees the line; `last_state` leaves it as it is. An output re-stamped onto another line
-  carries its level there and the old line is switched off and freed; a changed wiring fact
-  (active low) rewrites the line once. Each release is an `output_released` event. A clean stop
-  lets go of a release no pass has applied yet;
+  order (motors before valves): switched off and the line freed — whatever its safe state.
+  `safeState` (R-14) is what a pump does when the node's software stops or its power goes; an
+  output the program no longer has is supervised by no rule (no maximum run, no dry-run
+  protection) and on a port-table node not even its own card can switch it, so it never stays
+  on. An output re-stamped onto another line carries its level there and the old line is
+  switched off and freed; a changed wiring fact (active low) rewrites the line once. A line the
+  new program uses again — another card drives it, or it is now read as an input — is not
+  touched (an input takes the line over when it is sampled), and a release planned by an earlier
+  reload that no pass has applied yet is dropped when its line is back in the program. Each
+  release is an `output_released` event. A clean stop lets go of a release no pass has applied yet;
 - the swap holds the runtime lock, which a pass holds from start to end, so it always lands
-  between two passes. A program loaded **cold** — the first one, or after `stop()` (the bench's
-  outage button) — still starts from its defaults and the persisted state, as after a restart;
-  the persisted state is read only then, so a reload no longer re-announces a resumed run.
+  between two passes, and it is **atomic**: if taking over fails half-way, every piece of
+  runtime state is put back as it was, nothing is announced, and the bundle is rejected
+  (`could not take over from the running program: …`); `ProgramSync` acks any compile failure
+  as rejected instead of losing the pull thread. A program loaded **cold** — the first one, or
+  after `stop()` (the bench's outage button) — still starts from its defaults and the persisted
+  state, as after a restart; the persisted state is read only then, so a reload no longer
+  re-announces a resumed run, and a state file that cannot be used never keeps a program out.
 
 `IOAdapter.release_output` is new (LineIO frees the line, a PWM channel is stopped, a
-Broadcom-numbered line stays an output at the level just written). 16 new tests in
-`tests/test_blocks_reload.py`, the reload simulation among them; each fails on 0.3.2 except the
-cold-load guard.
+Broadcom-numbered line stays an output at the level just written). 30 tests in
+`tests/test_blocks_reload.py`, the reload simulation among them.
+
+Review of the reload (wave 0): two running plots taken out in one reload crashed the take-over
+half-way (the program swapped in, never acked, outputs left on, and with timed runs every later
+pass failed before writing an output); a running schedule taken out never ran its end; a plot
+taken out with its valve variable left the valve open; a release planned by one reload could
+switch off a line the next reload gave to another card, or drive a line that had become an
+input; a `last_state` output left the program running and could no longer be switched off.
+Each is fixed above and has its test; the 14 new ones fail without the fix (on 71a2b7e).
 
 **Security — a switch command moves a port only for the card it is linked to (RBAC-01, agent
 side).** A card document names its node and its ports itself, so a stranger's card could name
@@ -67,11 +92,43 @@ that card (`BlockRuntime.port_links()`). `ports/links.py`:
   back to every card);
 - **boot reconciliation** (`getBootState` lists every card that names this node, and applied
   them through the legacy executor) goes through the same check and never writes a port the
-  running program drives: the program decides after a restart (R-21).
+  running program drives: the program decides after a restart (R-21);
+- **one port, one card**: a bundle in which two cards (or two ports of one card) name the same
+  physical line and one of them drives it is refused — `line 17 of pinctrl-bcm2835 is claimed by
+  device.power of card intruder-1 and device.power of card pump-1: a port is linked to one card` —
+  and the running program stays. A `gpio` and a `pwm` port on one GPIO number are one line; two
+  cards reading one input are allowed. Before, the node ran both, and a stranger's card with a
+  default of ON drove the line on the next pass with no command at all;
+- **the port table is remembered**: the highest `portsVersion` the node heard is kept in its
+  state directory (`ports_version.json`), so a node that once ran a port table keeps running one
+  after a restart whose hardware report is not answered. The report is retried with back-off
+  (10 s doubling to 10 min) until it is answered. Until the node knows (an answer or the kept
+  value), the legacy GPIO path is refused (`refused: this node does not know yet whether it
+  runs a port table …`) — a card's own output in the running program still goes through the
+  runtime — and boot reconciliation waits up to 30 s for the answer first;
+- **without a port table**, a GPIO the running program reads (a flow switch the dry-run rules
+  watch) is refused like one it drives (`refused: GPIO 5 is read by the running program`), and a
+  switch naming a card's own input is refused; before, it was set up as a driven output;
+- the check and the dispatch of a switch hold the runtime lock, so a program pulled on another
+  thread cannot land between them, and a node that runs a port table never hands a switch to
+  the legacy executor, whatever let it past the check.
 
-16 new tests in `tests/test_port_links.py`; `main()` was also driven offline with fake MQTT and
+**What this does not cover — the backend half of RBAC-01.** The node checks what the cloud
+stamped into the program it runs, and today the backend copies each card's own
+`portBindings[].transport` into the bundle; a card owner writes their own bindings and
+`nodeUid`, and `writeAssetProgram` recompiles the node a card names. Refusing a second card on a
+line closes the double claim, not a stranger's card on a line no other card has linked yet, and
+a chip label + line and a Broadcom number naming the same pin are not related on the node
+(nothing here names a board). These hold only once the backend stamps transports from the
+node's port table and checks the card's link.
+
+26 tests in `tests/test_port_links.py`; `main()` was also driven offline with fake MQTT and
 HTTP: a stranger's `setPower` and a `testPort` naming the wrong card were refused with their
-reasons, the linked card's `setPower` completed through the runtime.
+reasons, the linked card's `setPower` completed through the runtime; after the review, a
+hardware report answered on the third try was kept as `portsVersion` 2 and survived a restart
+with no answer, a bundle adding a second card on line 17 was acked rejected in those words, and
+on a node with nothing kept and no answer the legacy path was refused while the program's own
+pump still switched.
 
 Tests read the contracts from `AGAL_CONTRACTS_DIR` when it is set (a worktree or a lone clone
 of the agent); the default stays `../../../contracts`.

@@ -28,7 +28,7 @@ from typing import Any, Callable, Optional
 
 from . import expr as E
 from .clock import Clock, SystemClock
-from .io import IOAdapter, PortRef, SimulatedIO, port_identity
+from .io import IOAdapter, PortRef, SimulatedIO, describe_port, physical_port
 from .sun import sun_event_local
 
 logger = logging.getLogger(__name__)
@@ -245,9 +245,20 @@ class BlockRuntime:
         # loaded cold starts from its defaults and the persisted state, as after a restart;
         # one loaded while another runs takes over from it (see compile).
         self._cold = True
-        # Outputs the last reload took out of the program, let go of on the next pass (R-7 order).
-        self._pending_releases: list[tuple[tuple[str, str], PortRef, str, bool, str]] = []
+        # Outputs a reload took off a port, let go of on the next pass (R-7 order):
+        # (assetId, sourceKey), the port let go of, the variable type, is a motor.
+        self._pending_releases: list[tuple[tuple[str, str], PortRef, str, bool]] = []
+        # The ends of running schedules a reload took out (or whose end it changed): they still
+        # run when the schedule would have ended, through the mapping they were written against.
+        self._orphan_ends: list[dict] = []
+        self._pending_resumes: list[tuple[str, float]] = []
         self.io.set_change_listener(self._on_input_change)
+
+    @property
+    def lock(self) -> threading.RLock:
+        """Held by a pass from start to end and by a program swap; a caller that decides from what the
+        program is (ports.links.handle_switch) holds it across the check and the dispatch."""
+        return self._lock
 
     # ------------------------------------------------------------ compile
 
@@ -258,10 +269,11 @@ class BlockRuntime:
         card or link write) takes over without a bump: every output keeps its level, every
         variable whose declaration is unchanged keeps its value, an unchanged rule keeps its
         hold / limit / sequence state, schedules and plot runs carry on to their end. Only an
-        output the new program no longer has is let go of, to its asset's safe state, on the
-        next pass. The swap holds the runtime lock, which a pass holds from start to end, so it
-        always lands between two passes. A program loaded cold (the first one, or after stop())
-        starts from its defaults and the persisted state, as after a restart.
+        output the new program no longer has is let go of — switched off — on the next pass.
+        The swap holds the runtime lock, which a pass holds from start to end, so it always
+        lands between two passes; if taking over fails, everything is put back as it was and the
+        bundle is rejected. A program loaded cold (the first one, or after stop()) starts from
+        its defaults and the persisted state, as after a restart.
         """
         try:
             aabs, order, nab, tz, loc = self._build(bundle)
@@ -271,36 +283,70 @@ class BlockRuntime:
             raise CompileError(f"malformed bundle: {e}") from e
         with self._lock:
             warm = self.nab is not None and not self._cold
-            old_aabs, old_nab = self.aabs, self.nab
-            old_outputs = self._output_ports() if warm else {}
-            old_state = self._snapshot_state()
-            self.bundle = bundle
-            self.version = int(bundle.get("version", 0))
-            self.aabs, self.aab_order, self.nab = aabs, order, nab
-            self.tz = tz
-            self.location = loc
-            self._restore_state(old_state)  # carry baselines / schedule state across versions
-            if warm:
-                self._carry_over(old_aabs, old_nab)
-                self._plan_releases(old_outputs)
-                self._persist_due = True
-            else:
-                self._pending_releases = []
-                self._load_persisted()
-                self._active_runs = {p: r for p, r in self._active_runs.items() if p in (nab.plots if nab else {})}
-            self._cold = False
-            self._applied_pending = True
-            # First pass after a (re)load reports every card in full, so the
-            # cloud's copy is corrected right after a restart.
-            for blk in self.aabs.values():
-                blk.dirty.update(blk.vars.keys())
+            saved = self._save_for_rollback()
+            events: list[tuple[str, dict]] = []
+            try:
+                self._swap(bundle, aabs, order, nab, tz, loc, warm, events)
+            except Exception as e:  # noqa: BLE001
+                self._rollback(saved)
+                logger.error("program v%s could not take over from the running program: %s",
+                             bundle.get("version"), e, exc_info=True)
+                raise CompileError(f"could not take over from the running program: {e}") from e
+            for type_, payload in events:  # only once the new program is in
+                self.sink.event(type_, payload)
         logger.info("program v%d compiled%s: %d assets, NAB %d rules / %d schedules", self.version,
                     " (took over from the running program)" if warm else "", len(order),
                     len(nab.rules) if nab else 0, len(nab.schedules) if nab else 0)
 
+    _ROLLBACK = ("bundle", "version", "aabs", "aab_order", "nab", "tz", "location", "_active_runs", "_last_written",
+                 "_pending_releases", "_orphan_ends", "_pending_events", "_pending_resumes", "_persist_due", "_cold",
+                 "_applied_pending")
+
+    def _save_for_rollback(self) -> dict:
+        saved = {k: getattr(self, k) for k in self._ROLLBACK}
+        saved["_active_runs"] = {p: dict(r) for p, r in self._active_runs.items()}
+        for k in ("_last_written",):
+            saved[k] = dict(saved[k])
+        for k in ("_pending_releases", "_orphan_ends", "_pending_events", "_pending_resumes"):
+            saved[k] = list(saved[k])
+        return saved
+
+    def _rollback(self, saved: dict) -> None:
+        for k, v in saved.items():
+            setattr(self, k, v)
+
+    def _swap(self, bundle: dict, aabs, order, nab, tz, loc, warm: bool, events: list) -> None:
+        old_aabs, old_nab = self.aabs, self.nab
+        old_outputs = self._output_ports() if warm else {}
+        old_state = self._snapshot_state()
+        self.bundle = bundle
+        self.version = int(bundle.get("version", 0))
+        self.aabs, self.aab_order, self.nab = aabs, order, nab
+        self.tz = tz
+        self.location = loc
+        self._restore_state(old_state)  # carry baselines / schedule state across versions
+        if warm:
+            self._carry_over(old_aabs, old_nab, events)
+            self._plan_releases(old_outputs)
+            self._persist_due = True
+        else:
+            self._pending_releases = []
+            self._orphan_ends = []
+            try:
+                self._load_persisted()
+            except Exception as e:  # noqa: BLE001 — a bad state file never keeps a good program out
+                logger.warning("persisted state not used: %s", e)
+            self._active_runs = {p: r for p, r in self._active_runs.items() if p in (nab.plots if nab else {})}
+        self._cold = False
+        self._applied_pending = True
+        # First pass after a (re)load reports every card in full, so the
+        # cloud's copy is corrected right after a restart.
+        for blk in self.aabs.values():
+            blk.dirty.update(blk.vars.keys())
+
     # ----------------------------------------------- reload without a bump
 
-    def _carry_over(self, old_aabs: dict[str, "_Block"], old_nab: "_Block") -> None:
+    def _carry_over(self, old_aabs: dict[str, "_Block"], old_nab: "_Block", events: list) -> None:
         """Seed the program just built from the one that was running (see compile)."""
         for aid, blk in self.aabs.items():
             ob = old_aabs.get(aid)
@@ -340,20 +386,15 @@ class BlockRuntime:
             if same:
                 v.value, v.last_change = ov.value, ov.last_change
         self._carry_rules(old_nab, nab)
-        old_schedules = {s.id: s for s in old_nab.schedules}
-        for s in nab.schedules:
-            o = old_schedules.pop(s.id, None)
-            if o is not None:
-                s.active_end_mono = o.active_end_mono  # a running schedule still ends on time
-        now = self.clock.monotonic()
-        for o in old_schedules.values():
-            # A schedule taken out while it runs: its plot run still ends when the schedule would have.
-            run = self._active_runs.get(o.d.get("plotId") or "")
-            if o.active_end_mono is not None and run is not None and run.get("end") is None:
-                run["end"] = o.active_end_mono
-        for pid in [p for p in self._active_runs if p not in nab.plots]:
+        self._carry_schedules(old_nab, nab)
+        # Every plot taken out is out of the runs before any of them is ended: ending one looks at
+        # the runs that go on.
+        removed = [p for p in self._active_runs if p not in nab.plots]
+        for pid in removed:
             self._active_runs.pop(pid)
-            self._end_removed_run(old_nab.plots.get(pid) or {}, pid, now)
+        now = self.clock.monotonic()
+        for pid in removed:
+            self._end_removed_run(old_nab, pid, now, events)
 
     @staticmethod
     def _carry_rules(old_blk: "_Block", blk: "_Block") -> None:
@@ -365,22 +406,142 @@ class BlockRuntime:
             for f in _Rule.STATE:
                 setattr(r, f, getattr(o, f))
 
-    def _end_removed_run(self, old_plot: dict, plot_id: str, now: float) -> None:
-        """A plot taken out of the program while it ran: the run ends, its valves close."""
-        nab = self.nab
-        still_running = {vn for p in self._active_runs for vn in (nab.plots[p].get("valveVariables") or [])}
-        valves = [vn for vn in (old_plot.get("valveVariables") or [])
-                  if vn in nab.vars and nab.vars[vn].settable and vn not in still_running]
-        others_open = any(bool(nab.vars[vn].value) for p in nab.plots.values()
-                          for vn in (p.get("valveVariables") or []) if vn in nab.vars and vn not in valves)
-        if nab.pump_variable and not others_open:
-            self._set_var(nab, nab.vars[nab.pump_variable], False, now)
-        for vn in valves:
-            self._set_var(nab, nab.vars[vn], False, now)
-        self.sink.event("plot_run_ended", {"plotId": plot_id, "source": "program"})
+    def _carry_schedules(self, old_nab: "_Block", nab: "_Block") -> None:
+        """A running schedule still ends on time, whatever the reload did to it: kept, its end
+        carries on; taken out, or its end actions changed, the end it was started with still runs
+        at that time (an orphaned end), resolved through the program it was written against — so
+        what its start switched on is switched off."""
+        old = {s.id: s for s in old_nab.schedules}
+        put_back = {o["scheduleId"]: o for o in self._orphan_ends if o["announce"]}
+        for s in nab.schedules:
+            o = old.pop(s.id, None)
+            if o is not None:
+                if o.active_end_mono is None:
+                    continue
+                s.active_end_mono = o.active_end_mono  # a running schedule still ends on time
+                old_end = self._stable_end(o, old_nab)
+                if old_end != self._stable_end(s, nab):
+                    self._orphan_ends.append(self._orphan(o, old_end, announce=False))
+            elif s.id in put_back:
+                # Taken out and put back before its end: the same run, ended once, at its own time.
+                orphan = put_back.pop(s.id)
+                self._orphan_ends.remove(orphan)
+                s.active_end_mono = orphan["end"]
+                s.last_run_date, s.active_end_wall, s.active_started_at = orphan["lastRunDate"], orphan["endWall"], orphan["startedAt"]
+                if orphan["actions"] != self._stable_end(s, nab):
+                    self._orphan_ends.append(dict(orphan, announce=False))
+        for o in old.values():
+            if o.active_end_mono is not None:
+                self._orphan_ends.append(self._orphan(o, self._stable_end(o, old_nab), announce=True))
 
-    def _output_ports(self) -> dict[tuple[str, str], tuple[PortRef, str, bool, str]]:
-        """(assetId, sourceKey) → (port, variable type, is a motor, safe state) for every output."""
+    @staticmethod
+    def _orphan(s: "_Schedule", actions: list, announce: bool) -> dict:
+        return {"end": s.active_end_mono, "scheduleId": s.id, "plotId": s.d.get("plotId"), "actions": actions,
+                "announce": announce, "lastRunDate": s.last_run_date, "endWall": s.active_end_wall,
+                "startedAt": s.active_started_at}
+
+    @staticmethod
+    def _target_of(blk: Optional["_Block"], name: Optional[str]) -> Optional[tuple]:
+        """What a NAB variable stands for, independent of its name: ("asset", assetId, variable) for
+        an asset variable, ("alert",) for the alert variable, ("nab", name) for a NAB local."""
+        v = blk.vars.get(name or "") if blk is not None else None
+        if v is None:
+            return None
+        if v.kind == "asset":
+            ref = v.d.get("asset") or {}
+            return ("asset", ref.get("assetId"), ref.get("variable"))
+        if v.kind == "alert":
+            return ("alert",)
+        return ("nab", v.name)
+
+    def _stable_end(self, s: "_Schedule", nab: "_Block") -> list[dict]:
+        """A schedule's end actions in terms that survive a reload (see _target_of). Only what ends
+        is kept: an orphaned end never starts a plot or a sequence the schedule would have chained to."""
+        d = s.d
+        actions = d.get("endActions") or ([{"type": "stop_plot", "plotId": d["plotId"]}] if d.get("plotId") else [])
+        out: list[dict] = []
+        for a in self._with_plot(actions, d.get("plotId")):
+            t = a.get("type")
+            if t == "set":
+                target = self._target_of(nab, a.get("variable"))
+                if target is None:
+                    continue
+                item: dict = {"type": "set", "target": list(target)}
+                if a.get("expression"):
+                    item["expression"] = a["expression"]
+                else:
+                    item["value"] = a.get("value")
+                if a.get("severity"):
+                    item["severity"] = a["severity"]
+                out.append(item)
+            elif t == "stop_plot":
+                out.append({"type": "stop_plot", "plotId": a.get("plotId")})
+            elif t in ("log", "alert"):
+                out.append({k: v for k, v in a.items() if k != "_ast"})
+        return out
+
+    def _set_target(self, target: tuple, value, now: float) -> bool:
+        """Set what a stable target names in the running program: through a NAB variable that
+        writes the same asset variable, else the asset variable itself; a NAB local by name."""
+        nab = self.nab
+        if target[0] == "asset":
+            _, aid, var = target
+            for v in nab.vars.values():
+                ref = v.d.get("asset") or {}
+                if v.kind == "asset" and v.settable and ref.get("assetId") == aid and ref.get("variable") == var:
+                    self._set_var(nab, v, _coerce(v.type, value), now)
+                    return True
+            blk = self.aabs.get(aid)
+            tv = blk.vars.get(var) if blk is not None else None
+            if tv is not None and tv.expr_ast is None and (
+                    tv.settable or (tv.port is not None and tv.port.transport.get("direction") == "out")):
+                self._set_var(blk, tv, _coerce(tv.type, value), now)
+                return True
+            return False
+        if target[0] == "nab":
+            v = nab.vars.get(target[1])
+            if v is not None and v.kind == "local" and v.expr_ast is None:
+                self._set_var(nab, v, _coerce(v.type, value), now)
+                return True
+        return False
+
+    def _target_is_on(self, target: Optional[tuple]) -> bool:
+        if target is None:
+            return False
+        if target[0] == "asset":
+            blk = self.aabs.get(target[1])
+            v = blk.vars.get(target[2]) if blk is not None else None
+        elif target[0] == "nab":
+            v = self.nab.vars.get(target[1])
+        else:
+            v = None
+        return bool(v.value) if v is not None else False
+
+    def _end_removed_run(self, old_nab: "_Block", plot_id: str, now: float, events: list) -> None:
+        """A plot taken out of the program while it ran: the run ends, its valves close (pump first),
+        found through the program the run was started in — the plot's valve variables leave the
+        NAB with it, while the valve cards stay on the node."""
+        nab = self.nab
+        old_plot = old_nab.plots.get(plot_id) or {}
+        held = {self._target_of(nab, vn) for p in self._active_runs
+                for vn in (nab.plots.get(p, {}).get("valveVariables") or [])}
+        valves: list[tuple] = []
+        for vn in old_plot.get("valveVariables") or []:
+            t = self._target_of(old_nab, vn)
+            if t is not None and t not in held and t not in valves:
+                valves.append(t)
+        others_open = any(self._target_is_on(t) for p in nab.plots.values() for vn in (p.get("valveVariables") or [])
+                          if (t := self._target_of(nab, vn)) is not None and t not in valves)
+        pump = self._target_of(old_nab, old_nab.pump_variable)
+        if pump is not None and not others_open and not self._set_target(pump, False, now):
+            logger.warning("plot %s left the program: its pump is in it no more, nothing to switch off", plot_id)
+        for t in valves:
+            if not self._set_target(t, False, now):
+                logger.warning("plot %s left the program: valve %s is in it no more, nothing to close", plot_id, t)
+        events.append(("plot_run_ended", {"plotId": plot_id, "source": "program"}))
+
+    def _output_ports(self) -> dict[tuple[str, str], tuple[PortRef, str, bool]]:
+        """(assetId, sourceKey) → (port, variable type, is a motor) for every output."""
         out = {}
         for aid in self.aab_order:
             blk = self.aabs[aid]
@@ -388,23 +549,33 @@ class BlockRuntime:
             is_motor = blk.asset_type in ("motor_controller",) or bool(meta.get("ratedCurrentA"))
             for v in blk.vars.values():
                 if v.port is not None and v.port.transport.get("direction") == "out":
-                    out[(aid, v.port.source_key)] = (v.port, v.type, is_motor, str(meta.get("safeState") or "off"))
+                    out[(aid, v.port.source_key)] = (v.port, v.type, is_motor)
         return out
+
+    def _ports_in_use(self) -> set:
+        """Every physical port the running program reads or drives."""
+        return {physical_port(v.port.transport) for aid in self.aab_order
+                for v in self.aabs[aid].vars.values() if v.port is not None}
 
     def _plan_releases(self, old_outputs: dict) -> None:
         new_outputs = self._output_ports()
-        still_driven = {port_identity(p.transport) for p, *_ in new_outputs.values()}
-        for key, (port, vtype, is_motor, safe) in old_outputs.items():
+        in_use = self._ports_in_use()
+        # A release an earlier reload planned and no pass has applied yet is dropped once its port
+        # is in the program again (driven by a card, or read as an input).
+        self._pending_releases = [r for r in self._pending_releases if physical_port(r[1].transport) not in in_use]
+        for key, (port, vtype, is_motor) in old_outputs.items():
             cur = new_outputs.get(key)
             if cur is not None and cur[0].transport == port.transport:
                 continue  # the same output on the same port: it keeps its level, nothing is written
-            if cur is not None or port_identity(port.transport) in still_driven:
+            used = physical_port(port.transport) in in_use
+            if cur is not None or used:
                 # The output is on another port now, its wiring facts changed (active low), or its
-                # line belongs to another card: the next pass writes the level the program holds.
+                # line belongs to another card or is read as an input: the next pass writes the
+                # level the program holds; an input takes the line over when it is sampled.
                 self._last_written.pop(key, None)
-            if port_identity(port.transport) in still_driven or (cur is None and key not in self._last_written):
+            if used or (cur is None and key not in self._last_written):
                 continue  # the line stays in the program, or this agent never drove it
-            self._pending_releases.append((key, port, vtype, is_motor, safe))
+            self._pending_releases.append((key, port, vtype, is_motor))
 
     def _build(self, bundle: dict):
         version = bundle.get("version")
@@ -436,6 +607,7 @@ class BlockRuntime:
             self._finish_block(blk, is_nab=False)
             aabs[aid] = blk
             order.append(aid)
+        self._check_one_card_per_port(aabs, order)
         nabd = bundle.get("nab")
         if not isinstance(nabd, dict):
             raise CompileError("bundle.nab missing")
@@ -481,6 +653,25 @@ class BlockRuntime:
             nab.schedules.append(_Schedule(sd))
         self._finish_block(nab, is_nab=True)
         return aabs, order, nab, tz, loc
+
+    @staticmethod
+    def _check_one_card_per_port(aabs: dict[str, _Block], order: list[str]) -> None:
+        """One port, one card (RBAC-01): a port is linked to one card (node linking, ADR-024), so a
+        bundle in which two cards — or two ports of one card — name the same physical line, and
+        one of them drives it, is refused and the running program stays. Two cards reading one
+        input is allowed. A card document names its ports itself until the cloud stamps them
+        from the node's port table, so this is the node's own check, not the cloud's."""
+        claims: dict[tuple, list[tuple[str, str, Optional[str], dict]]] = {}
+        for aid in order:
+            for v in aabs[aid].vars.values():
+                if v.port is not None:
+                    claims.setdefault(physical_port(v.port.transport), []).append(
+                        (aid, v.port.source_key, v.port.transport.get("direction"), v.port.transport))
+        for who in claims.values():
+            cards = sorted({(aid, key) for aid, key, _, _ in who})
+            if len(cards) > 1 and any(direction == "out" for _, _, direction, _ in who):
+                named = " and ".join(f"{key} of card {aid}" for aid, key in cards)
+                raise CompileError(f"{describe_port(who[0][3])} is claimed by {named}: a port is linked to one card")
 
     @staticmethod
     def _check_var(vd: dict, blk: _Block, which: str) -> None:
@@ -798,7 +989,7 @@ class BlockRuntime:
                 self._persist()
 
     def _apply_pending_resumes(self, now: float) -> None:
-        resumes, self._pending_resumes = getattr(self, "_pending_resumes", []), []
+        resumes, self._pending_resumes = self._pending_resumes, []
         for plot_id, end_mono in resumes:
             if plot_id not in self.nab.plots:
                 continue
@@ -1117,6 +1308,11 @@ class BlockRuntime:
 
     def _expire_runs(self, now: float) -> None:
         for pid, run in list(self._active_runs.items()):
+            if pid not in self.nab.plots:
+                # Never left behind by a reload (see _carry_over); if it were, it must not fail every pass.
+                logger.error("run of plot %s outlived its plot; dropped", pid)
+                self._active_runs.pop(pid)
+                continue
             if run.get("end") is not None and now >= run["end"]:
                 self._stop_plot(pid, now, source="timer")
 
@@ -1167,6 +1363,53 @@ class BlockRuntime:
                     self._persist_due = True
                     self.sink.event("run_missed", {"scheduleId": s.id, "plotId": d.get("plotId"), "reason": "start window elapsed"})
                     self._pending_events.append(("run_missed", {"scheduleId": s.id}))
+        for orphan in [o for o in self._orphan_ends if now >= o["end"]]:
+            self._orphan_ends.remove(orphan)
+            self._end_orphan(orphan, now, wall)
+
+    def _end_orphan(self, orphan: dict, now: float, wall: datetime) -> None:
+        """The end of a running schedule a reload took out (or whose end it changed): its end actions
+        as they were, each on what it named then (see _stable_end), in the program running now."""
+        sid, nab = orphan["scheduleId"], self.nab
+        if orphan["announce"]:
+            self.sink.event("schedule_ended", {"scheduleId": sid, "plotId": orphan["plotId"]})
+            self._pending_events.append(("schedule_ended", {"scheduleId": sid}))
+        for a in orphan["actions"]:
+            t = a.get("type")
+            try:
+                if t == "set":
+                    target = tuple(a["target"])
+                    val = self._evaluate_in(nab, a["expression"], now, wall) if "expression" in a else a.get("value")
+                    if val is None:
+                        continue
+                    if target[0] == "alert":
+                        self._raise_alert(nab, str(val), a.get("severity") or "warning", sid, now)
+                    elif not self._set_target(target, val, now):
+                        logger.info("schedule %s ended: %s is not in the program any more", sid, target)
+                elif t == "stop_plot":
+                    if a.get("plotId") in self._active_runs and a.get("plotId") in nab.plots:
+                        self._stop_plot(a["plotId"], now, source=sid)
+                elif t == "log":
+                    self.sink.log(self._fmt(nab, a.get("text", "")), None)
+                elif t == "alert":
+                    self._raise_alert(nab, self._fmt(nab, a.get("text", "")), a.get("severity") or "warning", sid, now)
+            except Exception as e:  # noqa: BLE001
+                logger.error("schedule %s end action %s failed: %s", sid, t, e)
+        self._persist_due = True
+
+    def _evaluate_in(self, blk: _Block, src: str, now: float, wall: datetime):
+        """An expression an orphaned end carries, against the program running now; None when it no
+        longer fits that program (a name it reads is gone)."""
+        try:
+            ast = E.parse(src)
+        except E.ExprError as e:
+            logger.info("orphaned end expression %r: %s", src, e)
+            return None
+        _, errs = E.validate(ast, blk.scope())
+        if errs:
+            logger.info("orphaned end expression %r no longer fits the program: %s", src, errs[0])
+            return None
+        return E.evaluate(ast, self._env(blk, now, wall))
 
     def _schedule_end(self, s: _Schedule, now: float, wall: datetime) -> None:
         d = s.d
@@ -1256,17 +1499,17 @@ class BlockRuntime:
             except Exception as e:  # noqa: BLE001
                 logger.error("write %s.%s failed: %s", blk.asset_id, v.port.source_key, e)
 
-    def _release_output(self, key: tuple[str, str], port: PortRef, vtype: str, is_motor: bool, safe: str) -> None:
-        """Let go of an output the program no longer has, to its asset's safe state (R-14):
-        ``off`` (the default) switches it off and frees the line; ``last_state`` leaves it as it is.
-        A line the output moved away from (the card's port is another one now) is always switched
-        off: the card's level carries on on its new port."""
+    def _release_output(self, key: tuple[str, str], port: PortRef, vtype: str, is_motor: bool) -> None:
+        """Let go of a port an output left: switched off and the line freed. Always off: the
+        asset's safeState (R-14) is what happens when the node's software stops or its power goes;
+        an output the program no longer has is supervised by no rule (no maximum run, no dry-run
+        protection), and on a port-table node not even its own card could switch it off any more.
+        An output that moved to another port carries its level there. A port the running program
+        uses again (another card drives it, or reads it as an input) is left to that program."""
         still_ours = self._output_var(key[0], key[1]) is not None  # moved to another port: the key is the new one's
-        if safe != "off" and not still_ours:
-            logger.warning("output %s.%s left the program; its safe state is %s, so it is left as it is",
-                           key[0], key[1], safe)
-            self.sink.event("output_released", {"assetId": key[0], "sourceKey": key[1], "level": "kept"})
+        if not still_ours:
             self._last_written.pop(key, None)
+        if physical_port(port.transport) in self._ports_in_use():
             return
         try:
             self.io.write_output(port, False if vtype == "bool" else 0.0)
@@ -1277,7 +1520,6 @@ class BlockRuntime:
         if still_ours:
             logger.info("output %s.%s moved to another port: the old one is switched off and released", key[0], key[1])
             return
-        self._last_written.pop(key, None)
         logger.info("output %s.%s left the program: switched off and released", key[0], key[1])
         self.sink.event("output_released", {"assetId": key[0], "sourceKey": key[1], "level": "off"})
 
@@ -1434,9 +1676,7 @@ class BlockRuntime:
                     self.sink.event("run_resumed", {"scheduleId": s.id, "plotId": s.d.get("plotId")})
                     if s.d.get("plotId"):
                         # applied after the boot pass (see step) so `on boot` rules cannot undo it
-                        pending = getattr(self, "_pending_resumes", [])
-                        pending.append((s.d["plotId"], s.active_end_mono))
-                        self._pending_resumes = pending
+                        self._pending_resumes.append((s.d["plotId"], s.active_end_mono))
                 else:
                     self.sink.event("run_cut_short", {"scheduleId": s.id, "plotId": s.d.get("plotId"), "gapSeconds": gap})
                     s.active_end_wall = None

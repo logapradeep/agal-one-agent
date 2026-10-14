@@ -29,6 +29,9 @@ from .sensors.protection import ProtectionConfig
 
 logger = logging.getLogger("agal_one_agent")
 
+# How long boot reconciliation waits for the answer to the hardware report (see _boot_wait).
+BOOT_WAIT_FOR_PORT_TABLE_S = 30.0
+
 
 def main():
     parser = argparse.ArgumentParser(description="Agal One IoT Agent")
@@ -95,10 +98,13 @@ def main():
     from .ports.port_test import run_port_test
     from .ports.bus_scan import run_bus_scan
     from .ports.links import LinkGuard, handle_switch, refuse_port_test
+    from .blocks.sync import DEFAULT_STATE_DIR
     line_io = LineIO()
     analog_io = AnalogReader()  # AI ports, read from their own wiring facts (contracts v1.9.1)
-    # RBAC-01: a switch command moves a port only for the card that port is linked to.
-    link_guard = LinkGuard()
+    # RBAC-01: a switch command moves a port only for the card that port is linked to. The highest
+    # portsVersion the node ever heard is kept in its state directory: once a port-table node,
+    # always one, even when the hardware report is not answered after a restart.
+    link_guard = LinkGuard(state_dir=config.blocks.state_dir or DEFAULT_STATE_DIR)
 
     def _legacy_gpio(command: dict):
         """The Broadcom number the legacy executor would write for this command, if any."""
@@ -108,17 +114,35 @@ def main():
     def _boot_guard(command: dict):
         return link_guard.check_boot_command(command, gpio=_legacy_gpio(command))
 
-    def _report_hardware():
-        try:
-            answer = http_reporter.report_hardware(hardware_report(__version__))
+    def _boot_wait():
+        # Boot reconciliation writes through the legacy executor: not before the node knows whether
+        # it runs a port table (until then the guard refuses the legacy path, so nothing is applied).
+        if not link_guard.wait_known(BOOT_WAIT_FOR_PORT_TABLE_S):
+            logger.warning("Boot reconciliation: the hardware report is not answered yet; the legacy path stays refused")
+
+    def _report_hardware(retry: bool = False):
+        delay = 10.0
+        while True:
+            answer = None
+            try:
+                answer = http_reporter.report_hardware(hardware_report(__version__))
+            except Exception as e:  # noqa: BLE001 — never takes the agent down
+                logger.warning("hardware report failed: %s", e)
             if answer:
                 link_guard.note_ports_version(answer.get("portsVersion"))
                 logger.info("Hardware reported: board profile %s (%s); port table v%s",
                             answer.get("boardProfileId") or "none", answer.get("boardMatch"), answer.get("portsVersion"))
-        except Exception as e:  # noqa: BLE001 — never takes the agent down
-            logger.warning("hardware report failed: %s", e)
+                return
+            if not retry:
+                return
+            # Until it is answered the node does not know whether it runs a port table (unless it
+            # kept one from before), and the legacy GPIO path stays refused: keep asking.
+            logger.warning("hardware report not answered; asking again in %d s", int(delay))
+            time.sleep(delay)
+            delay = min(delay * 2, 600.0)
 
-    threading.Thread(target=_report_hardware, name="hardware-report", daemon=True).start()
+    threading.Thread(target=_report_hardware, kwargs={"retry": not args.offline},
+                     name="hardware-report", daemon=True).start()
 
     # LoRa bridge (local — ChirpStack Gateway Bridge)
     lora_bridge = None
@@ -495,7 +519,7 @@ def main():
     # nudge the uploader to drain the backlog accumulated during the outage,
     # and pull the program in case a syncProgram poke was missed.
     def on_reconnect():
-        boot_reconciler.reconcile(config, mqtt_client, http_reporter, guard=_boot_guard)
+        boot_reconciler.reconcile(config, mqtt_client, http_reporter, guard=_boot_guard, wait_for=_boot_wait)
         uploader.wake()
         if program_sync is not None:
             program_sync.pull()
@@ -590,7 +614,7 @@ def main():
 
         if not args.offline:
             # Reconcile pin states with cloud on boot, then pull the program.
-            boot_reconciler.reconcile(config, mqtt_client, http_reporter, guard=_boot_guard)
+            boot_reconciler.reconcile(config, mqtt_client, http_reporter, guard=_boot_guard, wait_for=_boot_wait)
             if program_sync is not None:
                 program_sync.pull()
 

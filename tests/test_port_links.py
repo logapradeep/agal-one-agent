@@ -8,8 +8,10 @@ another card's port when it does not know the card a command names. No hardware.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -18,7 +20,7 @@ import pytest
 from agal_one_agent import boot_reconciler
 from agal_one_agent.blocks.clock import SimClock
 from agal_one_agent.blocks.io import SimulatedIO
-from agal_one_agent.blocks.runtime import BlockRuntime, RecordingSink
+from agal_one_agent.blocks.runtime import BlockRuntime, CompileError, RecordingSink
 from agal_one_agent.blocks.simulate import build_bundle_from_defaults
 from agal_one_agent.ports.links import LinkGuard, handle_switch, refuse, refuse_port_test
 
@@ -135,8 +137,18 @@ def test_without_a_port_table_the_legacy_gpio_path_stays_but_never_onto_a_progra
     assert g.check_switch(_switch("intruder-1"), gpio=27) == \
         "refused: GPIO 27 is driven by the running program for another card", "the GPIO the node's pins resolve"
     assert g.check_switch(_switch("legacy-card", gpioNumber=12)) is None, "a pin no program drives: legacy path"
-    assert g.check_switch(_switch("intruder-1", gpioNumber=5)) is None, "an input of the program is not an output"
     assert _guard(_runtime()).check_switch(_switch("any-card", gpioNumber=17)) is None, "no program, no table: as before"
+
+
+def test_without_a_port_table_a_gpio_the_program_reads_is_never_driven_as_an_output():
+    """GPIO 5 is flow-1's flow switch, read by the dry-run and flow rules. Before, a stranger's
+    setPower (or a boot-reconcile entry) naming it set the sensor line up as a driven output."""
+    g = _guard(_runtime(_farm(port_table=False)))
+    assert g.check_switch(_switch("intruder-1", gpioNumber=5)) == "refused: GPIO 5 is read by the running program"
+    assert g.check_switch(_switch("flow-1", gpioNumber=5)) == "refused: GPIO 5 is read by the running program"
+    assert g.check_switch({**_switch("flow-1"), "sourceKey": "sensor.flow"}) == \
+        "refused: sensor.flow of card flow-1 is an input on this node"
+    assert g.check_boot_command({**_switch("intruder-1"), "gpioNumber": 5}) == "refused: GPIO 5 is read by the running program"
 
 
 # ------------------------------------------------------------------ testPort
@@ -274,3 +286,158 @@ def test_boot_reconciliation_without_a_guard_is_unchanged(monkeypatch):
 def test_the_agent_entry_point_still_imports():
     import agal_one_agent.main as main  # noqa: F401 — main() wires the guard; a NameError would show here only at run time
     assert callable(main.main)
+
+
+# ------------------------------------------- the port table, before an answer
+
+def test_a_node_that_once_ran_a_port_table_keeps_running_one_after_a_restart(tmp_path):
+    """portsVersion was learnt only from one unretried hardware report per start: a node whose
+    report was not answered fell back to the legacy path. It is kept in the state directory."""
+    first = LinkGuard(state_dir=str(tmp_path))
+    assert first.known is False
+    first.note_ports_version(3)
+    assert json.loads((tmp_path / "ports_version.json").read_text()) == {"portsVersion": 3}
+
+    after_restart = LinkGuard(state_dir=str(tmp_path))  # no answer this time
+    after_restart.use_runtime(_runtime(_farm(port_table=False)))
+    assert after_restart.known and after_restart.ports_version == 3 and after_restart.runs_port_table()
+    assert after_restart.check_switch(_switch("intruder-1", gpioNumber=12)) == \
+        "refused: device.power of card intruder-1 is not linked to a port of this node"
+    after_restart.note_ports_version(1)
+    assert LinkGuard(state_dir=str(tmp_path)).ports_version == 3, "it only goes up"
+
+
+def test_until_the_node_knows_whether_it_runs_a_port_table_the_legacy_path_is_refused():
+    g = LinkGuard()
+    g.use_runtime(_runtime(_farm(port_table=False)))
+    assert g.known is False
+    assert g.check_switch(_switch("legacy-card", gpioNumber=12)) == \
+        "refused: this node does not know yet whether it runs a port table (its hardware report is not answered yet)"
+    assert g.check_switch(_switch("pump-1", gpioNumber=17)) is None, "a card's own output in the program: the runtime drives it"
+    g.note_ports_version(0)  # the answer: no port table
+    assert g.known and g.check_switch(_switch("legacy-card", gpioNumber=12)) is None
+
+
+def test_boot_reconciliation_waits_for_the_answer_to_the_hardware_report(monkeypatch):
+    monkeypatch.setattr(boot_reconciler.threading, "Thread", _SyncThread)
+    commands = [{"assetId": "legacy-card", "sourceKey": "device.power", "gpioNumber": 12, "value": 1}]
+
+    applied = []
+    monkeypatch.setattr(boot_reconciler, "execute", lambda config, mqtt, cmd: applied.append(cmd["assetId"]))
+    g = LinkGuard()
+    g.use_runtime(_runtime(_farm(port_table=False)))
+    boot_reconciler.reconcile(_Cfg, FakeMqtt(), _BootState(commands), guard=lambda c: g.check_boot_command(c),
+                              wait_for=lambda: None)  # never answered
+    assert applied == [], "not before the node knows"
+    boot_reconciler.reconcile(_Cfg, FakeMqtt(), _BootState(commands), guard=lambda c: g.check_boot_command(c),
+                              wait_for=lambda: g.note_ports_version(0))  # answered while it waits
+    assert applied == ["legacy-card"]
+
+    applied.clear()
+    table = LinkGuard()
+    table.use_runtime(_runtime(_farm(port_table=False)))
+    boot_reconciler.reconcile(_Cfg, FakeMqtt(), _BootState(commands), guard=lambda c: table.check_boot_command(c),
+                              wait_for=lambda: table.note_ports_version(4))
+    assert applied == [], "a port-table node never applies the boot state through the legacy executor"
+
+
+# ------------------------------------------ the check and the dispatch, as one
+
+def test_the_switch_check_and_its_dispatch_hold_the_runtime_lock():
+    """A program pulled on its own thread could land between the check and the dispatch: the
+    card's port gone, owns_port False, and the command went on to the legacy executor."""
+    rt = _runtime(_farm(port_table=True))
+    rt.step()
+    seen = []
+
+    def free(lock):
+        got = []
+        t = threading.Thread(target=lambda: got.append(lock.acquire(blocking=False)))
+        t.start()
+        t.join()
+        if got[0]:
+            lock.release()
+        return got[0]
+
+    class Watching(LinkGuard):
+        def check_switch(self, command, gpio=None):
+            seen.append(free(rt.lock))
+            return super().check_switch(command, gpio)
+
+    g = Watching()
+    g.use_runtime(rt)
+    g.note_ports_version(2)
+    mqtt, legacy = FakeMqtt(), []
+    handle_switch(_switch("valve-1"), g, rt, mqtt, legacy=legacy.append)
+    assert seen == [False], "another thread could not take the lock during the check"
+    assert [a[1] for a in mqtt.acks] == ["acknowledged", "completed"]
+
+
+def test_a_port_table_node_never_hands_a_switch_to_the_legacy_executor():
+    """Whatever let a command past the check (here a check that says yes to everything), a node
+    that runs a port table refuses it rather than write the GPIO the command names."""
+    rt = _runtime(_farm(port_table=True))
+
+    class Lenient(LinkGuard):
+        def check_switch(self, command, gpio=None):
+            return None
+
+    g = Lenient()
+    g.use_runtime(rt)
+    mqtt, legacy = FakeMqtt(), []
+    handle_switch(_switch("intruder-1", gpioNumber=17), g, rt, mqtt, legacy=legacy.append, gpio=17)
+    assert legacy == []
+    assert mqtt.acks == [("c1", "failed", "refused: device.power of card intruder-1 is not linked to a port of this node")]
+
+
+# ----------------------------------------------------- one port, one card
+
+def _intruder(transport, default=None):
+    aab = {"variables": [{"name": "relay", "kind": "node", "type": "bool", "settable": True, "exposed": True,
+                          **({"default": default} if default is not None else {}),
+                          "node": {"sourceKey": "device.power", "direction": "out"}}], "rules": []}
+    return {"assetId": "intruder-1", "assetType": "motor_controller", "aab": aab, "ports": {"device.power": transport}}
+
+
+def test_a_bundle_with_two_cards_on_one_output_line_is_refused():
+    """The backend copies each card's own portBindings[].transport into the bundle, so a stranger
+    could copy pump-1's chip label and line into a card naming this node; the node ran both."""
+    bundle = _farm(port_table=True)
+    bundle["assets"].append(_intruder({"kind": "gpio", "chip": CHIP, "line": 17, "direction": "out"}))
+    with pytest.raises(CompileError) as e:
+        _runtime(bundle)
+    assert str(e.value) == ("line 17 of pinctrl-bcm2835 is claimed by device.power of card intruder-1 and "
+                            "device.power of card pump-1: a port is linked to one card")
+
+
+def test_a_reload_that_adds_a_second_card_on_a_running_line_is_rejected_and_writes_nothing():
+    bundle = _farm(port_table=True)
+    rt = _runtime(bundle)
+    rt.step()
+    mark = len(rt.io.writes)
+    bad = dict(bundle, version=2, assets=bundle["assets"] + [_intruder({"kind": "gpio", "chip": CHIP, "line": 17,
+                                                                        "direction": "out"}, default=True)])
+    with pytest.raises(CompileError, match="a port is linked to one card"):
+        rt.compile(bad)
+    for _ in range(3):
+        rt.step()
+    assert rt.version == 1 and rt.io.writes[mark:] == []
+    assert [p.asset_id for p in rt.port_links() if p.transport.get("line") == 17] == ["pump-1"]
+
+
+def test_one_line_named_as_gpio_by_one_card_and_pwm_by_another_is_one_port():
+    bundle = _farm(port_table=False)
+    bundle["assets"].append(_intruder({"kind": "pwm", "gpioNumber": 17, "frequencyHz": 1000, "dutyCyclePct": 50}))
+    with pytest.raises(CompileError, match="GPIO 17 is claimed by device.power of card intruder-1 and device.power of card pump-1"):
+        _runtime(bundle)
+
+
+def test_an_output_on_a_line_another_card_reads_is_refused_but_two_cards_may_read_one_input():
+    bundle = _farm(port_table=False)
+    bundle["assets"].append(_intruder({"kind": "gpio", "gpioNumber": 5, "direction": "out"}))
+    with pytest.raises(CompileError, match="GPIO 5 is claimed by"):
+        _runtime(bundle)
+    shared = _farm(port_table=False)
+    flow = next(a for a in shared["assets"] if a["assetId"] == "flow-1")
+    shared["assets"].append(dict(flow, assetId="flow-1-copy"))
+    assert _runtime(shared).version == 1
