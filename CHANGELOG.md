@@ -41,6 +41,38 @@ Broadcom-numbered line stays an output at the level just written). 16 new tests 
 `tests/test_blocks_reload.py`, the reload simulation among them; each fails on 0.3.2 except the
 cold-load guard.
 
+**Security — a switch command moves a port only for the card it is linked to (RBAC-01, agent
+side).** A card document names its node and its ports itself, so a stranger's card could name
+somebody else's node and GPIO and switch it through `setAssetPower`; on the node, a program
+that did not know the command's `assetId` even fell back to *every* card's `device.power`
+and drove another card's program-owned output. What the node knows of its port table is what
+the cloud stamped into the running program: every port a card's block reads or drives, with
+that card (`BlockRuntime.port_links()`). `ports/links.py`:
+
+- a node **runs a port table** when the cloud reported a `portsVersion` above 0 (the
+  `reportHardware` answer or a `syncPorts`) or its program names a port by chip label + line.
+  There, `setPower` / `setPortValue` are carried out only for a port linked to the card the
+  command names, always through the runtime; anything else — no card, a card the port is not
+  linked to, an input — is refused with a failed `commandAck` in words (`refused: device.power
+  of card … is not linked to a port of this node`), and the legacy GPIO executor is never
+  reached. With a table and no program yet, every switch is refused;
+- `testPort` naming a card is refused unless the port is linked to that card (`refused: DO1 is
+  linked to another card on this node`), reported as a failed port test and a failed ack. A
+  free port is tested as before (the first check on a new board); a linked port tested with no
+  card named runs as the node-level check the cloud authorised, and is logged;
+- a node **without a port table** keeps the legacy GPIO path, now logged (`legacy GPIO path:
+  setPower for card …, GPIO … (this node has no port table)`), except onto a GPIO the running
+  program drives for another card — that is refused (a second writer);
+- the runtime itself answers only for the card a command names (`_port_var` no longer falls
+  back to every card);
+- **boot reconciliation** (`getBootState` lists every card that names this node, and applied
+  them through the legacy executor) goes through the same check and never writes a port the
+  running program drives: the program decides after a restart (R-21).
+
+16 new tests in `tests/test_port_links.py`; `main()` was also driven offline with fake MQTT and
+HTTP: a stranger's `setPower` and a `testPort` naming the wrong card were refused with their
+reasons, the linked card's `setPower` completed through the runtime.
+
 Tests read the contracts from `AGAL_CONTRACTS_DIR` when it is set (a worktree or a lone clone
 of the agent); the default stays `../../../contracts`.
 

@@ -10,7 +10,7 @@ import time
 from . import __version__
 from .config import AgentConfig, PinConfig
 from .mqtt_client import AgalOneMqttClient
-from .command_executor import execute, register_sensor, _get_handler
+from .command_executor import execute, register_sensor, _get_handler, _find_pin
 from .telemetry_publisher import TelemetryPublisher
 from .telemetry_buffer import TelemetryBuffer, DEFAULT_DB_PATH
 from .telemetry_uploader import TelemetryUploader
@@ -94,13 +94,25 @@ def main():
     from .ports.inventory import hardware_report
     from .ports.port_test import run_port_test
     from .ports.bus_scan import run_bus_scan
+    from .ports.links import LinkGuard, handle_switch, refuse_port_test
     line_io = LineIO()
     analog_io = AnalogReader()  # AI ports, read from their own wiring facts (contracts v1.9.1)
+    # RBAC-01: a switch command moves a port only for the card that port is linked to.
+    link_guard = LinkGuard()
+
+    def _legacy_gpio(command: dict):
+        """The Broadcom number the legacy executor would write for this command, if any."""
+        pin = _find_pin(config, command)
+        return pin.gpio_number if pin is not None else None
+
+    def _boot_guard(command: dict):
+        return link_guard.check_boot_command(command, gpio=_legacy_gpio(command))
 
     def _report_hardware():
         try:
             answer = http_reporter.report_hardware(hardware_report(__version__))
             if answer:
+                link_guard.note_ports_version(answer.get("portsVersion"))
                 logger.info("Hardware reported: board profile %s (%s); port table v%s",
                             answer.get("boardProfileId") or "none", answer.get("boardMatch"), answer.get("portsVersion"))
         except Exception as e:  # noqa: BLE001 — never takes the agent down
@@ -263,6 +275,7 @@ def main():
             tick_seconds=config.blocks.tick_seconds,
         )
         program_sync = ProgramSync(runtime, ProgramStore(state_dir), http_reporter)
+        link_guard.use_runtime(runtime)
         if program_sync.load_persisted():
             logger.info("Automation program v%d loaded from %s", runtime.version, state_dir)
         else:
@@ -396,6 +409,8 @@ def main():
             mqtt_client.publish_command_ack(command_id, "acknowledged")
 
             def _test():
+                if refuse_port_test(command, link_guard, http_reporter, mqtt_client):
+                    return  # RBAC-01: it names a card this port is not linked to
                 t = command.get("transport") or {}
                 owned = _runtime_port(t.get("chip"), t.get("line"))
                 if owned and command.get("action") == "pulse":
@@ -431,6 +446,7 @@ def main():
         # arrive inside its bundle, so this is a program pull; and the board says
         # again what it has (a bus may have been turned on since).
         if cmd_type == "syncPorts":
+            link_guard.note_ports_version(command.get("portsVersion"))
             mqtt_client.publish_command_ack(command_id, "completed")
             if program_sync is not None:
                 program_sync.pull()
@@ -459,18 +475,15 @@ def main():
                 mqtt_client.publish_command_ack(command_id, "failed", error=result.get("reason"))
             return
 
-        # setPower / setPortValue on a port the program owns → the runtime is the
-        # single writer (an app toggle becomes an interruption, R-23). Ports the
-        # program does not own fall through to the legacy executor unchanged.
-        if cmd_type in ("setPower", "setPortValue") and runtime is not None and runtime.nab is not None:
-            if runtime.owns_port(command.get("assetId"), command.get("sourceKey") or "device.power"):
-                mqtt_client.publish_command_ack(command_id, "acknowledged")
-                result = runtime.apply_command(command)
-                if result.get("accepted"):
-                    mqtt_client.publish_command_ack(command_id, "completed", applied_value=command.get("value"))
-                else:
-                    mqtt_client.publish_command_ack(command_id, "failed", error=result.get("reason"))
-                return
+        # setPower / setPortValue: is the port linked to the card the command names (RBAC-01)?
+        # Then a port the program owns goes through the runtime — the single writer; on a node
+        # with a port table that is the only way to an output. On a node without one, a port the
+        # program does not own goes to the legacy executor, logged (ports/links.py).
+        if cmd_type in ("setPower", "setPortValue"):
+            handle_switch(command, link_guard, runtime, mqtt_client, gpio=_legacy_gpio(command),
+                          legacy=lambda c: execute(config, mqtt_client, c,
+                                                   protection_monitor=protection_monitor if _legacy_protection_wanted() else None))
+            return
 
         # Regular GPIO/pin commands
         execute(config, mqtt_client, command,
@@ -482,7 +495,7 @@ def main():
     # nudge the uploader to drain the backlog accumulated during the outage,
     # and pull the program in case a syncProgram poke was missed.
     def on_reconnect():
-        boot_reconciler.reconcile(config, mqtt_client, http_reporter)
+        boot_reconciler.reconcile(config, mqtt_client, http_reporter, guard=_boot_guard)
         uploader.wake()
         if program_sync is not None:
             program_sync.pull()
@@ -577,7 +590,7 @@ def main():
 
         if not args.offline:
             # Reconcile pin states with cloud on boot, then pull the program.
-            boot_reconciler.reconcile(config, mqtt_client, http_reporter)
+            boot_reconciler.reconcile(config, mqtt_client, http_reporter, guard=_boot_guard)
             if program_sync is not None:
                 program_sync.pull()
 

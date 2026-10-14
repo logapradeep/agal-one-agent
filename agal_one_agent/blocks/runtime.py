@@ -732,13 +732,17 @@ class BlockRuntime:
                 return blk, v
         return None
 
+    def port_links(self) -> list[PortRef]:
+        """Every port the running program reads or drives, each with the card it belongs to.
+        The cloud stamps them from the node's port table, so they are this node's links."""
+        with self._lock:
+            return [v.port for aid in self.aab_order for v in self.aabs[aid].vars.values() if v.port is not None]
+
     def _port_var(self, asset_id: Optional[str], source_key: str) -> Optional[tuple[_Block, _Var]]:
-        candidates = [self.aabs[asset_id]] if asset_id in self.aabs else list(self.aabs.values())
-        for blk in candidates:
-            for v in blk.vars.values():
-                if v.port is not None and v.port.source_key == source_key and v.port.transport.get("direction") == "out":
-                    return blk, v
-        return None
+        # Only the card the command names (RBAC-01). This used to fall back to every card when the
+        # assetId was unknown, so a command for any card with a `device.power` drove another
+        # card's program-owned output.
+        return self._output_var(asset_id, source_key)
 
     # ----------------------------------------------------------------- pass
 
