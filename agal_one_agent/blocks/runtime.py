@@ -28,7 +28,7 @@ from typing import Any, Callable, Optional
 
 from . import expr as E
 from .clock import Clock, SystemClock
-from .io import IOAdapter, PortRef, SimulatedIO
+from .io import IOAdapter, PortRef, SimulatedIO, port_identity
 from .sun import sun_event_local
 
 logger = logging.getLogger(__name__)
@@ -125,7 +125,22 @@ class _Var:
         self.port: Optional[PortRef] = None
 
 
+def _signature(d: Any) -> str:
+    """A declaration as JSON, without what compiling adds to it (parsed expressions)."""
+    def strip(o):
+        if isinstance(o, dict):
+            return {k: strip(v) for k, v in o.items() if k != "_ast"}
+        if isinstance(o, list):
+            return [strip(x) for x in o]
+        return o
+    return json.dumps(strip(d), sort_keys=True, default=str)
+
+
 class _Rule:
+    # What a rule remembers between passes; carried across a reload while the rule is unchanged.
+    STATE = ("true_since", "fired", "last_fire", "ignore_until", "prev_ignore_after", "prev_var_value",
+             "limit_since", "limit_fired", "seq_active", "seq_step", "seq_next_at")
+
     def __init__(self, d: dict):
         self.d = d
         self.id = d["id"]
@@ -226,12 +241,28 @@ class BlockRuntime:
         self._clock_was_ok = True
         self._last_pass_mono: Optional[float] = None
         self._persist_due = False
+        # Cold = nothing is running: before the first program, and after stop(). A program
+        # loaded cold starts from its defaults and the persisted state, as after a restart;
+        # one loaded while another runs takes over from it (see compile).
+        self._cold = True
+        # Outputs the last reload took out of the program, let go of on the next pass (R-7 order).
+        self._pending_releases: list[tuple[tuple[str, str], PortRef, str, bool, str]] = []
         self.io.set_change_listener(self._on_input_change)
 
     # ------------------------------------------------------------ compile
 
     def compile(self, bundle: dict) -> None:
-        """Validate a compiled bundle and load it (atomic: on error the previous program stays)."""
+        """Validate a compiled bundle and load it (atomic: on error the previous program stays).
+
+        A program loaded while another one runs (the cloud recompiles a node on every block,
+        card or link write) takes over without a bump: every output keeps its level, every
+        variable whose declaration is unchanged keeps its value, an unchanged rule keeps its
+        hold / limit / sequence state, schedules and plot runs carry on to their end. Only an
+        output the new program no longer has is let go of, to its asset's safe state, on the
+        next pass. The swap holds the runtime lock, which a pass holds from start to end, so it
+        always lands between two passes. A program loaded cold (the first one, or after stop())
+        starts from its defaults and the persisted state, as after a restart.
+        """
         try:
             aabs, order, nab, tz, loc = self._build(bundle)
         except CompileError:
@@ -239,6 +270,9 @@ class BlockRuntime:
         except Exception as e:  # noqa: BLE001
             raise CompileError(f"malformed bundle: {e}") from e
         with self._lock:
+            warm = self.nab is not None and not self._cold
+            old_aabs, old_nab = self.aabs, self.nab
+            old_outputs = self._output_ports() if warm else {}
             old_state = self._snapshot_state()
             self.bundle = bundle
             self.version = int(bundle.get("version", 0))
@@ -246,14 +280,131 @@ class BlockRuntime:
             self.tz = tz
             self.location = loc
             self._restore_state(old_state)  # carry baselines / schedule state across versions
-            self._load_persisted()
+            if warm:
+                self._carry_over(old_aabs, old_nab)
+                self._plan_releases(old_outputs)
+                self._persist_due = True
+            else:
+                self._pending_releases = []
+                self._load_persisted()
+                self._active_runs = {p: r for p, r in self._active_runs.items() if p in (nab.plots if nab else {})}
+            self._cold = False
             self._applied_pending = True
             # First pass after a (re)load reports every card in full, so the
             # cloud's copy is corrected right after a restart.
             for blk in self.aabs.values():
                 blk.dirty.update(blk.vars.keys())
-            self._active_runs = {p: r for p, r in self._active_runs.items() if p in (nab.plots if nab else {})}
-        logger.info("program v%d compiled: %d assets, NAB %d rules / %d schedules", self.version, len(order), len(nab.rules) if nab else 0, len(nab.schedules) if nab else 0)
+        logger.info("program v%d compiled%s: %d assets, NAB %d rules / %d schedules", self.version,
+                    " (took over from the running program)" if warm else "", len(order),
+                    len(nab.rules) if nab else 0, len(nab.schedules) if nab else 0)
+
+    # ----------------------------------------------- reload without a bump
+
+    def _carry_over(self, old_aabs: dict[str, "_Block"], old_nab: "_Block") -> None:
+        """Seed the program just built from the one that was running (see compile)."""
+        for aid, blk in self.aabs.items():
+            ob = old_aabs.get(aid)
+            if ob is None:
+                continue
+            by_port = {(v.port.source_key, v.port.transport.get("direction")): v
+                       for v in ob.vars.values() if v.port is not None}
+            for v in blk.vars.values():
+                if v.port is not None:
+                    # A port variable is the level of its port: carried by the port's stable key
+                    # (assetId + sourceKey + direction) whatever else its declaration says.
+                    ov = by_port.get((v.port.source_key, v.port.transport.get("direction")))
+                    if ov is not None and ov.type != v.type:
+                        ov = None
+                else:
+                    ov = ob.vars.get(v.name)
+                    if ov is not None and (ov.port is not None or _signature(ov.d) != _signature(v.d)):
+                        ov = None  # a changed variable starts at its new default
+                if ov is not None:
+                    v.value, v.last_change = ov.value, ov.last_change
+            for n in blk.baselines:
+                ov = ob.vars.get(n)
+                if n in ob._learn and ov is not None and _signature(ov.d) == _signature(blk.vars[n].d):
+                    blk._learn[n] = ob._learn[n]  # a baseline being learnt goes on learning
+            self._carry_rules(ob, blk)
+        nab = self.nab
+        for v in nab.vars.values():
+            ov = old_nab.vars.get(v.name)
+            if ov is None or ov.kind != v.kind or ov.type != v.type:
+                continue
+            if v.kind == "asset":
+                # Re-read from its AAB variable before every NAB pass; carried so that
+                # `since()` and `on variable_changed` see no change that did not happen.
+                same = all((ov.d.get("asset") or {}).get(k) == (v.d.get("asset") or {}).get(k) for k in ("assetId", "variable"))
+            else:
+                same = _signature(ov.d) == _signature(v.d)
+            if same:
+                v.value, v.last_change = ov.value, ov.last_change
+        self._carry_rules(old_nab, nab)
+        old_schedules = {s.id: s for s in old_nab.schedules}
+        for s in nab.schedules:
+            o = old_schedules.pop(s.id, None)
+            if o is not None:
+                s.active_end_mono = o.active_end_mono  # a running schedule still ends on time
+        now = self.clock.monotonic()
+        for o in old_schedules.values():
+            # A schedule taken out while it runs: its plot run still ends when the schedule would have.
+            run = self._active_runs.get(o.d.get("plotId") or "")
+            if o.active_end_mono is not None and run is not None and run.get("end") is None:
+                run["end"] = o.active_end_mono
+        for pid in [p for p in self._active_runs if p not in nab.plots]:
+            self._active_runs.pop(pid)
+            self._end_removed_run(old_nab.plots.get(pid) or {}, pid, now)
+
+    @staticmethod
+    def _carry_rules(old_blk: "_Block", blk: "_Block") -> None:
+        old = {r.id: r for r in old_blk.rules}
+        for r in blk.rules:
+            o = old.get(r.id)
+            if o is None or _signature(o.d) != _signature(r.d):
+                continue  # a new or changed rule starts afresh, as at load; nothing else does
+            for f in _Rule.STATE:
+                setattr(r, f, getattr(o, f))
+
+    def _end_removed_run(self, old_plot: dict, plot_id: str, now: float) -> None:
+        """A plot taken out of the program while it ran: the run ends, its valves close."""
+        nab = self.nab
+        still_running = {vn for p in self._active_runs for vn in (nab.plots[p].get("valveVariables") or [])}
+        valves = [vn for vn in (old_plot.get("valveVariables") or [])
+                  if vn in nab.vars and nab.vars[vn].settable and vn not in still_running]
+        others_open = any(bool(nab.vars[vn].value) for p in nab.plots.values()
+                          for vn in (p.get("valveVariables") or []) if vn in nab.vars and vn not in valves)
+        if nab.pump_variable and not others_open:
+            self._set_var(nab, nab.vars[nab.pump_variable], False, now)
+        for vn in valves:
+            self._set_var(nab, nab.vars[vn], False, now)
+        self.sink.event("plot_run_ended", {"plotId": plot_id, "source": "program"})
+
+    def _output_ports(self) -> dict[tuple[str, str], tuple[PortRef, str, bool, str]]:
+        """(assetId, sourceKey) → (port, variable type, is a motor, safe state) for every output."""
+        out = {}
+        for aid in self.aab_order:
+            blk = self.aabs[aid]
+            meta = self._asset_meta(aid)
+            is_motor = blk.asset_type in ("motor_controller",) or bool(meta.get("ratedCurrentA"))
+            for v in blk.vars.values():
+                if v.port is not None and v.port.transport.get("direction") == "out":
+                    out[(aid, v.port.source_key)] = (v.port, v.type, is_motor, str(meta.get("safeState") or "off"))
+        return out
+
+    def _plan_releases(self, old_outputs: dict) -> None:
+        new_outputs = self._output_ports()
+        still_driven = {port_identity(p.transport) for p, *_ in new_outputs.values()}
+        for key, (port, vtype, is_motor, safe) in old_outputs.items():
+            cur = new_outputs.get(key)
+            if cur is not None and cur[0].transport == port.transport:
+                continue  # the same output on the same port: it keeps its level, nothing is written
+            if cur is not None or port_identity(port.transport) in still_driven:
+                # The output is on another port now, its wiring facts changed (active low), or its
+                # line belongs to another card: the next pass writes the level the program holds.
+                self._last_written.pop(key, None)
+            if port_identity(port.transport) in still_driven or (cur is None and key not in self._last_written):
+                continue  # the line stays in the program, or this agent never drove it
+            self._pending_releases.append((key, port, vtype, is_motor, safe))
 
     def _build(self, bundle: dict):
         version = bundle.get("version")
@@ -485,10 +636,15 @@ class BlockRuntime:
         if safe_state:
             self.apply_safe_state()
         self._persist()
+        with self._lock:
+            self._cold = True  # nothing runs any more: the next program loads as after a restart
 
     def apply_safe_state(self) -> None:
         """On a clean stop: pumps with safeState=off are de-energised (R-14)."""
         with self._lock:
+            releases, self._pending_releases = self._pending_releases, []
+            for rel in releases:  # outputs a reload took out and no pass has let go of yet
+                self._release_output(*rel)
             for aid in self.aab_order:
                 a = self._asset_meta(aid)
                 if a.get("safeState", "off") != "off":
@@ -565,6 +721,16 @@ class BlockRuntime:
     def owns_port(self, asset_id: Optional[str], source_key: str) -> bool:
         with self._lock:
             return self._port_var(asset_id, source_key) is not None
+
+    def _output_var(self, asset_id: Optional[str], source_key: str) -> Optional[tuple[_Block, _Var]]:
+        """The output variable of exactly this card's port, if the program has one."""
+        blk = self.aabs.get(asset_id) if asset_id else None
+        if blk is None:
+            return None
+        for v in blk.vars.values():
+            if v.port is not None and v.port.source_key == source_key and v.port.transport.get("direction") == "out":
+                return blk, v
+        return None
 
     def _port_var(self, asset_id: Optional[str], source_key: str) -> Optional[tuple[_Block, _Var]]:
         candidates = [self.aabs[asset_id]] if asset_id in self.aabs else list(self.aabs.values())
@@ -1050,7 +1216,11 @@ class BlockRuntime:
     # -------------------------------------------------------------- outputs
 
     def _flush_outputs(self) -> None:
-        writes: list[tuple[int, int, _Block, _Var]] = []
+        writes: list[tuple[int, int, Any, Any]] = []
+        releases, self._pending_releases = self._pending_releases, []
+        for rel in releases:
+            # A released output switches off with the other switch-offs: motors first, valves after.
+            writes.append((0, 0 if rel[3] else 1, None, rel))
         for aid in self.aab_order:
             blk = self.aabs[aid]
             # ui vars sourcing an output var mirror it
@@ -1073,11 +1243,39 @@ class BlockRuntime:
                 order = (0 if is_motor else 1) if not turning_on else (1 if is_motor else 0)
                 writes.append((1 if turning_on else 0, order, blk, v))
         for _, _, blk, v in sorted(writes, key=lambda w: (w[0], w[1])):
+            if blk is None:
+                self._release_output(*v)
+                continue
             try:
                 self.io.write_output(v.port, v.value)
                 self._last_written[(blk.asset_id, v.port.source_key)] = v.value
             except Exception as e:  # noqa: BLE001
                 logger.error("write %s.%s failed: %s", blk.asset_id, v.port.source_key, e)
+
+    def _release_output(self, key: tuple[str, str], port: PortRef, vtype: str, is_motor: bool, safe: str) -> None:
+        """Let go of an output the program no longer has, to its asset's safe state (R-14):
+        ``off`` (the default) switches it off and frees the line; ``last_state`` leaves it as it is.
+        A line the output moved away from (the card's port is another one now) is always switched
+        off: the card's level carries on on its new port."""
+        still_ours = self._output_var(key[0], key[1]) is not None  # moved to another port: the key is the new one's
+        if safe != "off" and not still_ours:
+            logger.warning("output %s.%s left the program; its safe state is %s, so it is left as it is",
+                           key[0], key[1], safe)
+            self.sink.event("output_released", {"assetId": key[0], "sourceKey": key[1], "level": "kept"})
+            self._last_written.pop(key, None)
+            return
+        try:
+            self.io.write_output(port, False if vtype == "bool" else 0.0)
+            self.io.release_output(port)
+        except Exception as e:  # noqa: BLE001
+            logger.error("release %s.%s failed: %s", key[0], key[1], e)
+            return
+        if still_ours:
+            logger.info("output %s.%s moved to another port: the old one is switched off and released", key[0], key[1])
+            return
+        self._last_written.pop(key, None)
+        logger.info("output %s.%s left the program: switched off and released", key[0], key[1])
+        self.sink.event("output_released", {"assetId": key[0], "sourceKey": key[1], "level": "off"})
 
     # Cloud reporting policy (R-27 vs. cost): a card's snapshot goes to the
     # cloud when something worth showing changed — a bool / text / choice

@@ -47,6 +47,17 @@ class PortRef:
         return (str(chip), int(line)) if chip and line is not None else None
 
 
+# Facts about how a line is wired or read, not about which line it is.
+_WIRING_FACTS = frozenset({"direction", "activeLow", "pull", "debounceMs", "sampleMs", "measure", "transform",
+                           "frequencyHz", "dutyCyclePct", "polarity", "unit"})
+
+
+def port_identity(transport: dict) -> tuple:
+    """Which physical port a transport names — the same for a port's stamp in a compiled bundle
+    and in a testPort command, whatever its direction or wiring facts (active low, pull, scale)."""
+    return tuple(sorted((k, str(v)) for k, v in (transport or {}).items() if k not in _WIRING_FACTS))
+
+
 class IOAdapter:
     def has_port(self, port: PortRef) -> bool:
         return True
@@ -60,6 +71,9 @@ class IOAdapter:
     def set_change_listener(self, fn: Callable[[], None]) -> None:
         """Optional: called when an input may have changed (fast path)."""
 
+    def release_output(self, port: PortRef) -> None:
+        """Let go of an output the program no longer drives (after it was written to its safe state)."""
+
     def close(self) -> None:
         pass
 
@@ -71,6 +85,7 @@ class SimulatedIO(IOAdapter):
         self._inputs: dict[tuple[str, str], Any] = {}
         self.outputs: dict[tuple[str, str], Any] = {}
         self.writes: list[tuple[str, str, Any]] = []
+        self.released: list[tuple[str, str, dict]] = []
         self._allowed = allowed_gpios
         self._listener: Optional[Callable[[], None]] = None
 
@@ -93,6 +108,9 @@ class SimulatedIO(IOAdapter):
 
     def output(self, asset_id: str, source_key: str, default=None) -> Any:
         return self.outputs.get((asset_id, source_key), default)
+
+    def release_output(self, port: PortRef) -> None:
+        self.released.append((port.asset_id, port.source_key, dict(port.transport)))
 
     def set_change_listener(self, fn: Callable[[], None]) -> None:
         self._listener = fn
@@ -183,6 +201,14 @@ class HardwareIO(IOAdapter):
             v = bool(v)
             return (not v) if port.transport.get("activeLow") else v
         return None
+
+    def release_output(self, port: PortRef) -> None:
+        if port.kind == "gpio" and port.line is not None and self._lines is not None:
+            self._lines.release(port.line[0], port.line[1])
+        elif port.kind == "pwm" and port.gpio is not None:
+            from ..handlers import pwm_handler  # noqa: PLC0415
+            pwm_handler.release(port.gpio)
+        # A Broadcom-numbered line stays set up as an output, at the level just written.
 
     def write_output(self, port: PortRef, value: Any) -> None:
         if port.kind == "pwm" and port.gpio is not None:

@@ -1,5 +1,49 @@
 # Changelog — agal-one-agent
 
+## 0.3.3 (unreleased)
+
+A new version rather than more of 0.3.2: 0.3.2 (cb03e4b) is already on `main` as its own
+build, and the OTA path tells builds apart by their version string. Neither is tagged;
+`/config/agent` still pins 0.3.1.
+
+**Fix — a program reload switched every running output off.** The cloud recompiles the whole
+node program on every block, card or link write and the node reloads it. `compile` rebuilt
+every variable at its default while the output flush compared against what it had last
+written, so the first pass after any reload during a plot run turned the pump and its valves
+OFF; a running schedule also lost its end time and never ended (wave 0, G1 —
+`scratchpad/understand/reload_sim.py`). A program loaded while another one runs now takes
+over from it:
+
+- **outputs keep their level**: a port variable is carried by its port's stable key (assetId +
+  sourceKey + direction), whatever else its declaration says. Nothing is written for an output
+  that did not change — an identical bundle reload writes nothing at all;
+- **variables** whose declaration is unchanged keep their value and their `since()`; a changed
+  one starts at its new default. NAB variables are matched by name;
+- **rules**: an unchanged rule keeps its hold, fired, ignore-window, limit and sequence state;
+  a new or changed rule starts afresh, as at load, and only that rule. Baselines being learnt
+  go on learning;
+- **runs and schedules** carry on: a running schedule ends at its planned time, a timed plot
+  run at its own; a plot taken out of the program while it runs ends its run and closes its
+  valves (pump first); a schedule taken out leaves its plot run to end when it would have;
+- **only an output the new program no longer has is let go of**, on the next pass, in the R-7
+  order (motors before valves), to its asset's safe state: `off` (the default) switches it off
+  and frees the line; `last_state` leaves it as it is. An output re-stamped onto another line
+  carries its level there and the old line is switched off and freed; a changed wiring fact
+  (active low) rewrites the line once. Each release is an `output_released` event. A clean stop
+  lets go of a release no pass has applied yet;
+- the swap holds the runtime lock, which a pass holds from start to end, so it always lands
+  between two passes. A program loaded **cold** — the first one, or after `stop()` (the bench's
+  outage button) — still starts from its defaults and the persisted state, as after a restart;
+  the persisted state is read only then, so a reload no longer re-announces a resumed run.
+
+`IOAdapter.release_output` is new (LineIO frees the line, a PWM channel is stopped, a
+Broadcom-numbered line stays an output at the level just written). 16 new tests in
+`tests/test_blocks_reload.py`, the reload simulation among them; each fails on 0.3.2 except the
+cold-load guard.
+
+Tests read the contracts from `AGAL_CONTRACTS_DIR` when it is set (a worktree or a lone clone
+of the agent); the default stays `../../../contracts`.
+
 ## 0.3.2 (unreleased)
 
 **Fix — an active-low output was switched ON for a moment whenever its line was opened.**
