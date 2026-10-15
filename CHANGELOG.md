@@ -15,8 +15,9 @@ a minute after it was queued. Now (`command_acks.py`):
 
 - every ack, from every call site (`command_executor.py`, `main.py`, `ports/links.py`), still
   goes through `AgalOneMqttClient.publish_command_ack`, which hands it to its **ack sink** — a
-  `CommandAcks`, set in `main.py` — whether MQTT is connected or not, and still publishes it on
-  the status topic when connected (harmless; a future broker consumer may use it);
+  `CommandAcks`, given to it by `wire_command_acks` in `main.py` — whether MQTT is connected or
+  not, and still publishes it on the status topic when connected (harmless; a future broker
+  consumer may use it);
 - `CommandAcks` posts from its own thread through `report_command_ack` (`{type: "commandAck",
   payload: {nodeUid, commandId, status, appliedValue?, error?}}`, with the node's
   `Authorization: Bearer`). A command is carried out, and the MQTT loop goes on, while its ack
@@ -24,38 +25,54 @@ a minute after it was queued. Now (`command_acks.py`):
 - **what is posted** — the ingress allows 1000 requests per node per hour, shared with
   heartbeats, telemetry, card variables and alerts, so a command costs at most two posts: the
   final `completed` / `failed` always; `acknowledged` after a 0.5 s hold, unless a later ack of
-  the command is queued by then. A switch that completes at once costs one post; a slow command
-  (a port-test pulse, a bus scan) two, and its `acknowledged` keeps it from timing out while it
-  runs (the sweep only times out `queued` / `sent`). `executing` after an `acknowledged` tells
-  the backend nothing new and stays on MQTT; without one (the receipt ack of an OTA update) it
-  is posted;
-- **in order per command**: an ack waits while an earlier ack of its command is queued, and an
-  intermediate ack with a later one queued behind it is not posted. Commands do not wait on each
-  other's retries;
+  the command is queued by then. A switch that completes at once costs one post; a command that
+  takes longer two, and its `acknowledged` tells the backend the node has it (`acknowledgedAt`)
+  — it does not keep the command from timing out: the backend's sweep ends `acknowledged` /
+  `executing` 60 s after the command was created too, and a final ack after that still lands.
+  `executing` after an `acknowledged` tells the backend nothing new and stays on MQTT; without
+  one it is posted;
+- **only acks the backend can use**: ids it keeps no command document for stay on MQTT —
+  `boot_<assetId>` (boot reconciliation, as before) and the node-level pokes it mints with a
+  prefix, `sync_…` (pin config, program, port table), `scan_bus_…` and `test_port_…` (their
+  results come back as `port_test` / `bus_scan` / `programAck`; the backend answers their acks
+  "untracked"). A port test or a bus scan cost two posts for nothing. The OTA `firmwareUpdate`
+  receipt and its failure stay on MQTT too (`publish_command_ack(..., ingress=False)`,
+  `main.handle_firmware_update`): the outcome comes back as `firmware_update` events, and the id
+  names a `/nodeCommands` doc, which commandAck does not track (each post cost the backend three
+  reads and a second's wait for a doc that is never there);
+- **in order**: an ack waits while an earlier ack of its command is queued, and an intermediate
+  ack with a later one queued behind it is not posted. Final acks also keep their order across
+  commands: when one is to be tried again (not reached, 408, 429, 5xx) every ack waits out its
+  back-off. Before, only "not reached" and 429 paused the queue, so with two quick switches (ON,
+  then OFF) an ON `completed` that met one 503 was posted after the OFF `completed`, and the
+  backend echoed "off" then "on" — the card showing ON with the relay off (reproduced with the
+  real `CommandAcks` and a fake ingress answering 500 once; now ON, ON, OFF). An intermediate
+  ack tried again waits alone;
 - **retries**: when the ingress is not reached or answers 408, 429 or 5xx, a final ack stays
   queued and is retried with back-off (1 s doubling to 30 s; 60 s after a 429) for 5 minutes,
   then given up with an error in the log (the command stays `timeout`); an intermediate ack
-  gets 3 tries. While the ingress is unreachable or rate-limited every ack waits out the
-  back-off. Any other 4xx is never going to be accepted and is not retried. On a clean stop each
-  waiting ack gets one more try, for 3 s at most;
+  gets 3 tries. Any other 4xx is never going to be accepted and is not retried (the ingress
+  answers a commandAck without the node's verified token 401). On a clean stop each waiting ack
+  gets one more try, for 3 s at most;
 - **bounded**: an `acknowledged` / `executing` that arrives while 32 acks wait is not queued; a
   final ack always is, up to 256 — there the oldest waiting intermediate ack makes room, and only
-  when every waiting ack is final is the oldest given up, logged;
-- **boot reconciliation** acks (`boot_<assetId>`) stay on MQTT, as before: they have no command
-  document, the backend ignores them, and posting the whole boot state would spend the budget
-  for nothing.
+  when every waiting ack is final is the oldest given up, logged.
 
 `report_command_ack` now returns the HTTP status (None when the ingress was not reached), so a
-refusal is told from an outage. 20 tests in `tests/test_command_acks.py`, with a fake reporter
-and no network. `main()` was also driven with a fake broker and a fake ingress: a `setPower`
-posted one `commandAck` `completed` with `appliedValue` 1 and the node's token, with MQTT up
-and with MQTT down, and the MQTT callback returned in under 5 ms.
+refusal is told from an outage. 37 tests in `tests/test_command_acks.py`, with a fake reporter
+and no network — including that `main()` calls `wire_command_acks` (the missing call was the
+bug) and that a wired client's ack reaches `HttpReporter`'s post. `main()` was also driven with
+a fake broker and a fake ingress: a `setPower` posted one `commandAck` `completed` with
+`appliedValue` 1 and the node's token, with MQTT up and with MQTT down, and the MQTT callback
+returned in under 5 ms.
 
-**What this does not cover — the backend half.** `handleCommandAck` updates whichever
-`/assetCommands` doc the `commandId` names and echoes its value onto that doc's asset without
-checking that the posting node is the command's node, and `TELEMETRY_AUTH_ENFORCE` is still
-false (`verifyNodeAuth` checks a token only when one is presented). The agent always presents
-its token; the node check belongs in the backend.
+**The backend half** (agal-one, branch `fix/2026-10-command-acks`, not deployed): the ingress
+takes a `commandAck` only with the node's verified token and only from the command's own node,
+keeps final statuses final (a completion after the backend's own `timeout`, or after a `failed`
+it wrote itself on a publish error, still lands), and echoes a completed command's value onto
+the card only when no newer command for the same card and port exists. A backend without that
+change (agal-one `60c3dfd` and earlier) takes an agent 0.3.3 ack too, without those guards, so
+the backend goes out before, or with, this agent.
 
 **Fix — a program reload switched every running output off.** The cloud recompiles the whole
 node program on every block, card or link write and the node reloads it. `compile` rebuilt

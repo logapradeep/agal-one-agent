@@ -4,44 +4,55 @@ The backend learns what became of a command (``/assetCommands/{commandId}.status
 ``telemetryIngress`` over HTTPS (``case "commandAck"`` → ``handleCommandAck``). Nothing consumes
 the MQTT status topic — Cloud Functions cannot subscribe (``blocks/cloud.py``) — so while acks
 went out on MQTT only, every command ended ``timeout`` (``checkCommandTimeouts`` times out a
-command still ``queued`` / ``sent`` 60 s after it was created) although the node had switched.
+command still in flight 60 s after it was created) although the node had switched.
 
 Every call site keeps calling ``AgalOneMqttClient.publish_command_ack``; main.py gives the MQTT
-client a ``CommandAcks`` as its ack sink, and each ack goes to the status topic (when MQTT is
-connected — harmless, a future broker consumer may use it) AND into this queue, whether MQTT is
-connected or not. A worker thread posts the queue through ``HttpReporter.report_command_ack``
-(``{type: "commandAck", payload: {nodeUid, commandId, status, appliedValue?, error?}}`` with
-the node's ``Authorization`` header). Submitting never waits on the network: a command is
-carried out, and the MQTT loop goes on, while the ack is still on its way.
+client a ``CommandAcks`` as its ack sink (``wire_command_acks``), and each ack goes to the status
+topic (when MQTT is connected — harmless, a future broker consumer may use it) AND into this
+queue, whether MQTT is connected or not. A worker thread posts the queue through
+``HttpReporter.report_command_ack`` (``{type: "commandAck", payload: {nodeUid, commandId,
+status, appliedValue?, error?}}`` with the node's ``Authorization`` header — the ingress takes a
+commandAck only with the node's verified token). Submitting never waits on the network: a
+command is carried out, and the MQTT loop goes on, while the ack is still on its way.
 
 What is posted. The ingress allows 1000 requests per node per hour, shared with heartbeats,
 telemetry, card variables and alerts, so a command costs at most two posts, and a switch one:
 
 - ``completed`` / ``failed`` (the final ack) — always posted, never dropped to make room, and
   retried while the ingress cannot be reached for ``FINAL_DEADLINE_S`` (5 minutes); then it is
-  given up with an error in the log (the command stays ``timeout`` on the backend);
+  given up with an error in the log. A final ack the backend gets after its sweep still lands
+  (the command did run), so a late one is worth sending;
 - ``acknowledged`` — held ``COALESCE_S`` (0.5 s) first, and not posted when a later ack of the
-  same command is queued by then: a switch that completes at once costs one post. A slow
-  command (a port-test pulse, a bus scan) has its ``acknowledged`` posted after the hold: it is
-  what keeps the command from timing out while it runs (the sweep only times out ``queued`` /
-  ``sent``). Tried ``INTERMEDIATE_TRIES`` times;
+  same command is queued by then: a switch that completes at once costs one post. A command
+  that takes longer has its ``acknowledged`` posted after the hold: the backend records that the
+  node has it (``acknowledgedAt``). It does not keep the command from timing out — the sweep
+  ends ``acknowledged`` / ``executing`` 60 s after the command was created as well. Tried
+  ``INTERMEDIATE_TRIES`` times;
 - ``executing`` — after an ``acknowledged`` of the same command it tells the backend nothing
-  new (the final ack follows), so it stays on MQTT. Without one (the receipt ack of an OTA
-  update) it is posted like ``acknowledged``;
-- a **boot-reconcile** ack (``commandId`` ``boot_<assetId>``, minted by ``boot_reconciler``) stays
-  on MQTT, as before: there is no command document for it and the backend ignores it, and the
-  boot state lists every card of the node, which would spend the budget for nothing.
+  new (the final ack follows), so it stays on MQTT; without one it is posted like
+  ``acknowledged``;
+- ids the backend keeps no command document for stay on MQTT (``UNTRACKED_PREFIXES``): a
+  **boot-reconcile** ack (``boot_<assetId>``, minted by ``boot_reconciler``) and the node-level
+  pokes the backend mints with a prefix (``sync_…``, ``scan_bus_…``, ``test_port_…``) — the
+  backend answers them "untracked" and records nothing (a port test's and a bus scan's results
+  come back as ``port_test`` / ``bus_scan``, a sync's as ``programAck``), so posting them would
+  spend the budget for nothing. The OTA ``firmwareUpdate`` acks stay on MQTT at their call site
+  (``publish_command_ack(..., ingress=False)``): the outcome comes back as ``firmware_update``
+  events, and its id names a ``/nodeCommands`` doc, which commandAck does not track.
 
 Order and bounds. Acks of one command are posted in the order they were made; an ack waits
-while an earlier ack of its command is queued. Different commands do not wait on each other's
-retries. An ``acknowledged`` / ``executing`` that arrives while ``MAX_WAITING`` acks are already
+while an earlier ack of its command is queued. Final acks also keep their order ACROSS commands:
+when a final ack is not delivered and is to be tried again (the ingress not reached, 408, 429,
+5xx), every ack waits out its back-off, so a switch ON whose ``completed`` met a 503 is never
+overtaken by the ``completed`` of the OFF that followed it (the card would end up showing ON
+with the relay off; the backend also refuses to echo an older command's value over a newer
+one). An ``acknowledged`` / ``executing`` that arrives while ``MAX_WAITING`` acks are already
 waiting (the ingress is not keeping up) is not queued; the final ack always is, up to
 ``HARD_CAP``. There the oldest waiting intermediate ack makes room, and only when every waiting
 ack is final is the oldest one given up, with an error in the log — memory stays bounded
-whatever happens. When the ingress cannot be reached or answers 429, every ack waits out the
-back-off (the ingress, not one ack, is the problem); a 4xx other than 408 / 429 is never going
-to be accepted and is not retried. On a clean stop each waiting ack gets one more try, holds
-and back-offs skipped, for a few seconds.
+whatever happens. A 4xx other than 408 / 429 is never going to be accepted and is not retried.
+On a clean stop each waiting ack gets one more try, holds and back-offs skipped, for a few
+seconds.
 """
 
 from __future__ import annotations
@@ -58,6 +69,11 @@ logger = logging.getLogger(__name__)
 
 FINAL_STATUSES = frozenset({"completed", "failed"})
 BOOT_RECONCILE_PREFIX = "boot_"
+# Command ids the backend keeps no /assetCommands doc for: its commandAck answers them "untracked"
+# and records nothing (agal-one backend/functions/src/modules/mqtt/commandAck.ts, TRACKED_COMMAND_ID:
+# only 20-character auto-ids are tracked). boot_ is minted here (boot_reconciler); sync_ (sync_<ts>,
+# sync_program_…, sync_ports_…), scan_bus_ and test_port_ by the backend. Keep the two lists together.
+UNTRACKED_PREFIXES = (BOOT_RECONCILE_PREFIX, "sync_", "scan_bus_", "test_port_")
 MAX_ERROR_CHARS = 500  # the words of a failed ack, as programAck's reason
 
 
@@ -129,8 +145,8 @@ class CommandAcks:
 
     def submit(self, command_id: str, status: str, applied_value: Any = None, error: Optional[str] = None) -> None:
         """Queue one ack for the ingress. Never blocks on the network."""
-        if not command_id or str(command_id).startswith(BOOT_RECONCILE_PREFIX):
-            return
+        if not command_id or str(command_id).startswith(UNTRACKED_PREFIXES):
+            return  # no command doc on the backend: MQTT only (module docstring)
         command_id = str(command_id)
         with self._cond:
             if self._closed:
@@ -304,7 +320,10 @@ class CommandAcks:
         ack.due = now + backoff
         if ack.final:
             ack.due = min(ack.due, ack.queued_at + self.final_deadline_s)  # the last try lands on the deadline
-        if status is None or status == 429:
+        if status is None or status == 429 or ack.final:
+            # The ingress unreachable or rate-limited: every ack waits (the ingress, not this ack,
+            # is the problem). A final ack to be tried again: every ack waits too, so no later
+            # command's final ack overtakes it (an older ON landing after a newer OFF).
             self._paused_until = max(self._paused_until, ack.due)
         logger.info("command ack %s %s: %s; trying again in %.0f s", ack.command_id, ack.status, ack.last,
                     max(0.0, ack.due - now))
@@ -317,3 +336,14 @@ class CommandAcks:
         else:
             self.dropped += 1
             logger.info("command ack %s %s dropped: %s", ack.command_id, ack.status, why)
+
+
+def wire_command_acks(mqtt_client, reporter, *, offline: bool) -> Optional[CommandAcks]:
+    """Give the MQTT client its ack sink: every ``publish_command_ack`` is also posted to the
+    ingress (main.py calls this; leaving it out is how every command came to end ``timeout``).
+    Offline (no cloud) nothing is wired and None is returned."""
+    if offline:
+        return None
+    acks = CommandAcks(reporter)
+    mqtt_client.set_ack_sink(acks.submit)
+    return acks

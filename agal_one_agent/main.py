@@ -17,7 +17,7 @@ from .telemetry_uploader import TelemetryUploader
 from .live_cadence import LiveCadenceController
 from .heartbeat import HeartbeatPublisher
 from .http_reporter import HttpReporter
-from .command_acks import CommandAcks
+from .command_acks import wire_command_acks
 from . import boot_reconciler
 from .sentry_setup import init_sentry
 from .sensors import (
@@ -32,6 +32,26 @@ logger = logging.getLogger("agal_one_agent")
 
 # How long boot reconciliation waits for the answer to the hardware report (see _boot_wait).
 BOOT_WAIT_FOR_PORT_TABLE_S = 30.0
+
+
+def handle_firmware_update(command: dict, mqtt_client, node_uid: str) -> None:
+    """A managed OTA update (health-gated rollback). Receipt ack only — the real outcome is
+    reported asynchronously via firmware_update_* events (started on install, then succeeded
+    once the new version clears probation, or rolled_back by the verify-timer). Its acks stay on
+    MQTT (``ingress=False``): the command is a /nodeCommands doc, which the ingress's commandAck
+    does not track, so a post would only cost the backend a lookup of a doc that is not there."""
+    from .ota_updater import perform_update
+    command_id = command.get("commandId", "")
+    version = command.get("version", "")
+    rollout_id = command.get("rolloutId", "")
+    mqtt_client.publish_command_ack(command_id, "executing", ingress=False)
+    try:
+        msg = perform_update(version, command_id=command_id,
+                             rollout_id=rollout_id, node_uid=node_uid)
+        logger.info("OTA: %s", msg)
+    except Exception as e:  # noqa: BLE001
+        logger.error("OTA: perform_update failed: %s", e)
+        mqtt_client.publish_command_ack(command_id, "failed", error=str(e), ingress=False)
 
 
 def main():
@@ -93,12 +113,10 @@ def main():
 
     # Command acks: the backend reads them only from telemetryIngress over HTTPS (nothing
     # consumes the MQTT status topic), so every publish_command_ack — from every call site — is
-    # also queued here and posted from the ack worker, in order per command, never blocking the
-    # command or the MQTT loop (command_acks.py has what is posted and why).
-    command_acks = None
-    if not args.offline:
-        command_acks = CommandAcks(http_reporter)
-        mqtt_client.set_ack_sink(command_acks.submit)
+    # also queued here and posted from the ack worker, in order, never blocking the command or
+    # the MQTT loop (command_acks.py has what is posted and why). tests/test_command_acks.py
+    # checks that main() makes this call.
+    command_acks = wire_command_acks(mqtt_client, http_reporter, offline=args.offline)
 
     # ---- Node linking (ADR-024): one GPIO path for every Linux board, and the
     # report of what this board is and has. Nothing here names a board.
@@ -368,20 +386,7 @@ def main():
 
         # OTA firmware update (managed, with health-gated rollback)
         if cmd_type == "firmwareUpdate":
-            from .ota_updater import perform_update
-            version = command.get("version", "")
-            rollout_id = command.get("rolloutId", "")
-            # Receipt ack only — the real outcome is reported asynchronously via
-            # firmware_update_* events (started on install, then succeeded once
-            # the new version clears probation, or rolled_back by the verify-timer).
-            mqtt_client.publish_command_ack(command_id, "executing")
-            try:
-                msg = perform_update(version, command_id=command_id,
-                                     rollout_id=rollout_id, node_uid=config.node.uid)
-                logger.info("OTA: %s", msg)
-            except Exception as e:  # noqa: BLE001
-                logger.error("OTA: perform_update failed: %s", e)
-                mqtt_client.publish_command_ack(command_id, "failed", error=str(e))
+            handle_firmware_update(command, mqtt_client, config.node.uid)
             return
 
         # Adaptive live cadence (ADR-013 §9-D3): the backend forwards a

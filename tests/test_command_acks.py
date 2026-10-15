@@ -21,7 +21,8 @@ import pytest
 import yaml
 
 from agal_one_agent import command_executor
-from agal_one_agent.command_acks import CommandAcks
+from agal_one_agent import main as agent_main
+from agal_one_agent.command_acks import CommandAcks, wire_command_acks
 from agal_one_agent.config import AgentConfig, MqttConfig
 from agal_one_agent.http_reporter import HttpReporter
 from agal_one_agent.mqtt_client import AgalOneMqttClient
@@ -220,9 +221,9 @@ def test_a_switch_that_completes_at_once_costs_one_post_and_a_slow_command_two()
     assert acks.wait_idle(5)
     assert reporter.posted() == [("fast", "completed")]
 
-    acks.submit("slow", "acknowledged")  # a port-test pulse: the final ack comes seconds later
+    acks.submit("slow", "acknowledged")  # a command whose final ack comes seconds later
     time.sleep(0.6)
-    assert reporter.posted()[-1] == ("slow", "acknowledged"), "the hold ended: acknowledged keeps it from timing out"
+    assert reporter.posted()[-1] == ("slow", "acknowledged"), "the hold ended: the backend learns the node has it"
     acks.submit("slow", "completed")
     assert acks.wait_idle(5)
     assert reporter.posted() == [("fast", "completed"), ("slow", "acknowledged"), ("slow", "completed")]
@@ -231,25 +232,62 @@ def test_a_switch_that_completes_at_once_costs_one_post_and_a_slow_command_two()
 def test_executing_is_posted_only_when_no_acknowledged_came_before():
     reporter = FakeReporter()
     acks = CommandAcks(reporter, **FAST)
-    acks.submit("ota-1", "executing")  # the OTA receipt ack: the only ack its command gets on success
+    acks.submit("c0", "executing")  # no acknowledged before it: it is the first the backend hears
     acks.submit("c1", "acknowledged")
     assert acks.wait_idle(5)
     acks.submit("c1", "executing")
     acks.submit("c1", "completed")
     assert acks.wait_idle(5)
-    assert reporter.posted() == [("ota-1", "executing"), ("c1", "acknowledged"), ("c1", "completed")]
+    assert reporter.posted() == [("c0", "executing"), ("c1", "acknowledged"), ("c1", "completed")]
 
 
-def test_boot_reconcile_acks_stay_on_mqtt():
+@pytest.mark.parametrize("command_id", [
+    "boot_pump-1",                    # boot_reconciler: the node's own boot state
+    "sync_1760000000000",             # publishPinConfigSync
+    "sync_program_3_1760000000000",   # a program pull poke (its result: programAck)
+    "sync_ports_2_1760000000000",     # a port table poke
+    "scan_bus_i2c-1_1760000000000",   # scanBus (its result: bus_scan)
+    "test_port_DIO1_1760000000000",   # testPort (its result: port_test)
+])
+def test_acks_the_backend_keeps_no_command_doc_for_stay_on_mqtt(command_id):
+    # The backend answers these ids "untracked" and records nothing: a post would only spend
+    # the node's ingress budget (a port test or a bus scan cost two posts for nothing).
     reporter = FakeReporter()
     acks = CommandAcks(reporter, **FAST)
     mqtt = _mqtt()
     mqtt.set_ack_sink(acks.submit)
     for status in ("acknowledged", "executing", "completed"):
-        mqtt.publish_command_ack("boot_pump-1", status)
+        mqtt.publish_command_ack(command_id, status)
     assert acks.wait_idle(5)
     assert reporter.tries == []
     assert [s for _, s in _mqtt_acks(mqtt)] == ["acknowledged", "executing", "completed"]
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["ota-ok", "ota-failed"])
+def test_the_ota_receipt_and_its_failure_stay_on_mqtt(monkeypatch, fails):
+    # A firmwareUpdate is a /nodeCommands doc: commandAck does not track it, and its outcome
+    # comes back as firmware_update events. Posting its acks cost the backend a lookup and a
+    # second's wait for a doc that is never there.
+    from agal_one_agent import ota_updater
+
+    def perform_update(version, command_id="", rollout_id="", node_uid=""):
+        if fails:
+            raise RuntimeError("pip install failed")
+        return f"installing {version}"
+
+    monkeypatch.setattr(ota_updater, "perform_update", perform_update)
+    reporter = FakeReporter()
+    acks = CommandAcks(reporter, **FAST)
+    mqtt = _mqtt()
+    mqtt.set_ack_sink(acks.submit)
+
+    agent_main.handle_firmware_update({"commandId": "Xq3k9TzLmN2pRs7VbW1c", "type": "firmwareUpdate",
+                                       "version": "v0.3.3"}, mqtt, "node-1")
+
+    assert acks.wait_idle(5)
+    assert reporter.tries == []
+    assert _mqtt_acks(mqtt) == [("Xq3k9TzLmN2pRs7VbW1c", "executing")] + \
+        ([("Xq3k9TzLmN2pRs7VbW1c", "failed")] if fails else [])
 
 
 # ------------------------------------------------------- never block the node
@@ -290,6 +328,53 @@ def test_a_final_ack_is_retried_until_the_ingress_answers():
     assert [s for _, s, _ in reporter.tries] == ["completed"] * 5
     assert reporter.posts == [("cmd-1", "completed", 1, None)]
     assert acks.given_up == 0
+
+
+@pytest.mark.parametrize("first_answer", [None, 408, 429, 500, 503])
+def test_final_acks_keep_their_order_across_commands_when_one_is_tried_again(first_answer):
+    # The user switches the pump ON (A), then OFF (B); the node does both. A's completed meets a
+    # transient failure. B's completed must not be posted before A's retry: the backend would echo
+    # "off" and then "on" — the card showing ON with the relay off.
+    a_failing = threading.Event()
+    b_queued = threading.Event()
+
+    def answer(command_id, status, n):
+        if (command_id, n) == ("A", 1):
+            a_failing.set()
+            assert b_queued.wait(5)
+            return first_answer
+        return 200
+
+    reporter = FakeReporter(answer=answer)
+    acks = CommandAcks(reporter, coalesce_s=0.0, backoff_s=(0.05,), rate_limited_s=0.05, final_deadline_s=5.0)
+    acks.submit("A", "completed", applied_value=1)
+    assert a_failing.wait(5)
+    acks.submit("B", "completed", applied_value=0)
+    b_queued.set()
+
+    assert acks.wait_idle(5)
+    assert [(c, s) for c, s, _ in reporter.tries] == [("A", "completed"), ("A", "completed"), ("B", "completed")]
+    assert [(c, v) for c, _, v, _ in reporter.posts] == [("A", 1), ("B", 0)]
+
+
+def test_an_intermediate_ack_tried_again_does_not_hold_another_commands_final_ack():
+    # Only final acks keep their order across commands; a retried acknowledged waits alone.
+    def answer(command_id, status, n):
+        return 503 if (command_id, status) == ("A", "acknowledged") else 200
+
+    reporter = FakeReporter(answer=answer)
+    acks = CommandAcks(reporter, coalesce_s=0.0, backoff_s=(0.3,), final_deadline_s=5.0)
+    acks.submit("A", "acknowledged")
+    deadline = time.monotonic() + 5
+    while not reporter.tries and time.monotonic() < deadline:
+        time.sleep(0.005)
+    time.sleep(0.02)  # A acknowledged is waiting out its 0.3 s back-off
+    started = time.monotonic()
+    acks.submit("B", "completed", applied_value=1)
+    while ("B", "completed") not in reporter.posted() and time.monotonic() - started < 5:
+        time.sleep(0.005)
+    assert time.monotonic() - started < 0.2, "B's final ack waited on A's intermediate retry"
+    assert acks.wait_idle(5)
 
 
 def test_a_reporter_that_raises_is_a_failed_try_not_the_end_of_the_worker():
@@ -440,3 +525,59 @@ def test_report_command_ack_tells_a_refusal_from_an_unreachable_ingress(monkeypa
 
     monkeypatch.setattr("urllib.request.urlopen", offline)
     assert rep.report_command_ack("cmd-1", "failed", error="x") is None
+
+
+# ------------------------------------------------------------- the wiring in main()
+# The bug was wiring: report_command_ack existed and nothing called it. These fail if main()
+# stops giving the MQTT client its ack sink.
+
+def _node_config(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.dump({"node": {"uid": "node-1", "name": "Bench", "auth_token": "tok"},
+                               "mqtt": {"broker": "broker.example"},
+                               "telemetry": {"ingress_url": "https://ingress.example/telemetryIngress"}}))
+    return str(path)
+
+
+class _WiredHere(Exception):
+    pass
+
+
+@pytest.mark.parametrize("offline", [False, True], ids=["cloud", "offline"])
+def test_main_wires_the_command_acks(tmp_path, monkeypatch, offline):
+    seen = {}
+
+    def wire(mqtt_client, reporter, *, offline):
+        seen.update(mqtt=mqtt_client, reporter=reporter, offline=offline)
+        raise _WiredHere  # stop main() here: nothing further is under test
+
+    monkeypatch.delenv("SENTRY_DSN", raising=False)
+    monkeypatch.setattr(agent_main, "wire_command_acks", wire)
+    monkeypatch.setattr("sys.argv", ["agal-one-agent", "--config", _node_config(tmp_path)]
+                        + (["--offline"] if offline else []))
+    with pytest.raises(_WiredHere):
+        agent_main.main()
+    assert isinstance(seen["mqtt"], AgalOneMqttClient)
+    assert isinstance(seen["reporter"], HttpReporter) and seen["reporter"].node_uid == "node-1"
+    assert seen["offline"] is offline
+
+
+def test_a_wired_mqtt_client_posts_its_acks_through_the_http_reporter(monkeypatch):
+    posted = []
+    rep = HttpReporter("node-1", auth_token="tok", base_url="https://ingress.example/telemetryIngress")
+    monkeypatch.setattr(rep, "_post_status", lambda data: posted.append(data) or 200)
+    mqtt = _mqtt(connected=False)  # MQTT down: the HTTPS leg does not depend on it
+
+    acks = wire_command_acks(mqtt, rep, offline=False)
+    mqtt.publish_command_ack("Xq3k9TzLmN2pRs7VbW1c", "completed", applied_value=1)
+
+    assert acks is not None and acks.wait_idle(5)
+    assert posted == [{"type": "commandAck", "payload": {"nodeUid": "node-1", "commandId": "Xq3k9TzLmN2pRs7VbW1c",
+                                                         "status": "completed", "appliedValue": 1}}]
+    acks.close()
+
+
+def test_offline_wires_no_ack_sink():
+    mqtt = _mqtt()
+    assert wire_command_acks(mqtt, MagicMock(), offline=True) is None
+    assert mqtt._ack_sink is None

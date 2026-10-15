@@ -300,11 +300,15 @@ class AgalOneMqttClient:
         status: str,
         applied_value: Optional[object] = None,
         error: Optional[str] = None,
+        *,
+        ingress: bool = True,
     ) -> None:
         """The one call for a command ack, from every site. It goes to the ack sink (the HTTPS
         leg the backend reads — whether MQTT is connected or not) and, when connected, to the
-        status topic (no consumer today; harmless, a future broker consumer may use it)."""
-        if self._ack_sink is not None:
+        status topic (no consumer today; harmless, a future broker consumer may use it).
+        ``ingress=False`` keeps it on MQTT only: an ack the backend has no use for (the OTA
+        receipt, whose outcome comes back as firmware_update events)."""
+        if ingress and self._ack_sink is not None:
             try:
                 self._ack_sink(command_id, status, applied_value, error)
             except Exception as e:  # noqa: BLE001 — an ack sink failure never fails the command
