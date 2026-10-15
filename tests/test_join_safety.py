@@ -545,15 +545,16 @@ def _boot(monkeypatch, tmp_path, ingress, connect):
     monkeypatch.setattr(agent_main.signal, "signal", lambda *a, **kw: None)
     monkeypatch.setattr(AgalOneMqttClient, "connect", connect)
     monkeypatch.setattr("sys.argv", ["agal-one-agent", "--config", _node_config_file(tmp_path)])
+    before = set(threading.enumerate())
     t0 = time.monotonic()
     ingress.t0 = t0
     try:
         with pytest.raises(_Stop):
             agent_main.main()
     finally:
-        # The background requests main started (the hardware report, boot reconciliation) end while
-        # the fake is still in place: none of them may reach a real host after the test.
-        for t in threading.enumerate():
+        # The background requests THIS start made (the hardware report, boot reconciliation) end
+        # while the fake is still in place: none of them may reach a real host after the test.
+        for t in set(threading.enumerate()) - before:
             if t.name in ("hardware-report", "boot-reconcile"):
                 t.join(timeout=35)
                 assert not t.is_alive(), f"{t.name} still running"
