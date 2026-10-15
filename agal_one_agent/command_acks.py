@@ -53,6 +53,13 @@ ack is final is the oldest one given up, with an error in the log — memory sta
 whatever happens. A 4xx other than 408 / 429 is never going to be accepted and is not retried.
 On a clean stop each waiting ack gets one more try, holds and back-offs skipped, for a few
 seconds.
+
+Refusals (agent 0.3.4, contracts v1.14.2). A message the node refused before carrying anything
+out — unsigned, forged, replayed, stale (command_signing.py) — is answered through this same
+queue as a final ``failed`` ack with ``reason`` (enums.yaml#CommandRefusalReason) and ``error``
+"refused: <reason> — …", for a tracked id only and at most 20 in 10 minutes (the gate decides
+both). The backend lets ``unsigned`` / ``replayed`` move nothing and lets the node's own answer
+for the command win over a ``bad_signature`` / ``stale`` one.
 """
 
 from __future__ import annotations
@@ -85,6 +92,7 @@ class _Ack:
     error: Optional[str]
     queued_at: float
     due: float
+    reason: Optional[str] = None  # a refusal's CommandRefusalReason (only with failed)
     tries: int = 0
     last: str = ""  # what the last try met, for the give-up log
 
@@ -143,8 +151,10 @@ class CommandAcks:
 
     # ------------------------------------------------------------------ submit
 
-    def submit(self, command_id: str, status: str, applied_value: Any = None, error: Optional[str] = None) -> None:
-        """Queue one ack for the ingress. Never blocks on the network."""
+    def submit(self, command_id: str, status: str, applied_value: Any = None, error: Optional[str] = None,
+               reason: Optional[str] = None) -> None:
+        """Queue one ack for the ingress. Never blocks on the network. ``reason`` only with
+        ``failed``: the node refused a message carrying this id (command_signing.py)."""
         if not command_id or str(command_id).startswith(UNTRACKED_PREFIXES):
             return  # no command doc on the backend: MQTT only (module docstring)
         command_id = str(command_id)
@@ -162,7 +172,8 @@ class CommandAcks:
             now = time.monotonic()
             ack = _Ack(command_id, status, _jsonable(applied_value),
                        None if error is None else str(error)[:MAX_ERROR_CHARS], queued_at=now,
-                       due=now if status in FINAL_STATUSES else now + self.coalesce_s)
+                       due=now if status in FINAL_STATUSES else now + self.coalesce_s,
+                       reason=reason if status == "failed" and reason else None)
             if not ack.final and len(self._queue) >= self.max_waiting:
                 self.dropped += 1
                 logger.info("command ack %s %s not posted: %d acks are waiting for the ingress",
@@ -222,7 +233,8 @@ class CommandAcks:
 
     def _drop_superseded_locked(self) -> None:
         """An intermediate ack with a later ack of its command queued behind it says nothing the
-        later one does not."""
+        later one does not. A refusal (``reason``) is about another message that carried the id —
+        a forged copy — so it supersedes nothing of the command's own acks."""
         later: set[str] = set()
         keep: deque[_Ack] = deque()
         for ack in reversed(self._queue):
@@ -230,7 +242,8 @@ class CommandAcks:
                 self.dropped += 1
                 logger.debug("command ack %s %s superseded", ack.command_id, ack.status)
                 continue
-            later.add(ack.command_id)
+            if ack.reason is None:
+                later.add(ack.command_id)
             keep.appendleft(ack)
         self._queue = keep
 
@@ -283,8 +296,9 @@ class CommandAcks:
         """The HTTP status of the post; None when the ingress was not reached."""
         ack.tries += 1
         try:
+            extra = {"reason": ack.reason} if ack.reason else {}
             status = self.reporter.report_command_ack(ack.command_id, ack.status,
-                                                      applied_value=ack.applied_value, error=ack.error)
+                                                      applied_value=ack.applied_value, error=ack.error, **extra)
         except Exception as e:  # noqa: BLE001 — a reporter failure is a failed try, never the worker's end
             logger.warning("command ack %s %s: %s", ack.command_id, ack.status, e)
             return None

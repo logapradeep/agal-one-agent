@@ -24,13 +24,31 @@ class AgalOneMqttClient:
         self._connected = False
         self._was_connected = False  # Tracks if we ever connected before
         # Where every command ack also goes (main.py: command_acks.CommandAcks, the HTTPS leg).
-        self._ack_sink: Optional[Callable[[str, str, Optional[object], Optional[str]], None]] = None
+        self._ack_sink: Optional[Callable[..., None]] = None
+        # Where every node event also goes (main.py: node_events.NodeEvents, the HTTPS leg).
+        self._event_sink: Optional[Callable[[dict], None]] = None
+        # What checks every message on the command topic before on_command (main.py:
+        # command_signing.CommandGate — contracts v1.14.2, the node refuses unsigned or forged ones).
+        self._gate = None
+        self._unchecked_logged = False
 
-    def set_ack_sink(self, sink: Optional[Callable[[str, str, Optional[object], Optional[str]], None]]) -> None:
-        """Every command ack is also handed to ``sink(command_id, status, applied_value, error)``,
-        connected or not. The backend reads acks only from telemetryIngress over HTTPS: nothing
-        consumes the status topic (command_acks.py). The sink must not block."""
+    def set_ack_sink(self, sink: Optional[Callable[..., None]]) -> None:
+        """Every command ack is also handed to ``sink(command_id, status, applied_value, error)``
+        (and ``reason=`` for a refusal), connected or not. The backend reads acks only from
+        telemetryIngress over HTTPS: nothing consumes the status topic (command_acks.py). The sink
+        must not block."""
         self._ack_sink = sink
+
+    def set_event_sink(self, sink: Optional[Callable[[dict], None]]) -> None:
+        """Every event from ``publish_event`` is also handed to ``sink(event)``, connected or not
+        (node_events.py: posted as ``sensor_event`` over HTTPS — nothing consumes the status
+        topic, so an event on MQTT only never reached the cloud). The sink must not block."""
+        self._event_sink = sink
+
+    def set_command_gate(self, gate) -> None:
+        """``gate.admit(raw)`` checks every message on the command topic and gives the command to
+        carry out, or None (command_signing.CommandGate). main.py always sets one."""
+        self._gate = gate
 
     def set_command_handler(self, handler: Callable[[dict], None]) -> None:
         self._on_command = handler
@@ -146,24 +164,33 @@ class AgalOneMqttClient:
         )
 
     def publish_event(self, event: dict) -> None:
-        """Publish a structured event to the status topic.
+        """Report a structured event — the one call for every node event.
 
         Used by the edge protection module (dry-run cutoff, low-water warning,
-        baseline-learned) and any other code that needs to emit an event the
-        cloud should record in the /events collection.
+        baseline-learned), the block runtime (blocks/cloud.py ``CloudSink.event``) and the
+        telemetry buffer (buffer_overflow): anything the cloud should record in /events.
 
-        Event shape (matches contracts/schemas/event.schema.json):
+        Event shape (functions.yaml NodeEvent; contracts/schemas/event.schema.json):
             {
                 "type": "dry_run_protection_triggered" | "low_water_level_warning" | ...,
-                "source": "protection" | "node" | ...,
+                "source": "protection" | "node" | "program",
                 "sourceKey": "<asset.subkey>",
                 "payload": { ... }
             }
 
-        Caller does NOT need to include nodeUid or timestamp — backend stamps them.
+        Caller does NOT need to include nodeUid or timestamp. It goes to the event sink — posted
+        over HTTPS as ``{type: sensor_event, payload: {nodeUid, event, timestamp, eventId}}`` with
+        the node's token, retried, whether MQTT is connected or not (node_events.py; contracts
+        v1.14.2) — and, when connected, to the status topic as before (no consumer; harmless).
         """
+        if self._event_sink is not None:
+            try:
+                self._event_sink(event)
+            except Exception as e:  # noqa: BLE001 — reporting never fails the caller (a protection trip)
+                logger.error("event %s not queued for the ingress: %s", event.get("type", "?"), e)
         if not self._client or not self._connected:
-            logger.warning("Cannot publish event (%s): not connected", event.get("type", "?"))
+            if self._event_sink is None:
+                logger.warning("Cannot publish event (%s): not connected", event.get("type", "?"))
             return
 
         wrapped = {
@@ -302,15 +329,21 @@ class AgalOneMqttClient:
         error: Optional[str] = None,
         *,
         ingress: bool = True,
+        reason: Optional[str] = None,
     ) -> None:
         """The one call for a command ack, from every site. It goes to the ack sink (the HTTPS
         leg the backend reads — whether MQTT is connected or not) and, when connected, to the
         status topic (no consumer today; harmless, a future broker consumer may use it).
         ``ingress=False`` keeps it on MQTT only: an ack the backend has no use for (the OTA
-        receipt, whose outcome comes back as firmware_update events)."""
+        receipt, whose outcome comes back as firmware_update events). ``reason`` (only with
+        ``failed``) is why the node refused a message carrying this id before carrying anything
+        out — enums.yaml#CommandRefusalReason (command_signing.CommandGate)."""
         if ingress and self._ack_sink is not None:
             try:
-                self._ack_sink(command_id, status, applied_value, error)
+                if reason is None:
+                    self._ack_sink(command_id, status, applied_value, error)
+                else:
+                    self._ack_sink(command_id, status, applied_value, error, reason=reason)
             except Exception as e:  # noqa: BLE001 — an ack sink failure never fails the command
                 logger.error("command ack %s %s not queued for the ingress: %s", command_id, status, e)
         if not self._client or not self._connected:
@@ -325,6 +358,8 @@ class AgalOneMqttClient:
             payload["appliedValue"] = applied_value
         if error:
             payload["error"] = error
+        if reason:
+            payload["reason"] = reason
 
         # Same {type, payload} envelope the ingress takes (the HTTPS leg posts this very payload).
         self._client.publish(
@@ -353,11 +388,26 @@ class AgalOneMqttClient:
             logger.warning("Unexpected MQTT disconnect (rc=%d), will auto-reconnect", rc)
 
     def _on_message(self, client, userdata, msg):
+        """Every message on the command topic is checked by the gate before anything reads it
+        (command_signing.py): the handler is given the very object that was verified, or nothing.
+        Without a gate (only a client nobody wired — main.py always sets one) the message is
+        parsed and carried out unchecked, logged once."""
         try:
-            payload = json.loads(msg.payload.decode("utf-8"))
-            logger.debug("Received command: %s", payload)
+            if self._gate is not None:
+                command = self._gate.admit(msg.payload)
+                if command is None:
+                    return  # refused: logged and answered by the gate
+            else:
+                if not self._unchecked_logged:
+                    self._unchecked_logged = True
+                    logger.error("MQTT commands are carried out UNCHECKED: no command gate is set")
+                command = json.loads(msg.payload.decode("utf-8"))
+                if not isinstance(command, dict):
+                    logger.error("MQTT message is not a JSON object: dropped")
+                    return
+            logger.debug("Received command: %s", command)
             if self._on_command:
-                self._on_command(payload)
+                self._on_command(command)
         except json.JSONDecodeError:
             logger.error("Invalid JSON in MQTT message: %s", msg.payload)
         except Exception as e:

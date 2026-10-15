@@ -12,3 +12,4 @@ CONTRACTS = os.path.normpath(os.path.expanduser(
     os.environ.get("AGAL_CONTRACTS_DIR") or os.path.join(_HERE, "..", "..", "..", "contracts")))
 DEFAULTS = os.path.join(CONTRACTS, "programs", "defaults")
 EXPRESSION_VECTORS = os.path.join(CONTRACTS, "programs", "test-vectors", "expressions.json")
+COMMAND_SIGNING_VECTORS = os.path.join(CONTRACTS, "nodes", "vectors", "command-signing.json")

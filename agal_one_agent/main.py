@@ -18,6 +18,8 @@ from .live_cadence import LiveCadenceController
 from .heartbeat import HeartbeatPublisher
 from .http_reporter import HttpReporter
 from .command_acks import wire_command_acks
+from .command_signing import wire_command_gate
+from .node_events import wire_node_events
 from . import boot_reconciler
 from .sentry_setup import init_sentry
 from .sensors import (
@@ -147,6 +149,28 @@ def main():
     # the MQTT loop (command_acks.py has what is posted and why). tests/test_command_acks.py
     # checks that main() makes this call.
     command_acks = wire_command_acks(mqtt_client, http_reporter, offline=args.offline)
+
+    # Every message on the command topic is checked before anything carries it out (contracts
+    # v1.14.2, command_signing.py): signed for THIS node with its auth_token, never seen before,
+    # not stale. One broker login is shared by every board, so the topic name alone separates
+    # nothing. A refused message is logged and, for a tracked id, answered through the ack queue
+    # above; the replay set lives in the state directory. tests/test_command_signing.py checks
+    # that main() makes this call.
+    from .blocks.clock import SystemClock
+    from .blocks.sync import DEFAULT_STATE_DIR
+    agent_clock = SystemClock()
+    command_gate = wire_command_gate(mqtt_client, http_reporter, token=config.node.auth_token,
+                                     state_dir=config.blocks.state_dir or DEFAULT_STATE_DIR,
+                                     offline=args.offline, clock_ok=agent_clock.clock_ok)
+
+    # Node events (protection trips, the block runtime's, buffer_overflow) reach the backend only
+    # over HTTPS too: every publish_event is also queued here and posted as a sensor_event with
+    # the node's token, in order, retried (node_events.py). tests/test_node_events.py checks it.
+    node_events = wire_node_events(mqtt_client, http_reporter, offline=args.offline,
+                                   clock_ok=agent_clock.clock_ok)
+    if command_gate is not None and command_gate.protected:
+        logger.info("Commands on %s are checked: signed for this node (hs256-v1), not replayed, not stale",
+                    config.mqtt.commands_topic)
 
     # ---- Node linking (ADR-024): one GPIO path for every Linux board, and the
     # report of what this board is and has. Nothing here names a board.
@@ -714,6 +738,8 @@ def main():
             cloud_sink.close()
         if command_acks is not None:
             command_acks.close(timeout=3.0)  # one more try for each ack still waiting
+        if node_events is not None:
+            node_events.close(timeout=3.0)  # after runtime.stop: its output_released events go too
         telemetry.stop()
         # Final drain attempt so a clean shutdown doesn't strand buffered rows.
         try:

@@ -2,6 +2,97 @@
 
 ## 0.3.4 (unreleased — not tagged)
 
+**Security — any board's config could command every other node; now a node carries out only
+commands signed for it (contracts v1.14.2, `Agal/contracts/nodes/command-signing.md`; founder
+2026-10-15: yes).** Every node connects to HiveMQ with one shared device login, written into every
+`config.yaml`, so whoever held one could publish to any node's `agal/{nodeUid}/commands` — the
+topic name was the only separation. The backend is to sign every message it publishes for one node
+with that node's `authToken` (`sigAlg` hs256-v1, `sigTs`, `sig` = base64url HMAC-SHA256 of the
+canonical JSON of the rest — SYNC.md v1.14.2 item 3, not built when this was written), and from
+0.3.4 the node checks every message at the MQTT boundary,
+before anything reads it (`command_signing.py`; `mqtt_client._on_message` hands the handler the
+very object it verified):
+
+- **refused, in the reference's order** (a port of `nodes/reference/signing.mjs`): no `sig` →
+  `unsigned`; a `sig` that is not 43 base64url characters, another `sigAlg`, a `sigTs` that is not
+  a safe integer, no usable `commandId`, no canonical form, or a MAC that does not match
+  (`hmac.compare_digest`) → `bad_signature`; an id accepted before → `replayed`; below the replay
+  floor, or — while the clock is trusted (`blocks/clock.py` `clock_ok()`: NTP synced or an RTC) —
+  signed more than 10 minutes ago or more than 2 minutes ahead → `stale`. A refused copy never
+  burns an id: a forged copy carrying a real command's id does not stop the real one.
+- **canonical JSON as JavaScript writes it**: keys sorted by UTF-16 code units at every level,
+  `JSON.stringify`'s string escapes (Tamil, ₹, U+2028 and emoji raw), and every number as
+  ECMAScript writes the double it parses to (`1.0` → `1`, `1E-7` → `1e-7`, `1e21` → `1e+21`,
+  `2^53+1` → `9007199254740992`) — `json.dumps` does none of that. The parser refuses `NaN` /
+  `Infinity`, as `JSON.parse` does.
+- **the replay set survives a restart**: every accepted id with its `sigTs`, aged 7 days on the
+  backend's clock (`highWater`), at most 10,000 (the oldest leaves and raises `evictedFloor`),
+  in the state directory (`command_replay.json` + `command_replay.journal`; one fsynced line per
+  command, written BEFORE it is carried out, folded into the snapshot every 2,000 and at start; a
+  torn last line is ignored, a damaged snapshot is kept aside and the set starts empty, logged).
+  So a Pi that has not synced NTP yet still refuses a replay. If the card cannot be written the
+  command is still carried out (remembered in memory, logged as an error) — refusing would leave
+  the node unable to take the command that switches the pump off.
+- **every refusal is logged** (reason, commandId, why — never the token; the type only when the
+  MAC verified). A refused 20-character auto-id is answered with a failed command ack carrying
+  `reason` and `error` "refused: <reason> — …" through the 0.3.3 HTTPS ack queue, at most 20 in any
+  10 minutes (a flood of forged messages must not spend the node's 1000-an-hour ingress budget); a
+  prefixed id (`sync_…`, `scan_bus_…`, `test_port_…`) has no document and is only logged. A refusal
+  ack never supersedes the real command's own `acknowledged` in the queue. A `stale`
+  `firmwareUpdate` (its MAC verified, so its fields are the backend's) is also reported as
+  `firmware_update {phase: failed, commandId, toVersion, rolloutId, error}`, once per command, so
+  `otaStatus` does not stay `updating`; its ack stays on MQTT, as every firmwareUpdate ack does
+  (its id is a `/nodeCommands` doc, which commandAck does not track).
+- **a node with an empty `auth_token` checks nothing** (command-signing.md §5.5, the contract's
+  choice): it carries out every message as before and logs once, as an error at start, that its
+  commands are NOT verified. Every node made by `createNode` or the join command has a token.
+
+**Release order: never put 0.3.4 on a node before the backend that signs is deployed** — a 0.3.4
+node refuses every unsigned command, `firmwareUpdate` included, and answers each tracked one
+`failed` "refused: unsigned"; it works again by itself once the signing backend is out. Agents
+0.3.1 / 0.3.3 ignore the three extra fields.
+
+**Fix — no node alert reached the cloud.** A node's events — the protection trips
+(`sensors/protection.py`: dry-run cut-off, low water, baseline learned), the block runtime's
+(`blocks/cloud.py` `CloudSink.event`: plot / schedule runs, commands applied or failed, outputs
+released, runs cut short …) and `buffer_overflow` — were published on the MQTT status topic only,
+which nothing consumes, in a flat body the ingress answers 400 (contracts v1.14.1 review, SYNC.md
+3e). Now every `publish_event` also goes to `node_events.NodeEvents` (`main.py` wires it as the
+MQTT client's event sink, like the ack sink), which posts `{type: "sensor_event", payload:
+{nodeUid, event, timestamp, eventId, timestampUncertain?}}` (functions.yaml 1.10.2
+`SensorEventPayload`) with the node's Bearer token, connected or not:
+
+- `nodeUid` is `config.node.uid`, not `mqtt.username` (the shared login's name on a node that uses
+  it — what the MQTT copy has always carried);
+- `eventId` (20 random characters) is minted when the event is raised and is the same on every
+  retry: the backend files `/events/{nodeUid}_{eventId}` once, so a retry rings no phone twice;
+- `timestampUncertain: true` while the clock is not trusted (the backend files it at receive time);
+- in order, one at a time: not delivered (unreachable, 408, 429, 5xx) → tried again after a
+  back-off (1 s … 60 s; 60 s after a 429) while the events behind it wait, for up to 24 h; any
+  other 4xx → given up at once, logged; events have their own budget of 300 an hour (burst 30)
+  within the node's 1000-an-hour ingress limit, and an event over it waits; at most 256 waiting (the oldest that is not a protection event
+  leaves first, logged); NaN / Infinity in a payload become null; one more try each on a clean
+  stop, after the runtime's own stop events.
+
+The MQTT copy is kept (harmless; whether to drop it is the founder's, SYNC.md v1.14.2 item 6).
+Events are not persisted: a restart while the ingress is unreachable loses the ones waiting.
+
+Verified (signing + events): `tests/test_command_signing.py` (178) — the 13 signing vectors (canonical
+text and sig) and all 31 verifying sequences of `Agal/contracts/nodes/vectors/command-signing.json`,
+each against the in-memory set and the persisted one; eviction at 10,000 (and after a restart);
+35 number literals against the text Node's `String()` gives for each; escapes; UTF-16 key order; 300 random nested
+messages canonicalised and MACed by the reference `signing.mjs` in Node (run when `node` is on the
+PATH); the replay set across restarts, its floor, aging, a torn journal line, a damaged snapshot,
+the fold, an unwritable card, the id on disk before the handler runs; the gate at the MQTT
+boundary (every reason, the clock rule, untracked ids, non-commands, the 20-in-10-minutes cap,
+the stale firmwareUpdate report, no token); the refusal ack's HTTPS body; main() wiring.
+`tests/test_node_events.py` (20) — the wire body and Bearer token, the node's uid, retries with
+one eventId, order, 4xx, 429, the deadline, the cap, the budget, the stop, each source of events,
+main() wiring. Mutation-checked: Python's key order, `repr` numbers, no clock check, no floor, a
+refused copy remembered, no MAC compare, no persisted line, no cap, the broker username as
+nodeUid, no event sink, the gate not wired, uppercase `\u` escapes — each fails the tests. Not run
+on a Pi, against the broker, or against a backend that signs (not built yet).
+
 **Fix — a firmware update needed the board's terminal (founder, 2026-10-15: "once the rpi is
 linked, there should not be a need to do anything on the pi terminal especially the updates").**
 The app's Update firmware button (`updateNodeFirmware` → `/nodeCommands` → `firmwareUpdate

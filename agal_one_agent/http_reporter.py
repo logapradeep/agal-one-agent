@@ -169,11 +169,13 @@ class HttpReporter:
         return self._post({"type": "telemetry_batch", "payload": payload})
 
     def report_command_ack(self, command_id: str, status: str,
-                           applied_value=None, error: str = None) -> Optional[int]:
+                           applied_value=None, error: str = None, reason: str = None) -> Optional[int]:
         """POST a command ack — the only way the backend learns what became of a command
         (nothing consumes the MQTT status topic). Called from ``command_acks.CommandAcks``'s
         worker, never on a command's own thread. Returns the HTTP status (200 = recorded), or
-        None when the ingress was not reached, so the caller can tell a retry from a refusal."""
+        None when the ingress was not reached, so the caller can tell a retry from a refusal.
+        ``reason`` (only with failed; contracts v1.14.2 CommandAckPayload.reason): the node
+        refused a message carrying this id — unsigned | bad_signature | replayed | stale."""
         payload = {
             "nodeUid": self.node_uid,
             "commandId": command_id,
@@ -183,8 +185,30 @@ class HttpReporter:
             payload["appliedValue"] = applied_value
         if error:
             payload["error"] = error
+        if reason and status == "failed":
+            payload["reason"] = reason
 
         return self._post_status({"type": "commandAck", "payload": payload})
+
+    def report_sensor_event(self, event: dict, *, event_id: str, timestamp: int,
+                            timestamp_uncertain: bool = False) -> Optional[int]:
+        """POST one node event — ``{type: "sensor_event", payload: SensorEventPayload}``
+        (functions.yaml 1.10.2, contracts v1.14.2): ``{nodeUid, event, timestamp, eventId,
+        timestampUncertain?}``, with the node's Bearer token (the ingress takes a sensor_event only
+        with it). ``nodeUid`` is the node's own uid (config.yaml node.uid) — never the broker
+        username, which on a node with the shared device login is not this node. ``eventId`` is
+        the same on every retry: the backend files /events/{nodeUid}_{eventId} once. Called from
+        ``node_events.NodeEvents``'s worker. The HTTP status, or None when the ingress was not
+        reached."""
+        payload: dict = {
+            "nodeUid": self.node_uid,
+            "event": event,
+            "timestamp": int(timestamp),
+            "eventId": event_id,
+        }
+        if timestamp_uncertain:
+            payload["timestampUncertain"] = True
+        return self._post_status({"type": "sensor_event", "payload": payload})
 
     def report_firmware_event(self, phase: str, from_version: str = None,
                               to_version: str = None, command_id: str = None,
