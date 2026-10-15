@@ -53,7 +53,7 @@ class EventSink:
 
     def variables(self, asset_id: str, values: dict[str, Any]) -> None: ...
     def alert(self, text: str, severity: str, rule_id: Optional[str], asset_id: Optional[str] = None) -> None: ...
-    def event(self, type_: str, payload: dict) -> None: ...
+    def event(self, type_: str, payload: dict, source: str = "program") -> None: ...
     def log(self, text: str, asset_id: Optional[str] = None) -> None: ...
     def reading(self, asset_id: str, source_key: str, value: Any, kind_uri: Optional[str], unit: Optional[str]) -> None: ...
     def program_ack(self, version: int, status: str, reason: Optional[str] = None) -> None: ...
@@ -69,6 +69,7 @@ class RecordingSink(EventSink):
         self.logs: list[dict] = []
         self.readings: list[dict] = []
         self.acks: list[dict] = []
+        self.sources: list[str] = []  # the event source of each entry of `events` (program, node)
 
     def variables(self, asset_id, values):
         self.variables_log.append((asset_id, dict(values)))
@@ -76,8 +77,9 @@ class RecordingSink(EventSink):
     def alert(self, text, severity, rule_id, asset_id=None):
         self.alerts.append({"text": text, "severity": severity, "ruleId": rule_id, "assetId": asset_id})
 
-    def event(self, type_, payload):
+    def event(self, type_, payload, source="program"):
         self.events.append({"type": type_, **payload})
+        self.sources.append(source)
 
     def log(self, text, asset_id=None):
         self.logs.append({"text": text, "assetId": asset_id})
@@ -208,7 +210,8 @@ class _Block:
 
 class BlockRuntime:
     def __init__(self, io: IOAdapter, sink: EventSink, clock: Optional[Clock] = None,
-                 state_dir: Optional[str] = None, tick_seconds: float = 1.0):
+                 state_dir: Optional[str] = None, tick_seconds: float = 1.0,
+                 lock: Optional[threading.RLock] = None, listen: bool = True):
         self.io = io
         self.sink = sink
         self.clock = clock or SystemClock()
@@ -221,7 +224,9 @@ class BlockRuntime:
         self.aabs: dict[str, _Block] = {}
         self.aab_order: list[str] = []
         self.nab: Optional[_Block] = None
-        self._lock = threading.RLock()
+        # A shared lock when a ProgramHost runs this beside the v3 runtime (one lock for both, so a
+        # switch command is checked and dispatched against whichever program runs).
+        self._lock = lock or threading.RLock()
         self._thread: Optional[threading.Thread] = None
         self._sampler: Optional[threading.Thread] = None
         self._running = False
@@ -252,7 +257,13 @@ class BlockRuntime:
         # run when the schedule would have ended, through the mapping they were written against.
         self._orphan_ends: list[dict] = []
         self._pending_resumes: list[tuple[str, float]] = []
-        self.io.set_change_listener(self._on_input_change)
+        if listen:
+            self.io.set_change_listener(self._on_input_change)
+
+    @property
+    def loaded(self) -> bool:
+        """A program is loaded (the NAB of a v1 bundle)."""
+        return self.nab is not None
 
     @property
     def lock(self) -> threading.RLock:

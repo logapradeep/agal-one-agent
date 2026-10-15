@@ -272,12 +272,14 @@ def main():
         default_watching=config.telemetry.live_watch_default,
     )
 
-    # ---- Automation-block runtime (ADR-017, contracts v1.5.0) ----------------
+    # ---- Automation-block runtime (ADR-017; bundle v3 since contracts v1.15.0, ADR-029) --------
+    # The host runs the bundle the cloud serves: a language-1 NAB bundle exactly as agent 0.3.x runs
+    # it, a language-3 bundle (layout rules, the instruction, the built-ins) once the node is migrated.
     runtime = None
     program_sync = None
     cloud_sink = None
     if config.blocks.enabled:
-        from .blocks import BlockRuntime, SystemClock
+        from .blocks import ProgramHost, SystemClock
         from .blocks.cloud import CloudSink, build_hardware_io, sensors_by_key
         from .blocks.sync import ProgramStore, ProgramSync, DEFAULT_STATE_DIR
 
@@ -291,12 +293,13 @@ def main():
             logger.warning("blocks.simulated_io is ON — ports are simulated; this must never run on a farm node")
         else:
             block_io = build_hardware_io(config, sensors_by_key(config), lines=line_io, analog=analog_io)
-        runtime = BlockRuntime(
+        runtime = ProgramHost(
             block_io,
             cloud_sink,
             clock=SystemClock(),
             state_dir=state_dir,
             tick_seconds=config.blocks.tick_seconds,
+            node_uid=config.node.uid,
         )
         program_sync = ProgramSync(runtime, ProgramStore(state_dir), http_reporter)
         link_guard.use_runtime(runtime)
@@ -310,7 +313,7 @@ def main():
             return False
         if config.blocks.legacy_protection:
             return True
-        return runtime is None or runtime.nab is None
+        return runtime is None or not runtime.loaded
 
     # ---- Raw-LoRa star listener (ADR-011 v1) — DARK unless enabled -----------
     lora_listener = None
@@ -341,16 +344,14 @@ def main():
 
     # Command handler
     def _runtime_port(label, line):
-        """(assetId, sourceKey) of the program variable that drives this chip line, if any."""
-        if runtime is None or runtime.nab is None or label is None or line is None:
+        """(assetId, sourceKey) of the v1 program variable that drives this chip line, if any (a port
+        test pulses it through the runtime). A v3 program never hands a line to a port test."""
+        if runtime is None or not runtime.loaded:
             return None
-        for aid, blk in runtime.aabs.items():
-            for v in blk.vars.values():
-                port = getattr(v, "port", None)
-                t = getattr(port, "transport", None) or {}
-                if t.get("chip") == label and t.get("line") is not None and int(t["line"]) == int(line):
-                    return (aid, port.source_key)
-        return None
+        return runtime.port_for_line(label, line)
+
+    def _line_busy(label, line) -> bool:
+        return runtime is not None and runtime.loaded and runtime.line_in_use(label, line)
 
     def on_command(command: dict):
         cmd_type = command.get("type", "")
@@ -446,8 +447,7 @@ def main():
                               "detail": f"through the running program: on for {seconds} s, then off" if on.get("accepted")
                               else str(on.get("reason") or "the program refused it")[:200]}
                 else:
-                    result = run_port_test(command, line_io, busy=(lambda label, line: _runtime_port(label, line) is not None),
-                                           analog=analog_io)
+                    result = run_port_test(command, line_io, busy=_line_busy, analog=analog_io)
                 http_reporter.report_port_test(command_id, result)
                 mqtt_client.publish_command_ack(command_id, "completed" if result["result"] == "passed" else "failed",
                                                 error=None if result["result"] == "passed" else result.get("detail"))
@@ -488,8 +488,10 @@ def main():
             program_sync.pull(expected_version=command.get("version"))
             return
 
-        if cmd_type in ("runPlot", "stopPlot", "setVariable"):
-            if runtime is None or runtime.nab is None:
+        # resetValve / pauseAutomation / resumeAutomation: bundle v3 (contracts v1.15.0). A language-1
+        # program refuses them as unknown; runPlot / stopPlot / setVariable are refused by a v3 program.
+        if cmd_type in ("runPlot", "stopPlot", "setVariable", "resetValve", "pauseAutomation", "resumeAutomation"):
+            if runtime is None or not runtime.loaded:
                 mqtt_client.publish_command_ack(command_id, "failed", error="no automation program loaded")
                 return
             result = runtime.apply_command(command)
@@ -588,16 +590,17 @@ def main():
 
         # The block runtime runs with or without the cloud; the legacy protection
         # thread only when there is no program to replace it.
-        if runtime is not None and runtime.nab is not None:
+        if runtime is not None and runtime.loaded:
             runtime.start()
-            logger.info("Automation runtime started (program v%d)", runtime.version)
+            logger.info("Automation runtime started (program v%d, block language %d)", runtime.version, runtime.language)
         if runtime is not None and config.blocks.simulated_io:
+            # The bench (a laptop node) simulates the plumbing of a language-1 program.
             from .blocks.bench import BenchPhysics
             from .blocks.bench_ui import BenchUI
-            bench_physics = BenchPhysics(runtime, runtime.io)
+            bench_physics = BenchPhysics(runtime.v1, runtime.io)
             bench_physics.start()
             bench_ui = BenchUI(
-                runtime, bench_physics,
+                runtime.v1, bench_physics,
                 mqtt_client=None if args.offline else mqtt_client,
                 heartbeat=None if args.offline else heartbeat,
                 program_sync=program_sync, cloud_sink=cloud_sink,
@@ -644,9 +647,9 @@ def main():
             time.sleep(1)
             # A program that arrives after boot starts the runtime and retires the
             # legacy protection thread (single writer per output).
-            if runtime is not None and runtime.nab is not None and not runtime._running:
+            if runtime is not None and runtime.loaded and not runtime._running:
                 runtime.start()
-                logger.info("Automation runtime started (program v%d)", runtime.version)
+                logger.info("Automation runtime started (program v%d, block language %d)", runtime.version, runtime.language)
                 if legacy_started and protection_monitor is not None and not config.blocks.legacy_protection:
                     protection_monitor.stop()
                     legacy_started = False

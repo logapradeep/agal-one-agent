@@ -12,7 +12,9 @@ Modules
   clock     wall + monotonic clock abstraction (system + simulated)
   sun       sunrise / sunset for schedules with a ``sunEvent``
   io        port adapters: SimulatedIO (bench on a laptop) and HardwareIO (GPIO)
-  runtime   BlockRuntime — compile, evaluate, act, persist, acknowledge
+  runtime   BlockRuntime — compile, evaluate, act, persist, acknowledge (block language 1)
+  v3        RuntimeV3 — bundle v3: layout rules, the instruction, the built-ins (ADR-029)
+  host      ProgramHost — runs the bundle the cloud serves, language 1 or 3
   sync      program store + cloud fetch/ack helpers
   simulate  ``agal-one-agent-sim`` CLI: run a bundle against a scenario file
 """
@@ -21,3 +23,4 @@ from .expr import ExprError, parse, validate, evaluate  # noqa: F401
 from .runtime import BlockRuntime, CompileError, EventSink  # noqa: F401
 from .io import SimulatedIO, HardwareIO  # noqa: F401
 from .clock import SystemClock, SimClock  # noqa: F401
+from .host import ProgramHost, BLOCK_LANGUAGE  # noqa: F401

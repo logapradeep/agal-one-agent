@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -98,6 +99,15 @@ class IOAdapter:
     def release_output(self, port: PortRef) -> None:
         """Let go of an output the program no longer drives (after it was written to its safe state)."""
 
+    def pulse(self, port: PortRef, ms: int) -> None:
+        """One pulse of ``ms`` milliseconds on an output (a latching valve's open or close coil, bundle v3):
+        on, wait, off. If the off fails the exception propagates — the caller treats the pulse as cut short."""
+        self.write_output(port, True)
+        try:
+            time.sleep(max(0, int(ms)) / 1000.0)
+        finally:
+            self.write_output(port, False)
+
     def close(self) -> None:
         pass
 
@@ -110,6 +120,10 @@ class SimulatedIO(IOAdapter):
         self.outputs: dict[tuple[str, str], Any] = {}
         self.writes: list[tuple[str, str, Any]] = []
         self.released: list[tuple[str, str, dict]] = []
+        # Every physical action in order — {assetId, sourceKey, value} for a write, {…, pulseMs} for a pulse
+        # (the shape of the bundle-v3 golden vectors' `writes`).
+        self.log: list[dict] = []
+        self.pulses: list[tuple[str, str, int]] = []
         self._allowed = allowed_gpios
         self._listener: Optional[Callable[[], None]] = None
 
@@ -129,6 +143,11 @@ class SimulatedIO(IOAdapter):
     def write_output(self, port: PortRef, value: Any) -> None:
         self.outputs[(port.asset_id, port.source_key)] = value
         self.writes.append((port.asset_id, port.source_key, value))
+        self.log.append({"assetId": port.asset_id, "sourceKey": port.source_key, "value": value})
+
+    def pulse(self, port: PortRef, ms: int) -> None:
+        self.pulses.append((port.asset_id, port.source_key, int(ms)))
+        self.log.append({"assetId": port.asset_id, "sourceKey": port.source_key, "pulseMs": int(ms)})
 
     def output(self, asset_id: str, source_key: str, default=None) -> Any:
         return self.outputs.get((asset_id, source_key), default)

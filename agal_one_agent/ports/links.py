@@ -190,6 +190,12 @@ class LinkGuard:
         return None
 
 
+def _loaded(runtime) -> bool:
+    """A program is loaded — a ProgramHost or a runtime of either language says ``loaded``."""
+    loaded = getattr(runtime, "loaded", None)
+    return bool(loaded) if loaded is not None else getattr(runtime, "nab", None) is not None
+
+
 def refuse(mqtt_client, command: dict, refusal: str) -> None:
     """The failed ack for a refused command, in the words of the refusal."""
     logger.warning("%s %s: %s", command.get("type"), command.get("commandId"), refusal)
@@ -213,7 +219,7 @@ def handle_switch(command: dict, guard: LinkGuard, runtime, mqtt_client,
             refuse(mqtt_client, command, refusal)
             return
         command_id = command.get("commandId", "")
-        if runtime is not None and runtime.nab is not None and \
+        if runtime is not None and _loaded(runtime) and \
                 runtime.owns_port(command.get("assetId"), command.get("sourceKey") or "device.power"):
             mqtt_client.publish_command_ack(command_id, "acknowledged")
             result = runtime.apply_command(command)

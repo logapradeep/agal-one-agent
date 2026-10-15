@@ -189,9 +189,9 @@ class CloudSink(EventSink):
         except Exception as e:  # noqa: BLE001
             logger.debug("alert http: %s", e)
 
-    def event(self, type_: str, payload: dict) -> None:
+    def event(self, type_: str, payload: dict, source: str = "program") -> None:
         try:
-            self.mqtt.publish_event({"type": type_, "source": "program", "payload": payload,
+            self.mqtt.publish_event({"type": type_, "source": source or "program", "payload": payload,
                                      "sourceKey": payload.get("assetId") or payload.get("plotId") or ""})
         except Exception as e:  # noqa: BLE001
             logger.debug("event mqtt: %s", e)
@@ -282,10 +282,25 @@ def capabilities_from_pins(config) -> dict:
 
 
 def heartbeat_extra(runtime, config, sink: Optional[CloudSink] = None) -> dict:
-    """The block-runtime fields the heartbeat carries."""
-    extra: dict = {"capabilities": capabilities_from_pins(config)}
-    if runtime is not None and runtime.nab is not None:
+    """The block-runtime fields the heartbeat carries.
+
+    ``capabilities.blockLanguage`` is 3 (contracts v1.15.0): this agent runs bundle v3, and still runs a
+    language-1 NAB bundle as agent 0.3.x does until the node is migrated — the cloud serves v3 only to a
+    node that reports 3 AND has no unmigrated NAB (programs/README.md §7.2). While a v3 bundle runs, the
+    status also carries its built-ins: ``safety``, ``valves``, ``guards``, ``held``, ``automation`` and the
+    active instruction part per layout (functions.yaml 1.11.0 telemetryIngress)."""
+    from .host import BLOCK_LANGUAGE
+    caps = capabilities_from_pins(config)
+    caps["blockLanguage"] = BLOCK_LANGUAGE
+    extra: dict = {"capabilities": caps}
+    loaded = getattr(runtime, "loaded", None)
+    if loaded is None:
+        loaded = runtime is not None and getattr(runtime, "nab", None) is not None
+    if runtime is not None and loaded:
         extra["programVersion"] = runtime.version
         ack = sink.last_ack if sink else None
         extra["programStatus"] = (ack or {}).get("status", "applied")
+        status = getattr(runtime, "status_extra", None)
+        if callable(status):
+            extra.update(status() or {})
     return extra

@@ -15,7 +15,7 @@ import os
 import threading
 from typing import Optional
 
-from .runtime import BlockRuntime, CompileError
+from .runtime import CompileError
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,8 @@ class ProgramStore:
 class ProgramSync:
     """Glue between the cloud (http_reporter) and the runtime."""
 
-    def __init__(self, runtime: BlockRuntime, store: ProgramStore, http_reporter, sink_ack=None):
+    def __init__(self, runtime, store: ProgramStore, http_reporter, sink_ack=None):
+        # runtime: a ProgramHost (the agent) or a BlockRuntime (tests, the simulator)
         self.runtime = runtime
         self.store = store
         self.http = http_reporter

@@ -1,5 +1,117 @@
 # Changelog — agal-one-agent
 
+## 0.4.0 (unreleased, not tagged)
+
+**Bundle v3 — layout rules, the instruction, the built-ins (ADR-029, contracts v1.15.0, programs/README.md §7).**
+A minor version, not more of 0.3.3: a new block language, a new capability, new commands and new events.
+Neither 0.3.3 nor this is tagged; `/config/agent` still pins 0.3.1. Releasing it is the founder's.
+
+**Coexistence — nothing changes for a node until it is migrated.** The agent now reports
+`capabilities.blockLanguage = 3`. The cloud serves a v3 bundle only to a node that reports 3 AND whose v1 NAB is
+migrated (`migratedAt`, the founder's yes); every other node keeps its language-1 NAB bundle. So the agent runs
+both: `blocks/host.py` `ProgramHost` hands a language-1 bundle (`language` absent or 1) to the unchanged
+`BlockRuntime` — the same writes as 0.3.3, checked by a test that drives both side by side — and a language-3
+bundle to the new `blocks/v3/` runtime. Language 2 (superseded before it was built) is rejected. The one change
+to the v1 module is additive (an event `source`, a shared lock, `loaded`). The migration switch itself is checked
+first (a v3 bundle that does not compile never stops the v1 program), then the v1 runtime stops as on a clean
+stop and v3 loads cold, as after a restart — the contract defines no bumpless take-over across languages.
+
+**The pass (§7.5):** inputs → the built-ins (power sense, E-stop latch, valve drivers, motor guards), then the
+commands and which blocks hold → each layout's active instruction part → the rule slots → outputs written once,
+through the built-ins' veto, switch-offs first (motors before valves), then switch-ons (valves before motors), each
+class in `assets[]` order. Every card the bundle carries is sampled; digital inputs also every 100 ms between passes.
+
+- **The motor guard** (`v3/guard.py`, §7.11), always on, evaluated before every block. Dry run (the current
+  `dropPct` below the learned baseline for `holdSeconds`), overload (above `multiple` × the rated current, or ×
+  the learned running current when no rated current is set — 1.25 × by default), phase loss (three phase, where
+  phase sense is wired) and imbalance (a current per phase), the voltage window where voltage is measured. Current
+  is not judged during `inrushIgnoreSeconds` after each start. The baseline is learned once — the first 10 s after
+  the inrush of a run that then runs a minute with no trip — kept on the node, never from a run that tripped. A
+  trip: the motor off in that pass (the veto), the run of the block that had it on ended (`watering_not_finished`,
+  `guard_tripped`), the restart lockout (never under 30 s, whatever a bundle says) during which nothing starts it — not
+  a rule that keeps asking, not a command. A motor card without a guard, or a block that drives a motor port other
+  than the guarded one, is refused. Ported from `sensors/protection.py` (the confirm window, the post-inrush
+  average) without its thread or its relay writes.
+- **The valve drivers** (`v3/valve.py`, §7.9). Blocks set `valve.open`; the coils are the driver's alone (a block
+  naming one is refused). Continuous: one output, normally closed = powered open, inverted for normally open,
+  never faults. Single-pulse latching: an open and a close output, one pulse of `pulseMs` (default 100), never both;
+  the position and a pulse-in-progress mark are written to the state directory before and after every pulse. FAULT
+  on a supply that drops or cannot be read (`supply_lost`), a start after an unclean stop (`unclean_boot`), a pulse
+  cut short (`pulse_cut_short`), a first start or a changed configuration (`position_unknown`). While in FAULT no
+  pulse is sent and only the blocks that use the valve hold (write, stop or read its `valve.open` — reading its
+  built-ins is not a use), their outputs off, motors first. `resetValve` is refused while the supply is not sensed
+  (and when the valve is not in fault); otherwise one close pulse, recorded closed, and the held blocks resume by
+  their schedules' own clock (`watering_resumed` cause `valve_reset`, or `run_cut_short` + `watering_not_finished`
+  `valve_fault` once their planned end has passed). No time is added.
+- **The E-stop** (`v3/safety.py`, §7.10). The aux contact (`nc` or `no`; an unreadable input reads as pressed)
+  latches: every motor off, the blocks that drive a motor hold, `estop_pressed`. No command, role or rule clears it:
+  a motor start is refused `refused: the E-stop is latched at the panel`. It clears only at the panel — the input
+  reads released, then a rising edge of the reset input or the panel start's contact (a reset already held down
+  does not count). The latch survives a restart. Held blocks resume by their own clock (`watering_resumed` cause
+  `estop_cleared`; a run whose planned end passed is logged `run_cut_short` + `watering_not_finished` `estop`).
+  Valves may still close and be reset while it is latched.
+- **Power sense** (§7.8). `power_cut` / `power_restored` come from the mains (and UPS) sense inputs only — the clock
+  coming good no longer raises `power_restored`. A mains cut interrupts every running run and switches motors off,
+  then the continuous valves; a latching valve stays where it is. 30 s after the power is back (fixed) each run
+  resumes for the time it had left inside its window (planned start → planned end + its `startWindowMinutes`),
+  its start actions applied again; a run whose window passed, or that the window cuts, is logged `run_cut_short` —
+  a notice, never `watering_not_finished`. A restart is the same with cause `restart`, 30 s after the boot pass
+  (the runs in progress are kept in the state directory, refreshed every minute while one runs).
+- **The bumpless swap and the instruction switch** (§7.5–7.6), building on 0.3.3's take-over: atomic under the
+  runtime lock, rejected with every piece of state put back when it fails half-way; outputs carried by (card,
+  port) — a valve by its `valve.open` — and nothing written for one that keeps its level; variables by (block
+  key, name), rules by (block key, rule id) when unchanged; the built-ins' state never reset; running schedules
+  carried by (layout, schedule id) across the layout's parts — start kept, end = start + new duration, only the new
+  start actions applied at the switch pass — or, when gone, their old end actions at their planned end. An output
+  no block writes any more keeps its level to the end of the run that set it, or `now` (the handover's `now`, or no
+  run in progress); an output that is off is let go of (`output_released`). The active part is the today-only part
+  of the node's local date, else the every-day one; at the node's local midnight the today-only part ends and runs
+  are carried or ended by the same rule (`instruction_switched`, cause `midnight`).
+- **Pause-first** (§4a, §7.7) — built here for v3: `pauseAutomation {until?, stopAll?, then?, actor}` /
+  `resumeAutomation {actor}`. While running, a command on an output a block writes is refused `automation_running`;
+  an output no block writes is switched directly (with `minutes`, timed on the node). While paused the instruction
+  parts and the ordinary rule slots wait, the built-ins and the interlock slots run; resume runs the waiting end
+  actions, re-applies the running schedules' start actions, switches off what was left on by hand (pump first) and
+  restarts the ordinary rules as after a program load. A timed pause resumes on the node's clock.
+- **Commands on a v3 node:** `resetValve`, `pauseAutomation`, `resumeAutomation`; `setPower` / `setPortValue` name a
+  valve by `valve.open`; `runPlot`, `stopPlot` and `setVariable` are refused. A port test on a line the v3 program
+  uses is refused as busy (a guard or a valve driver owns it). The node's own check (RBAC-01) sees every card port
+  plus each valve's logical `valve.open`.
+- **Heartbeat** (functions.yaml 1.11.0): `capabilities.blockLanguage` 3, and while a v3 bundle runs `safety`
+  {estop, power}, `valves`, `guards`, `held`, `automation` and the active instruction part per layout. The built-ins'
+  events (`valve_fault`, `valve_reset`, `estop_pressed`, `estop_cleared`, `guard_tripped`, `power_cut`,
+  `power_restored`, `watering_resumed`, `watering_not_finished`, `instruction_switched`) go out with source `node`;
+  `CloudSink.event` gained the `source` argument. A command's `actor` becomes the events' Author with the node's own
+  `at`.
+
+Where the contract left room, the agent does this (each is in the code, in words, where it happens):
+a guard reports itself tripped for as long as its lockout runs (nothing else would ever clear it); a baseline under
+0.1 A is not learnt (a motor that draws nothing is not running — the next run learns); motors stay off from a mains
+cut until the 30 s resume (and for the 30 s after a restart with runs to resume); the ordinary rule slots restart as
+after a program load when runs resume after a cut (found while testing: with a latching valve open through the cut,
+"a valve is open" never went false and the pump never restarted — its test fails without the fix); a run resumed
+while its part holds (a latching valve in FAULT after an unclean boot) is announced when the hold clears, not
+before; after a restart every output starts off (a latching valve known open gets one close pulse); a valve reset
+when it is not in fault is refused.
+
+Not covered — contract gaps reported with this version: a v3 card's live values (on/off, current) have no message of
+their own (the v1 `variables` message carried AAB variables, and v3 has none); data cards (§4b) are not built in
+this agent; how a `setPower` names a valve card in v3 (`valve.open` here); a block suspended by the backend reaches
+the node as a recompile, so its switch is announced with cause `confirmed`; port ids (DI3) are not in the bundle,
+so refusals name the card and its port; `three_or_two_phase` motors are judged as three phase; an AI phase-sense
+input counts as present when non-zero. The bench page and its physics (`blocks.simulated_io`) and the simulator CLI
+still drive language-1 bundles only.
+
+Found on the way, not changed: `--offline` still posts the one-shot hardware report and the program ack over HTTPS,
+and the default ingress URL is the production one.
+
+93 tests in `tests/test_v3_*.py` (a fake I/O, a SimClock, no hardware): the golden vectors of
+`contracts/programs/vectors` run through the runtime in 1 s passes — `instruction-switch.json` (adding Valve 2 while
+Valve 1 runs: the motor and Valve 1 never stop), `rule-edit-swap.json`, `rewire-swap.json` — with both bundles of
+`two-node-layout.json`, the cross-node cases of `cross-node-refused.json` and the field box side of the rewire; one
+test file per built-in; and every event the runtime sends validated against `event.schema.json` with AJV (when
+`AJV_PATH` is set). `main()` was driven offline with a persisted v3 `program.json`.
+
 ## 0.3.3 (unreleased)
 
 A new version rather than more of 0.3.2: 0.3.2 (cb03e4b) is already on `main` as its own
