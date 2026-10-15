@@ -6,6 +6,57 @@ A new version rather than more of 0.3.2: 0.3.2 (cb03e4b) is already on `main` as
 build, and the OTA path tells builds apart by their version string. Neither is tagged;
 `/config/agent` still pins 0.3.1.
 
+**Fix — every command ended `timeout` although the node switched (seen in prod 2026-10-15).**
+The backend learns what became of a command only from `telemetryIngress` over HTTPS
+(`commandAck` → `handleCommandAck`); nothing consumes the MQTT status topic (Cloud Functions
+cannot subscribe). The agent acked over MQTT only — `HttpReporter.report_command_ack` existed
+and nothing called it — so `checkCommandTimeouts` marked every `/assetCommands` doc `timeout`
+a minute after it was queued. Now (`command_acks.py`):
+
+- every ack, from every call site (`command_executor.py`, `main.py`, `ports/links.py`), still
+  goes through `AgalOneMqttClient.publish_command_ack`, which hands it to its **ack sink** — a
+  `CommandAcks`, set in `main.py` — whether MQTT is connected or not, and still publishes it on
+  the status topic when connected (harmless; a future broker consumer may use it);
+- `CommandAcks` posts from its own thread through `report_command_ack` (`{type: "commandAck",
+  payload: {nodeUid, commandId, status, appliedValue?, error?}}`, with the node's
+  `Authorization: Bearer`). A command is carried out, and the MQTT loop goes on, while its ack
+  is on the way;
+- **what is posted** — the ingress allows 1000 requests per node per hour, shared with
+  heartbeats, telemetry, card variables and alerts, so a command costs at most two posts: the
+  final `completed` / `failed` always; `acknowledged` after a 0.5 s hold, unless a later ack of
+  the command is queued by then. A switch that completes at once costs one post; a slow command
+  (a port-test pulse, a bus scan) two, and its `acknowledged` keeps it from timing out while it
+  runs (the sweep only times out `queued` / `sent`). `executing` after an `acknowledged` tells
+  the backend nothing new and stays on MQTT; without one (the receipt ack of an OTA update) it
+  is posted;
+- **in order per command**: an ack waits while an earlier ack of its command is queued, and an
+  intermediate ack with a later one queued behind it is not posted. Commands do not wait on each
+  other's retries;
+- **retries**: when the ingress is not reached or answers 408, 429 or 5xx, a final ack stays
+  queued and is retried with back-off (1 s doubling to 30 s; 60 s after a 429) for 5 minutes,
+  then given up with an error in the log (the command stays `timeout`); an intermediate ack
+  gets 3 tries. While the ingress is unreachable or rate-limited every ack waits out the
+  back-off. Any other 4xx is never going to be accepted and is not retried. On a clean stop each
+  waiting ack gets one more try, for 3 s at most;
+- **bounded**: an `acknowledged` / `executing` that arrives while 32 acks wait is not queued; a
+  final ack always is, up to 256 — there the oldest waiting intermediate ack makes room, and only
+  when every waiting ack is final is the oldest given up, logged;
+- **boot reconciliation** acks (`boot_<assetId>`) stay on MQTT, as before: they have no command
+  document, the backend ignores them, and posting the whole boot state would spend the budget
+  for nothing.
+
+`report_command_ack` now returns the HTTP status (None when the ingress was not reached), so a
+refusal is told from an outage. 20 tests in `tests/test_command_acks.py`, with a fake reporter
+and no network. `main()` was also driven with a fake broker and a fake ingress: a `setPower`
+posted one `commandAck` `completed` with `appliedValue` 1 and the node's token, with MQTT up
+and with MQTT down, and the MQTT callback returned in under 5 ms.
+
+**What this does not cover — the backend half.** `handleCommandAck` updates whichever
+`/assetCommands` doc the `commandId` names and echoes its value onto that doc's asset without
+checking that the posting node is the command's node, and `TELEMETRY_AUTH_ENFORCE` is still
+false (`verifyNodeAuth` checks a token only when one is presented). The agent always presents
+its token; the node check belongs in the backend.
+
 **Fix — a program reload switched every running output off.** The cloud recompiles the whole
 node program on every block, card or link write and the node reloads it. `compile` rebuilt
 every variable at its default while the output flush compared against what it had last

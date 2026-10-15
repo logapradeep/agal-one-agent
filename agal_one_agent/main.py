@@ -17,6 +17,7 @@ from .telemetry_uploader import TelemetryUploader
 from .live_cadence import LiveCadenceController
 from .heartbeat import HeartbeatPublisher
 from .http_reporter import HttpReporter
+from .command_acks import CommandAcks
 from . import boot_reconciler
 from .sentry_setup import init_sentry
 from .sensors import (
@@ -89,6 +90,15 @@ def main():
     # default when that's empty.
     http_reporter = HttpReporter(config.node.uid, auth_token=config.node.auth_token,
                                  base_url=config.telemetry.ingress_url)
+
+    # Command acks: the backend reads them only from telemetryIngress over HTTPS (nothing
+    # consumes the MQTT status topic), so every publish_command_ack — from every call site — is
+    # also queued here and posted from the ack worker, in order per command, never blocking the
+    # command or the MQTT loop (command_acks.py has what is posted and why).
+    command_acks = None
+    if not args.offline:
+        command_acks = CommandAcks(http_reporter)
+        mqtt_client.set_ack_sink(command_acks.submit)
 
     # ---- Node linking (ADR-024): one GPIO path for every Linux board, and the
     # report of what this board is and has. Nothing here names a board.
@@ -664,6 +674,8 @@ def main():
         if cloud_sink is not None:
             cloud_sink.flush(timeout=3.0)
             cloud_sink.close()
+        if command_acks is not None:
+            command_acks.close(timeout=3.0)  # one more try for each ack still waiting
         telemetry.stop()
         # Final drain attempt so a clean shutdown doesn't strand buffered rows.
         try:

@@ -23,6 +23,14 @@ class AgalOneMqttClient:
         self._on_reconnect: Optional[Callable[[], None]] = None
         self._connected = False
         self._was_connected = False  # Tracks if we ever connected before
+        # Where every command ack also goes (main.py: command_acks.CommandAcks, the HTTPS leg).
+        self._ack_sink: Optional[Callable[[str, str, Optional[object], Optional[str]], None]] = None
+
+    def set_ack_sink(self, sink: Optional[Callable[[str, str, Optional[object], Optional[str]], None]]) -> None:
+        """Every command ack is also handed to ``sink(command_id, status, applied_value, error)``,
+        connected or not. The backend reads acks only from telemetryIngress over HTTPS: nothing
+        consumes the status topic (command_acks.py). The sink must not block."""
+        self._ack_sink = sink
 
     def set_command_handler(self, handler: Callable[[dict], None]) -> None:
         self._on_command = handler
@@ -293,6 +301,14 @@ class AgalOneMqttClient:
         applied_value: Optional[object] = None,
         error: Optional[str] = None,
     ) -> None:
+        """The one call for a command ack, from every site. It goes to the ack sink (the HTTPS
+        leg the backend reads — whether MQTT is connected or not) and, when connected, to the
+        status topic (no consumer today; harmless, a future broker consumer may use it)."""
+        if self._ack_sink is not None:
+            try:
+                self._ack_sink(command_id, status, applied_value, error)
+            except Exception as e:  # noqa: BLE001 — an ack sink failure never fails the command
+                logger.error("command ack %s %s not queued for the ingress: %s", command_id, status, e)
         if not self._client or not self._connected:
             return
 
@@ -306,7 +322,7 @@ class AgalOneMqttClient:
         if error:
             payload["error"] = error
 
-        # Publish ack on status topic (backend listens for commandAck type)
+        # Same {type, payload} envelope the ingress takes (the HTTPS leg posts this very payload).
         self._client.publish(
             self.config.status_topic,
             json.dumps({"type": "commandAck", "payload": payload}),

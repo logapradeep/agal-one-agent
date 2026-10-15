@@ -169,7 +169,11 @@ class HttpReporter:
         return self._post({"type": "telemetry_batch", "payload": payload})
 
     def report_command_ack(self, command_id: str, status: str,
-                           applied_value=None, error: str = None) -> None:
+                           applied_value=None, error: str = None) -> Optional[int]:
+        """POST a command ack — the only way the backend learns what became of a command
+        (nothing consumes the MQTT status topic). Called from ``command_acks.CommandAcks``'s
+        worker, never on a command's own thread. Returns the HTTP status (200 = recorded), or
+        None when the ingress was not reached, so the caller can tell a retry from a refusal."""
         payload = {
             "nodeUid": self.node_uid,
             "commandId": command_id,
@@ -180,7 +184,7 @@ class HttpReporter:
         if error:
             payload["error"] = error
 
-        self._post({"type": "commandAck", "payload": payload})
+        return self._post_status({"type": "commandAck", "payload": payload})
 
     def report_firmware_event(self, phase: str, from_version: str = None,
                               to_version: str = None, command_id: str = None,
@@ -251,6 +255,11 @@ class HttpReporter:
         """POST an envelope to the ingress. Returns True iff the server replied
         200 — the durable batch path relies on this to prune only on confirmed
         delivery; the fire-and-forget callers ignore the return value."""
+        return self._post_status(data) == 200
+
+    def _post_status(self, data: dict) -> Optional[int]:
+        """POST an envelope to the ingress: the HTTP status of the answer, or None
+        when the ingress was not reached (also kept in ``last_status``)."""
         try:
             body = json.dumps(data).encode("utf-8")
             req = urllib.request.Request(
@@ -263,14 +272,15 @@ class HttpReporter:
                 self.last_status = resp.status
                 if resp.status != 200:
                     logger.warning("HTTP report failed: %d", resp.status)
-                    return False
-                return True
+                return resp.status
         except urllib.error.HTTPError as e:
             self.last_status = e.code
             logger.warning("HTTP report error: %s", e)
+            return e.code
         except urllib.error.URLError as e:
             self.last_status = None
             logger.warning("HTTP report error: %s", e)
         except Exception as e:
+            self.last_status = None
             logger.warning("HTTP report unexpected error: %s", e)
-        return False
+        return None
