@@ -21,9 +21,10 @@ protection trip cuts the relay first and its report follows.
 - ``eventId`` (20 random ``[A-Za-z0-9]``) is minted when the event is raised and is the same on
   every retry: the backend writes ``/events/{nodeUid}_{eventId}`` once, so a retry of an event
   that did land changes nothing and rings no phone twice.
-- ``timestamp`` is when it was raised, by the node's clock; while that clock is not trusted
-  (``blocks/clock.py`` ``clock_ok()`` false — no NTP sync yet, no RTC) the event says
-  ``timestampUncertain: true`` and the backend files it at receive time.
+- ``timestamp`` is when it was raised: by the backend's time from its HTTPS answers when the node has
+  seen one (``server_time.py``; v1.14.2 review), else by the node's clock; while neither is trusted
+  (no backend answer yet, ``blocks/clock.py`` ``clock_ok()`` false — no NTP sync yet, no RTC) the
+  event says ``timestampUncertain: true`` and the backend files it at receive time.
 - In order, one at a time: an event not delivered (the ingress not reached, 408, 429, 5xx) is
   tried again after a back-off, and the events behind it wait — for up to ``DEADLINE_S`` (24 h:
   a dry-run trip during a long outage still arrives); then it is given up with an error in the
@@ -99,6 +100,7 @@ class NodeEvents:
     BURST = 30
 
     def __init__(self, reporter, *, clock_ok: Optional[Callable[[], bool]] = None,
+                 trusted_now: Optional[Callable[[], Optional[int]]] = None,
                  backoff_s: Optional[tuple] = None, rate_limited_s: Optional[float] = None,
                  deadline_s: Optional[float] = None, cap: Optional[int] = None,
                  budget_per_hour: Optional[float] = None, burst: Optional[int] = None,
@@ -108,6 +110,7 @@ class NodeEvents:
             from .blocks.clock import SystemClock
             clock_ok = SystemClock().clock_ok
         self.clock_ok = clock_ok
+        self.trusted_now = trusted_now
         self.now_ms = now_ms or (lambda: int(time.time() * 1000))
         self.backoff_s = tuple(self.BACKOFF_S if backoff_s is None else backoff_s)
         self.rate_limited_s = self.RATE_LIMITED_S if rate_limited_s is None else rate_limited_s
@@ -137,11 +140,21 @@ class NodeEvents:
         if not isinstance(event, dict) or not event.get("type"):
             logger.warning("node event without a type not reported: %r", event)
             return None
-        try:
-            uncertain = not bool(self.clock_ok())
-        except Exception:  # noqa: BLE001 — a clock probe failure: say the time may be off
-            uncertain = True
-        item = _Event(_jsonable(dict(event)), new_event_id(), int(self.now_ms()), uncertain, time.monotonic())
+        at: Optional[int] = None
+        if self.trusted_now is not None:
+            try:
+                at = self.trusted_now()
+            except Exception:  # noqa: BLE001
+                at = None
+        if at is not None:
+            uncertain = False
+        else:
+            try:
+                uncertain = not bool(self.clock_ok())
+            except Exception:  # noqa: BLE001 — a clock probe failure: say the time may be off
+                uncertain = True
+            at = self.now_ms()
+        item = _Event(_jsonable(dict(event)), new_event_id(), int(at), uncertain, time.monotonic())
         with self._cond:
             if self._closed:
                 logger.warning("node event %s after stop: not reported", event.get("type"))
@@ -284,13 +297,21 @@ class NodeEvents:
 
 
 def wire_node_events(mqtt_client, reporter, *, offline: bool,
-                     clock_ok: Optional[Callable[[], bool]] = None) -> Optional[NodeEvents]:
+                     clock_ok: Optional[Callable[[], bool]] = None, server_time=None) -> Optional[NodeEvents]:
     """Give the MQTT client its event sink: every ``publish_event`` is also posted to the ingress
-    as a sensor_event (main.py calls this; tests/test_node_events.py checks that it does). Offline
+    as a sensor_event (main.py calls this; tests/test_node_events.py checks that it does). An event's
+    time is the backend's (``server_time``) when known, else the node's clock (``clock_ok``). Offline
     (no cloud) nothing is wired and None is returned."""
     if offline:
         return None
-    events = NodeEvents(reporter, clock_ok=clock_ok)
+    trusted = None
+    if server_time is not None:
+        if clock_ok is None:
+            from .blocks.clock import SystemClock
+            clock_ok = SystemClock().clock_ok
+        from .server_time import trusted_now
+        trusted = trusted_now(server_time, clock_ok)
+    events = NodeEvents(reporter, clock_ok=clock_ok, trusted_now=trusted)
     mqtt_client.set_event_sink(events.submit)
     return events
 

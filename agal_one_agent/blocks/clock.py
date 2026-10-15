@@ -12,6 +12,7 @@ DS3231 — _audit/98 §5, R-21). While it is False the runtime holds schedules
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import sys
@@ -33,13 +34,16 @@ class Clock:
 
 
 class SystemClock(Clock):
-    """Real clocks. ``clock_ok`` is probed at most every ``probe_interval`` seconds."""
+    """Real clocks. ``clock_ok`` is probed at most every ``probe_interval`` seconds — and on its
+    first call (agent 0.3.4 review: the last probe started at 0.0 on the monotonic clock, which on
+    Linux counts from boot, so for the first minute after boot it answered "trusted" unprobed —
+    the minute right after a power cut, when the clock is most likely wrong)."""
 
     def __init__(self, probe_interval: float = 60.0, assume_ok: Optional[bool] = None):
         self._probe_interval = probe_interval
         self._assume_ok = assume_ok
-        self._last_probe = 0.0
-        self._ok = True
+        self._last_probe = -math.inf
+        self._ok = False
 
     def monotonic(self) -> float:
         return time.monotonic()

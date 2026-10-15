@@ -140,8 +140,14 @@ def main():
     # base_url comes from the backend-generated config (telemetry.ingress_url,
     # v0.1.6 config-driven region); HttpReporter falls back to its module
     # default when that's empty.
+    # The backend's time, from the Date of every HTTPS answer (server_time.py; contracts v1.14.2
+    # review, command-signing.md §5.4): the command gate checks a command's age against it, so a
+    # board whose clock is wrong after a power cut neither carries out a captured old command nor
+    # refuses a fresh one.
+    from .server_time import ServerTime
+    server_time = ServerTime()
     http_reporter = HttpReporter(config.node.uid, auth_token=config.node.auth_token,
-                                 base_url=config.telemetry.ingress_url)
+                                 base_url=config.telemetry.ingress_url, server_time=server_time)
 
     # Command acks: the backend reads them only from telemetryIngress over HTTPS (nothing
     # consumes the MQTT status topic), so every publish_command_ack — from every call site — is
@@ -152,22 +158,24 @@ def main():
 
     # Every message on the command topic is checked before anything carries it out (contracts
     # v1.14.2, command_signing.py): signed for THIS node with its auth_token, never seen before,
-    # not stale. One broker login is shared by every board, so the topic name alone separates
-    # nothing. A refused message is logged and, for a tracked id, answered through the ack queue
-    # above; the replay set lives in the state directory. tests/test_command_signing.py checks
+    # not stale on the backend's time. One broker login is shared by every board, so the topic name
+    # alone separates nothing. A refused message is logged and, when it is a bad_signature or stale
+    # for a tracked id, answered through the ack queue above; the replay set lives in the state
+    # directory. A node without a token carries out nothing. tests/test_command_signing.py checks
     # that main() makes this call.
     from .blocks.clock import SystemClock
     from .blocks.sync import DEFAULT_STATE_DIR
     agent_clock = SystemClock()
     command_gate = wire_command_gate(mqtt_client, http_reporter, token=config.node.auth_token,
                                      state_dir=config.blocks.state_dir or DEFAULT_STATE_DIR,
-                                     offline=args.offline, clock_ok=agent_clock.clock_ok)
+                                     offline=args.offline, clock_ok=agent_clock.clock_ok,
+                                     server_time=server_time)
 
     # Node events (protection trips, the block runtime's, buffer_overflow) reach the backend only
     # over HTTPS too: every publish_event is also queued here and posted as a sensor_event with
     # the node's token, in order, retried (node_events.py). tests/test_node_events.py checks it.
     node_events = wire_node_events(mqtt_client, http_reporter, offline=args.offline,
-                                   clock_ok=agent_clock.clock_ok)
+                                   clock_ok=agent_clock.clock_ok, server_time=server_time)
     if command_gate is not None and command_gate.protected:
         logger.info("Commands on %s are checked: signed for this node (hs256-v1), not replayed, not stale",
                     config.mqtt.commands_topic)

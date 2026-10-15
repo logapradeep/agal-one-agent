@@ -319,8 +319,8 @@ def test_main_wires_the_node_events(tmp_path, monkeypatch, offline):
                                "telemetry": {"ingress_url": "https://ingress.example/telemetryIngress"}}))
     seen = {}
 
-    def wire(mqtt_client, reporter, *, offline, clock_ok=None):
-        seen.update(mqtt=mqtt_client, reporter=reporter, offline=offline, clock_ok=clock_ok)
+    def wire(mqtt_client, reporter, *, offline, clock_ok=None, server_time=None):
+        seen.update(mqtt=mqtt_client, reporter=reporter, offline=offline, clock_ok=clock_ok, server_time=server_time)
         raise _WiredHere
 
     monkeypatch.delenv("SENTRY_DSN", raising=False)

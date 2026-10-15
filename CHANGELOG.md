@@ -17,9 +17,10 @@ very object it verified):
   `unsigned`; a `sig` that is not 43 base64url characters, another `sigAlg`, a `sigTs` that is not
   a safe integer, no usable `commandId`, no canonical form, or a MAC that does not match
   (`hmac.compare_digest`) → `bad_signature`; an id accepted before → `replayed`; below the replay
-  floor, or — while the clock is trusted (`blocks/clock.py` `clock_ok()`: NTP synced or an RTC) —
-  signed more than 10 minutes ago or more than 2 minutes ahead → `stale`. A refused copy never
-  burns an id: a forged copy carrying a real command's id does not stop the real one.
+  floor, no trusted now, or signed more than 10 minutes before / 2 minutes after the node's trusted
+  now → `stale` (review, below: the node's now is the backend's time from its HTTPS answers, else an
+  NTP / RTC clock — the time check is never skipped). A refused copy never burns an id: a forged
+  copy carrying a real command's id does not stop the real one.
 - **canonical JSON as JavaScript writes it**: keys sorted by UTF-16 code units at every level,
   `JSON.stringify`'s string escapes (Tamil, ₹, U+2028 and emoji raw), and every number as
   ECMAScript writes the double it parses to (`1.0` → `1`, `1E-7` → `1e-7`, `1e21` → `1e+21`,
@@ -34,18 +35,23 @@ very object it verified):
   command is still carried out (remembered in memory, logged as an error) — refusing would leave
   the node unable to take the command that switches the pump off.
 - **every refusal is logged** (reason, commandId, why — never the token; the type only when the
-  MAC verified). A refused 20-character auto-id is answered with a failed command ack carrying
-  `reason` and `error` "refused: <reason> — …" through the 0.3.3 HTTPS ack queue, at most 20 in any
-  10 minutes (a flood of forged messages must not spend the node's 1000-an-hour ingress budget); a
-  prefixed id (`sync_…`, `scan_bus_…`, `test_port_…`) has no document and is only logged. A refusal
-  ack never supersedes the real command's own `acknowledged` in the queue. A `stale`
-  `firmwareUpdate` (its MAC verified, so its fields are the backend's) is also reported as
+  MAC verified). A `bad_signature` or `stale` refusal of a 20-character auto-id is answered with a
+  failed command ack carrying `reason` and `error` "refused: <reason> — …" through the 0.3.3 HTTPS
+  ack queue — at most 5 `bad_signature` and 20 `stale` answers in any 10 minutes, counted apart (a
+  flood of forged messages must not spend the node's 1000-an-hour ingress budget, nor crowd out a
+  real command's answer); `unsigned` and `replayed` are only logged (review); a prefixed id
+  (`sync_…`, `scan_bus_…`, `test_port_…`) has no document and is only logged. A refusal ack never
+  supersedes the real command's own `acknowledged` in the queue. A `firmwareUpdate` refused
+  `stale` by the time check (its MAC verified, so its fields are the backend's) is also reported as
   `firmware_update {phase: failed, commandId, toVersion, rolloutId, error}`, once per command, so
-  `otaStatus` does not stay `updating`; its ack stays on MQTT, as every firmwareUpdate ack does
-  (its id is a `/nodeCommands` doc, which commandAck does not track).
-- **a node with an empty `auth_token` checks nothing** (command-signing.md §5.5, the contract's
-  choice): it carries out every message as before and logs once, as an error at start, that its
-  commands are NOT verified. Every node made by `createNode` or the join command has a token.
+  `otaStatus` does not stay `updating` — not one below the replay floor (a replayed capture,
+  review); its ack stays on MQTT, as every firmwareUpdate ack does (its id is a `/nodeCommands`
+  doc, which commandAck does not track).
+- **a node with an empty `auth_token` carries out nothing** from its command topic
+  (command-signing.md §5.5, review): it can check nothing, every message is refused and logged — at
+  start and at most once a minute — "no token: join this node again". Every node made by
+  `createNode`, the join command or `provision` has a token; the backend never publishes to a node
+  it holds none for.
 
 **Release order: never put 0.3.4 on a node before the backend that signs is deployed** — a 0.3.4
 node refuses every unsigned command, `firmwareUpdate` included, and answers each tracked one
@@ -93,6 +99,39 @@ main() wiring. Mutation-checked: Python's key order, `repr` numbers, no clock ch
 refused copy remembered, no MAC compare, no persisted line, no cap, the broker username as
 nodeUid, no event sink, the gate not wired, uppercase `\u` escapes — each fails the tests. Not run
 on a Pi, against the broker, or against a backend that signs (not built yet).
+
+**Review fixes (contracts v1.14.2 review, same release).** Checked against the code; each held:
+
+- **No trusted now → `stale`; the node's now is the backend's** (`server_time.py`, command-signing.md
+  §5.4). As first written, the time check was skipped while `clock_ok()` was false — every boot of a
+  Pi until NTP syncs — so a signed command captured from the topic and never carried out (sent while
+  the node was offline, or before it ran 0.3.4) stayed executable for 7 days, and after a fresh or
+  damaged replay set for ever; a `setPower` ON that timed out hours earlier could run at the next
+  boot. Now `HttpReporter` hands the `Date` of every HTTPS answer from the backend (telemetryIngress,
+  getProgram, reportHardware, getBootState — `https://` only, so TLS authenticates it; error answers
+  too) to a `ServerTime`, and the gate's now is that plus the monotonic time since; before the first
+  answer, the wall clock when `clock_ok()`; otherwise none, and every command is refused `stale` "no
+  trusted time yet" (it burns no id; the answer to its own refusal ack gives the node the time). The
+  backend's time comes first even with NTP: a Pi 5 has `/dev/rtc0` but no battery. Node events take
+  the backend's time too when the clock is not trusted (`timestampUncertain` only when neither is).
+- **`clock_ok()` probes on its first call** (`blocks/clock.py`): the last probe started at 0.0 on a
+  monotonic clock that counts from boot, so for the first minute after boot it said "trusted"
+  without asking — the minute right after a power cut. `/dev/rtc0` still counts as an RTC (the block
+  runtime's schedule hold depends on it on DS3231 kits); the gate no longer relies on it once the
+  backend has answered.
+- **No token → nothing carried out** (above). As first written a tokenless node carried out
+  everything — while the backend's `provision` / `getProvisionScript` wrote `auth_token: ""` for every
+  joined node (fixed there too).
+- **`unsigned` / `replayed` refusals are not posted; `bad_signature` (5) and `stale` (20) budgets
+  apart** (above): junk with made-up 20-character ids no longer spends the answers a real refusal needs.
+- **A replayed old `firmwareUpdate` is not reported as this node's update failing** (above): one below
+  the replay floor overwrote `otaStatus` and a finished rollout's record (the backend now also takes a
+  `firmware_update` only with the token and for the node's current update).
+
+Verified: `tests/test_command_signing.py` (now with vectors 1.1.0 — 33 verifying sequences, a step
+may carry its own `clockTrusted` / `nowMs`), `tests/test_server_time.py` (13: the Date reference,
+http and unreadable Dates ignored, the order backend → trusted wall clock → none, every reporter
+call and an error answer feed it, the first probe, node events). Full suite 685 passed.
 
 **Fix — a firmware update needed the board's terminal (founder, 2026-10-15: "once the rpi is
 linked, there should not be a need to do anything on the pi terminal especially the updates").**

@@ -16,22 +16,27 @@ and a port of ``nodes/reference/signing.mjs`` — the shared vectors
   whitespace, strings escaped as ``JSON.stringify`` escapes them, and every number written as
   ECMAScript writes the IEEE 754 double it parses to — which ``json.dumps`` does not (``1.0``,
   ``1e-07``, ``-0.0``).
-- ``verify_command`` (§5.2): the six checks in the reference's order — no token: unchecked
-  (legacy, §5.5); no ``sig``: ``unsigned``; shape or MAC (``hmac.compare_digest``):
-  ``bad_signature``; an id accepted before: ``replayed``; below the replay floor, or — with a
-  trusted clock — more than 10 minutes old or 2 minutes ahead: ``stale``. Only an accepted command
-  is remembered; a refused copy never burns an id.
+- ``verify_command`` (§5.2): the six checks in the reference's order — no token: refused
+  ``bad_signature`` (§5.5: it can check nothing, so it carries out nothing); no ``sig``:
+  ``unsigned``; shape or MAC (``hmac.compare_digest``): ``bad_signature``; an id accepted before:
+  ``replayed``; below the replay floor, no trusted now, or more than 10 minutes old or 2 minutes
+  ahead of it: ``stale``. Only an accepted command is remembered; a refused copy never burns an id.
 - ``ReplayStore`` (§5.3): the accepted ids with their ``sigTs``, aged 7 days on the BACKEND's
   clock (``highWater``), at most 10,000 (``evictedFloor``), persisted in the state directory
   BEFORE the command is carried out — so a restart, or a crash halfway, followed by a
   redelivery does not carry it out twice.
 - ``CommandGate``: the MQTT boundary (``mqtt_client._on_message``). It hands the handler the very
   object it verified, logs every refusal, answers a refused tracked id with a failed command ack
-  carrying ``reason`` (at most 20 in 10 minutes), and reports a ``stale`` ``firmwareUpdate`` as a
-  failed ``firmware_update`` too.
+  carrying ``reason`` — ``bad_signature`` (at most 5 in 10 minutes) and ``stale`` (at most 20), never
+  ``unsigned`` or ``replayed`` — and reports a ``firmwareUpdate`` refused by the time check (not the
+  floor) as a failed ``firmware_update`` too. Its "now" is ``server_time.trusted_now``: the
+  backend's time from its HTTPS answers, else an NTP / RTC wall clock, else none (§5.4).
 
-A node whose ``auth_token`` is empty cannot check anything: it carries out every message as agents
-up to 0.3.3 did, and says so once, loudly, at start (§5.5 — the contract's choice).
+A node whose ``auth_token`` is empty cannot check anything, so it carries out NOTHING from its
+command topic (§5.5, v1.14.2 review — agents up to 0.3.3, and 0.3.4 as first written, carried such
+messages out): every message is refused and logged, at start and at most once a minute — "no token:
+join this node again". Nothing legitimate is lost: the backend never publishes to a node it holds no
+token for.
 """
 
 from __future__ import annotations
@@ -254,11 +259,11 @@ class Verdict:
     had a usable one, ``command_id``. ``message`` is the parsed message when its MAC verified (a
     ``replayed`` or ``stale`` one: its fields are the backend's)."""
 
-    __slots__ = ("accepted", "command", "verified", "reason", "command_id", "detail", "message")
+    __slots__ = ("accepted", "command", "verified", "reason", "command_id", "detail", "message", "window")
 
     def __init__(self, accepted: bool, *, command: Optional[dict] = None, verified: bool = False,
                  reason: Optional[str] = None, command_id: Optional[str] = None, detail: str = "",
-                 message: Optional[dict] = None):
+                 message: Optional[dict] = None, window: bool = False):
         self.accepted = accepted
         self.command = command
         self.verified = verified
@@ -266,6 +271,9 @@ class Verdict:
         self.command_id = command_id
         self.detail = detail
         self.message = message
+        #: A ``stale`` refused by check 6 — the time window, or no trusted now — not by the floor
+        #: (check 5, a capture at least 7 days older than a command already carried out).
+        self.window = window
 
     def __repr__(self) -> str:
         if self.accepted:
@@ -278,8 +286,10 @@ def verify_command(wire: Any, token: Optional[str], state: ReplayState, *,
                    now_ms: Optional[int] = None) -> Verdict:
     """§5 — the reference's ``verifyCommand``. ``wire`` is the message as received (text or bytes)
     or an already-parsed object; ``token`` the node's authToken (empty or None: a node without one,
-    nothing is checked); ``state`` kept across calls. ``clock_trusted`` may be a callable, asked only
-    when a message reaches the clock check. Only an accepted command is remembered."""
+    which refuses everything — §5.5); ``state`` kept across calls. ``clock_trusted`` says whether
+    ``now_ms`` is a trusted now (§5.4; False: none, and a message that reaches check 6 is stale); it
+    may be a callable, asked only when a message reaches that check. Only an accepted command is
+    remembered."""
     msg = wire
     if isinstance(wire, (str, bytes, bytearray)):
         try:
@@ -290,11 +300,12 @@ def verify_command(wire: Any, token: Optional[str], state: ReplayState, *,
         return Verdict(False, reason="bad_signature", detail="not a JSON object")
     command_id = msg.get("commandId") if _command_id_ok(msg.get("commandId")) else None
 
-    def refuse(reason: str, detail: str, verified_message: Optional[dict] = None) -> Verdict:
-        return Verdict(False, reason=reason, command_id=command_id, detail=detail, message=verified_message)
+    def refuse(reason: str, detail: str, verified_message: Optional[dict] = None, window: bool = False) -> Verdict:
+        return Verdict(False, reason=reason, command_id=command_id, detail=detail, message=verified_message,
+                       window=window)
 
     if not isinstance(token, str) or not token:
-        return Verdict(True, command=msg, verified=False)
+        return refuse("bad_signature", "this node holds no token: join it again")
     if "sig" not in msg:
         return refuse("unsigned", "no sig")
     sig = msg["sig"]
@@ -323,12 +334,13 @@ def verify_command(wire: Any, token: Optional[str], state: ReplayState, *,
     if sig_ts < state.floor():
         return refuse("stale", "older than the replay window", msg)
     trusted = clock_trusted() if callable(clock_trusted) else bool(clock_trusted)
-    if trusted:
-        now = int(time.time() * 1000) if now_ms is None else int(now_ms)
-        if now - sig_ts > MAX_AGE_MS:
-            return refuse("stale", "signed more than 10 minutes ago", msg)
-        if sig_ts - now > MAX_AHEAD_MS:
-            return refuse("stale", "signed more than 2 minutes in the future", msg)
+    if not trusted:
+        return refuse("stale", "no trusted time yet", msg, window=True)
+    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    if now - sig_ts > MAX_AGE_MS:
+        return refuse("stale", "signed more than 10 minutes ago", msg, window=True)
+    if sig_ts - now > MAX_AHEAD_MS:
+        return refuse("stale", "signed more than 2 minutes in the future", msg, window=True)
     state.remember(command_id, sig_ts)
     return Verdict(True, command=msg, verified=True)
 
@@ -489,17 +501,26 @@ class CommandGate:
     (``AgalOneMqttClient.publish_command_ack``: the ordered HTTPS queue of command_acks.py, plus
     the status topic). ``firmware_report(command_id=…, to_version=…, rollout_id=…, error=…)`` posts a
     failed ``firmware_update`` (``HttpReporter.report_firmware_event``); it is called off this
-    thread. ``clock_ok`` says whether the wall clock is trusted (``blocks/clock.py``)."""
+    thread. ``trusted_now()`` is the node's trusted now in ms, or None (``server_time.trusted_now``:
+    the backend's time from its HTTPS answers, else an NTP / RTC wall clock — §5.4); without one,
+    ``clock_ok`` and ``now_ms`` make it (the wall clock when ``clock_ok()``)."""
 
-    REFUSAL_ACKS_MAX = 20
+    #: Answers per refusal reason in any REFUSAL_ACKS_WINDOW_S (v1.14.2 review: counted apart — a
+    #: verified MAC is needed for stale, so forged traffic can spend only the bad_signature budget).
+    REFUSAL_ACKS_MAX = {"stale": 20, "bad_signature": 5}
     REFUSAL_ACKS_WINDOW_S = 600.0
+    #: Refusals that are only logged: the backend moves no command for them (functions.yaml
+    #: commandAck), and answering let anyone with the shared login spend the answers with junk ids.
+    LOGGED_ONLY = frozenset({"unsigned", "replayed"})
     FIRMWARE_REPORTED_MAX = 64
+    NO_TOKEN_LOG_EVERY_S = 60.0
 
     def __init__(self, token: str, state: ReplayState, *,
                  ack: Optional[Callable[..., None]] = None,
                  firmware_report: Optional[Callable[..., None]] = None,
                  clock_ok: Optional[Callable[[], bool]] = None,
                  now_ms: Optional[Callable[[], int]] = None,
+                 trusted_now: Optional[Callable[[], Optional[int]]] = None,
                  monotonic: Callable[[], float] = time.monotonic,
                  firmware_report_async: bool = True):
         self.token = token or ""
@@ -511,28 +532,42 @@ class CommandGate:
             clock_ok = SystemClock().clock_ok
         self.clock_ok = clock_ok
         self.now_ms = now_ms or (lambda: int(time.time() * 1000))
+        self._trusted_now = trusted_now
         self.monotonic = monotonic
         self.firmware_report_async = firmware_report_async
         self._lock = threading.Lock()
-        self._refusal_acks: deque[float] = deque()
+        self._refusal_acks: dict[str, deque[float]] = {r: deque() for r in self.REFUSAL_ACKS_MAX}
         self._firmware_reported: deque[str] = deque()
+        self._no_token_logged_at = -math.inf
         # Counters (tests and a debugging session read them).
         self.accepted = 0
         self.refused: dict[str, int] = {r: 0 for r in REFUSAL_REASONS}
         self.refusal_acks_sent = 0
         self.refusal_acks_withheld = 0
         if not self.token:
-            logger.error("node.auth_token is empty: commands on the command topic are NOT verified — anyone with "
-                         "the shared broker login can command this node. Join the node again to give it a token.")
+            self._no_token_logged_at = self.monotonic()
+            logger.error("node.auth_token is empty: this node checks nothing, so it carries out NOTHING from its "
+                         "command topic — no token: join this node again (the join command from the app).")
 
     @property
     def protected(self) -> bool:
         return bool(self.token)
 
+    def trusted_now(self) -> Optional[int]:
+        """The node's trusted now in ms since the epoch (§5.4), or None."""
+        if self._trusted_now is not None:
+            return self._trusted_now()
+        try:
+            ok = bool(self.clock_ok())
+        except Exception:  # noqa: BLE001 — a probe failure: not trusted
+            ok = False
+        return int(self.now_ms()) if ok else None
+
     def admit(self, raw: Union[bytes, str, dict]) -> Optional[dict]:
         with self._lock:
-            verdict = verify_command(raw, self.token, self.state, clock_trusted=self.clock_ok,
-                                     now_ms=self.now_ms())
+            # The node's trusted now (cheap: the backend's time, or a clock probe cached for a minute).
+            now = self.trusted_now()
+            verdict = verify_command(raw, self.token, self.state, clock_trusted=now is not None, now_ms=now)
             if verdict.accepted:
                 self.accepted += 1
                 return verdict.command
@@ -543,22 +578,38 @@ class CommandGate:
 
     def _refused(self, v: Verdict) -> None:
         self.refused[v.reason] = self.refused.get(v.reason, 0) + 1
+        if not self.token:
+            # A node with no token can post nothing either (the ingress takes an ack only with the
+            # node's token): it logs, loudly, at most once a minute.
+            t = self.monotonic()
+            if t - self._no_token_logged_at >= self.NO_TOKEN_LOG_EVERY_S:
+                self._no_token_logged_at = t
+                logger.error("command refused: no token: join this node again — commandId %s not carried out "
+                             "(every message on the command topic is refused until the node has a token)",
+                             v.command_id or "(none)")
+            return
         # Only a message whose MAC verified (replayed, stale) has a type worth naming: the type of an
         # unsigned or forged one could be anyone's.
         verified_type = v.message.get("type") if v.message is not None else None
         what = f" {verified_type!s:.40}" if verified_type is not None else ""
         logger.warning("command refused: %s%s — commandId %s — %s (not carried out)",
                        v.reason, what, v.command_id or "(none)", v.detail)
+        if v.reason in self.LOGGED_ONLY:
+            return  # never posted (§6): the backend moves no command for it
         tracked = v.command_id is not None and TRACKED_COMMAND_ID.fullmatch(v.command_id) is not None
         firmware_msg = verified_type == "firmwareUpdate"
-        firmware = (v.reason == "stale" and firmware_msg and self.firmware_report is not None
+        # A firmwareUpdate refused by the TIME check is a real update arriving late (or before the node
+        # had the time): the node's otaStatus must not stay "updating". One below the floor is a
+        # capture replayed (v1.14.2 review): not reported.
+        firmware = (v.reason == "stale" and v.window and firmware_msg and self.firmware_report is not None
                     and v.command_id not in self._firmware_reported)
         if not tracked and not firmware:
             return  # a prefixed id (sync_…, scan_bus_…, test_port_…) has no document; nothing to answer
-        if not self._spend():
+        if not self._spend(v.reason):
             self.refusal_acks_withheld += 1
-            logger.warning("command refused: %s — no answer posted (%d refusals answered in the last %d minutes)",
-                           v.command_id, self.REFUSAL_ACKS_MAX, int(self.REFUSAL_ACKS_WINDOW_S // 60))
+            logger.warning("command refused: %s — no answer posted (%d %s refusals answered in the last %d minutes)",
+                           v.command_id, self.REFUSAL_ACKS_MAX.get(v.reason, 0), v.reason,
+                           int(self.REFUSAL_ACKS_WINDOW_S // 60))
             return
         error = f"refused: {v.reason} — {v.detail}"
         if tracked and self.ack is not None:
@@ -589,23 +640,28 @@ class CommandGate:
         except Exception as e:  # noqa: BLE001
             logger.warning("command refused: the firmware_update failed report did not go out: %s", e)
 
-    def _spend(self) -> bool:
-        """At most REFUSAL_ACKS_MAX answers in any REFUSAL_ACKS_WINDOW_S: a flood of forged messages must
-        not spend the node's ingress budget (1000 an hour, shared with everything it reports)."""
+    def _spend(self, reason: str) -> bool:
+        """At most REFUSAL_ACKS_MAX[reason] answers in any REFUSAL_ACKS_WINDOW_S: a flood must not
+        spend the node's ingress budget (1000 an hour, shared with everything it reports), and forged
+        traffic (bad_signature) must not crowd out the stale answers a real command needs."""
+        limit = self.REFUSAL_ACKS_MAX.get(reason, 0)
+        window = self._refusal_acks.setdefault(reason, deque())
         now = self.monotonic()
-        while self._refusal_acks and now - self._refusal_acks[0] >= self.REFUSAL_ACKS_WINDOW_S:
-            self._refusal_acks.popleft()
-        if len(self._refusal_acks) >= self.REFUSAL_ACKS_MAX:
+        while window and now - window[0] >= self.REFUSAL_ACKS_WINDOW_S:
+            window.popleft()
+        if len(window) >= limit:
             return False
-        self._refusal_acks.append(now)
+        window.append(now)
         return True
 
 
 def wire_command_gate(mqtt_client, http_reporter, *, token: str, state_dir: str, offline: bool,
-                      clock_ok: Optional[Callable[[], bool]] = None) -> Optional[CommandGate]:
+                      clock_ok: Optional[Callable[[], bool]] = None,
+                      server_time=None) -> Optional[CommandGate]:
     """Give the MQTT client its gate: every message on the command topic is checked before
-    ``on_command`` (main.py calls this; tests/test_command_signing.py checks that it does). Offline
-    (no MQTT) nothing is wired and None is returned."""
+    ``on_command`` (main.py calls this; tests/test_command_signing.py checks that it does). Its now
+    is the backend's time from ``server_time`` (the reporter's, when none is given), else the wall
+    clock when ``clock_ok()`` (§5.4). Offline (no MQTT) nothing is wired and None is returned."""
     if offline:
         return None
 
@@ -613,7 +669,14 @@ def wire_command_gate(mqtt_client, http_reporter, *, token: str, state_dir: str,
         http_reporter.report_firmware_event(phase="failed", to_version=to_version, command_id=command_id,
                                             rollout_id=rollout_id, error=error)
 
+    if clock_ok is None:
+        from .blocks.clock import SystemClock
+        clock_ok = SystemClock().clock_ok
+    if server_time is None:
+        server_time = getattr(http_reporter, "server_time", None)
+    from .server_time import ServerTime, trusted_now
     gate = CommandGate(token, ReplayStore(state_dir) if token else ReplayState(),
-                       ack=mqtt_client.publish_command_ack, firmware_report=firmware_report, clock_ok=clock_ok)
+                       ack=mqtt_client.publish_command_ack, firmware_report=firmware_report, clock_ok=clock_ok,
+                       trusted_now=trusted_now(server_time if isinstance(server_time, ServerTime) else None, clock_ok))
     mqtt_client.set_command_gate(gate)
     return gate

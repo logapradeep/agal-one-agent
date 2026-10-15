@@ -30,9 +30,12 @@ class HttpReporter:
     """
 
     def __init__(self, node_uid: str, auth_token: str = "",
-                 base_url: str = ""):
+                 base_url: str = "", server_time=None):
         self.node_uid = node_uid
         self.auth_token = auth_token
+        # The backend's time from the Date of every HTTPS answer (server_time.ServerTime; contracts
+        # v1.14.2 review, command-signing.md §5.4): the command gate checks a command's age against it.
+        self.server_time = server_time
         # Prefer the backend-supplied URL (config.telemetry.ingress_url); fall
         # back to the module default when the config omits it (older configs or
         # a bare manual install).
@@ -75,10 +78,15 @@ class HttpReporter:
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=20) as resp:
+                self._note_time(resp, req)
                 if resp.status != 200:
                     logger.warning("getProgram failed: %d", resp.status)
                     return None
                 return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            self._note_time(e, req)
+            logger.warning("getProgram error: %s", e)
+            return None
         except Exception as e:  # noqa: BLE001
             logger.warning("getProgram error: %s", e)
             return None
@@ -105,8 +113,10 @@ class HttpReporter:
                 headers=self._headers(), method="POST",
             )
             with urllib.request.urlopen(req, timeout=20) as resp:
+                self._note_time(resp, req)
                 return json.loads(resp.read().decode("utf-8")) if resp.status == 200 else None
         except urllib.error.HTTPError as e:
+            self._note_time(e, req)
             if e.code == 409:
                 logger.error("reportHardware: this board is already linked to another node — unlink it there first")
             else:
@@ -258,15 +268,29 @@ class HttpReporter:
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=15) as resp:
+                self._note_time(resp, req)
                 if resp.status == 200:
                     data = json.loads(resp.read().decode("utf-8"))
                     return data.get("commands", [])
                 else:
                     logger.warning("fetch_boot_state failed: %d", resp.status)
                     return []
+        except urllib.error.HTTPError as e:
+            self._note_time(e, req)
+            logger.warning("fetch_boot_state error: %s", e)
+            return []
         except Exception as e:
             logger.warning("fetch_boot_state error: %s", e)
             return []
+
+    def _note_time(self, resp, req) -> None:
+        """Hand the answer's Date to the server-time reference (an https:// answer only)."""
+        if self.server_time is None:
+            return
+        try:
+            self.server_time.observe(getattr(resp, "headers", None), getattr(req, "full_url", ""))
+        except Exception as e:  # noqa: BLE001 — the time reference never fails a report
+            logger.debug("server time not noted: %s", e)
 
     def _headers(self) -> dict:
         """Request headers, including the node auth header when a token is configured."""
@@ -293,11 +317,13 @@ class HttpReporter:
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
+                self._note_time(resp, req)
                 self.last_status = resp.status
                 if resp.status != 200:
                     logger.warning("HTTP report failed: %d", resp.status)
                 return resp.status
         except urllib.error.HTTPError as e:
+            self._note_time(e, req)
             self.last_status = e.code
             logger.warning("HTTP report error: %s", e)
             return e.code

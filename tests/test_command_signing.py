@@ -87,8 +87,10 @@ def _state(kind, tmp_path):
 def test_verifying_vector(v, kind, tmp_path):
     state = _state(kind, tmp_path)
     for i, step in enumerate(v["steps"]):
+        # A step's own clockTrusted / nowMs (vectors 1.1.0) replace the sequence's for that step.
         verdict = verify_command(step["wire"], _token(v["token"]), state,
-                                 clock_trusted=v["clockTrusted"], now_ms=v["nowMs"])
+                                 clock_trusted=step.get("clockTrusted", v["clockTrusted"]),
+                                 now_ms=step.get("nowMs", v["nowMs"]))
         got = "accepted" if verdict.accepted else verdict.reason
         assert got == step["expect"], f"step {i}: {verdict!r}"
         if "verified" in step:
@@ -117,16 +119,17 @@ def test_the_10001st_id_evicts_the_oldest_and_raises_the_floor(kind, tmp_path):
         return json.dumps(sign_command({"commandId": cid, "type": "syncProgram", "version": 1, "timestamp": t0},
                                        TOKEN, ts)[0])
 
-    assert verify_command(msg("EvictNewest000000001", t0 + cs.REPLAY_SET_MAX), TOKEN, state, now_ms=0).accepted
+    now = dict(clock_trusted=True, now_ms=t0 + cs.REPLAY_SET_MAX)  # all within 10 s: the set and its floor decide
+    assert verify_command(msg("EvictNewest000000001", t0 + cs.REPLAY_SET_MAX), TOKEN, state, **now).accepted
     assert len(state.seen) == cs.REPLAY_SET_MAX and "seed0" not in state.seen
     assert state.evicted_floor == t0
-    assert verify_command(msg("seed0", t0), TOKEN, state, now_ms=0).reason == "stale"
-    assert verify_command(msg("seed1", t0 + 1), TOKEN, state, now_ms=0).reason == "replayed"
+    assert verify_command(msg("seed0", t0), TOKEN, state, **now).reason == "stale"
+    assert verify_command(msg("seed1", t0 + 1), TOKEN, state, **now).reason == "replayed"
     if kind == "persisted":
         again = ReplayStore(str(tmp_path / "state"))
         assert again.evicted_floor == t0 and again.has("EvictNewest000000001") and not again.has("seed0")
         assert len(again.seen) == cs.REPLAY_SET_MAX
-        assert verify_command(msg("seed0", t0), TOKEN, again, now_ms=0).reason == "stale"
+        assert verify_command(msg("seed0", t0), TOKEN, again, **now).reason == "stale"
 
 
 # ======================================================================= §3 canonical JSON
@@ -277,11 +280,20 @@ def _signed(cid="Xk3vQ9pL2mN8rT5wY7zA", ts=1792042200000, token=TOKEN, **fields)
     return json.dumps(sign_command(message, token, ts)[0])
 
 
+def _at(ts_ms):
+    """A trusted now (the backend's time, or an NTP clock) at ts_ms."""
+    return dict(clock_trusted=True, now_ms=ts_ms)
+
+
+NOW = _at(1792042200000)  # _signed()'s default sigTs
+
+
 def test_an_accepted_id_is_still_refused_after_a_restart(tmp_path):
     d = str(tmp_path / "state")
-    assert verify_command(_signed(), TOKEN, ReplayStore(d), now_ms=0).accepted
+    assert verify_command(_signed(), TOKEN, ReplayStore(d), **NOW).accepted
     after_restart = ReplayStore(d)
-    assert verify_command(_signed(), TOKEN, after_restart, now_ms=0).reason == "replayed"
+    assert verify_command(_signed(), TOKEN, after_restart, **NOW).reason == "replayed"
+    assert verify_command(_signed(), TOKEN, after_restart, clock_trusted=False).reason == "replayed"  # whatever the time
     assert after_restart.high_water == 1792042200000
 
 
@@ -289,11 +301,13 @@ def test_the_floor_is_kept_across_a_restart_on_the_backends_clock(tmp_path):
     d = str(tmp_path / "state")
     day = 24 * 3600 * 1000
     t = 1792042200000
-    assert verify_command(_signed("NewOne00000000000001", t), TOKEN, ReplayStore(d), now_ms=0).accepted
+    assert verify_command(_signed("NewOne00000000000001", t), TOKEN, ReplayStore(d), **_at(t)).accepted
     store = ReplayStore(d)
-    # No trusted clock (a Pi before NTP): 8 days below the high-water mark is still stale.
-    assert verify_command(_signed("OldOne00000000000001", t - 8 * day), TOKEN, store, now_ms=0).reason == "stale"
-    assert verify_command(_signed("OldOne00000000000002", t - 6 * day), TOKEN, store, now_ms=0).accepted
+    # Even with a "now" that would pass the 10-minute window (a clock that is days behind), 8 days
+    # below the high-water mark — kept on the card — is stale: the floor is on the backend's clock.
+    old = verify_command(_signed("OldOne00000000000001", t - 8 * day), TOKEN, store, **_at(t - 8 * day))
+    assert old.reason == "stale" and old.detail == "older than the replay window" and not old.window
+    assert verify_command(_signed("OldOne00000000000002", t - 6 * day), TOKEN, store, **_at(t - 6 * day)).accepted
 
 
 def test_ids_more_than_seven_days_below_the_high_water_mark_leave_the_set(tmp_path):
@@ -301,12 +315,12 @@ def test_ids_more_than_seven_days_below_the_high_water_mark_leave_the_set(tmp_pa
     day = 24 * 3600 * 1000
     t = 1792042200000
     store = ReplayStore(d)
-    assert verify_command(_signed("First000000000000001", t), TOKEN, store, now_ms=0).accepted
-    assert verify_command(_signed("Later000000000000001", t + 8 * day), TOKEN, store, now_ms=0).accepted
+    assert verify_command(_signed("First000000000000001", t), TOKEN, store, **_at(t)).accepted
+    assert verify_command(_signed("Later000000000000001", t + 8 * day), TOKEN, store, **_at(t + 8 * day)).accepted
     assert not store.has("First000000000000001")
     assert not ReplayStore(d).has("First000000000000001")
-    # Gone from the set, but below the floor: never carried out again.
-    assert verify_command(_signed("First000000000000001", t), TOKEN, ReplayStore(d), now_ms=0).reason == "stale"
+    # Gone from the set, but below the floor: never carried out again (whatever "now" says).
+    assert verify_command(_signed("First000000000000001", t), TOKEN, ReplayStore(d), **_at(t)).reason == "stale"
 
 
 def test_the_id_is_on_the_card_before_the_command_is_carried_out(tmp_path):
@@ -314,7 +328,7 @@ def test_the_id_is_on_the_card_before_the_command_is_carried_out(tmp_path):
     seen_on_disk = []
     client = _client()
     client.set_command_gate(CommandGate(TOKEN, ReplayStore(d), ack=client.publish_command_ack,
-                                        clock_ok=lambda: False))
+                                        trusted_now=lambda: 1792042200000))
     client.set_command_handler(lambda c: seen_on_disk.append(ReplayStore(d).has(c["commandId"])))
     client._on_message(None, None, _Msg(_signed()))
     assert seen_on_disk == [True]
@@ -323,12 +337,12 @@ def test_the_id_is_on_the_card_before_the_command_is_carried_out(tmp_path):
 def test_a_torn_last_journal_line_is_ignored(tmp_path):
     d = tmp_path / "state"
     store = ReplayStore(str(d))
-    assert verify_command(_signed("Kept0000000000000001"), TOKEN, store, now_ms=0).accepted
+    assert verify_command(_signed("Kept0000000000000001"), TOKEN, store, **NOW).accepted
     with open(d / cs.REPLAY_JOURNAL_FILE, "a", encoding="utf-8") as f:
         f.write('{"id": "Torn00000000000')  # a power cut during the append: that command never ran
     again = ReplayStore(str(d))
     assert again.has("Kept0000000000000001") and not again.has("Torn0000000000000001")
-    assert verify_command(_signed("Torn0000000000000001"), TOKEN, again, now_ms=0).accepted
+    assert verify_command(_signed("Torn0000000000000001"), TOKEN, again, **NOW).accepted
 
 
 def test_a_damaged_snapshot_is_kept_aside_and_the_set_starts_empty(tmp_path, caplog):
@@ -340,7 +354,11 @@ def test_a_damaged_snapshot_is_kept_aside_and_the_set_starts_empty(tmp_path, cap
     assert store.seen == {} and store.high_water == 0
     assert (d / (cs.REPLAY_SNAPSHOT_FILE + ".corrupt")).exists()
     assert any("unreadable" in r.getMessage() for r in caplog.records)
-    assert verify_command(_signed(), TOKEN, store, now_ms=0).accepted
+    assert verify_command(_signed(), TOKEN, store, **NOW).accepted
+    # v1.14.2 review: with the set gone, the time check is what keeps an old capture out — it is
+    # never skipped (no trusted now: stale; an hour-old command: stale).
+    assert verify_command(_signed("OldCapture0000000001", 1792042200000 - 3600_000), TOKEN, store, **NOW).reason == "stale"
+    assert verify_command(_signed("NoTime00000000000001"), TOKEN, store, clock_trusted=False).reason == "stale"
 
 
 def test_the_journal_is_folded_into_the_snapshot(tmp_path):
@@ -348,7 +366,7 @@ def test_the_journal_is_folded_into_the_snapshot(tmp_path):
     store = ReplayStore(str(d), compact_every=3)
     ids = [f"Fold{i:016d}" for i in range(7)]
     for i, cid in enumerate(ids):
-        assert verify_command(_signed(cid, 1792042200000 + i), TOKEN, store, now_ms=0).accepted
+        assert verify_command(_signed(cid, 1792042200000 + i), TOKEN, store, **NOW).accepted
     lines = (d / cs.REPLAY_JOURNAL_FILE).read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1  # 7 = 3 + 3 folded, 1 in the journal
     snap = json.loads((d / cs.REPLAY_SNAPSHOT_FILE).read_text(encoding="utf-8"))
@@ -363,10 +381,10 @@ def test_a_card_that_cannot_be_written_still_carries_the_command_out(tmp_path, c
     blocker.write_text("x")
     store = ReplayStore(str(blocker / "state"))
     with caplog.at_level(logging.ERROR, logger="agal_one_agent.command_signing"):
-        verdict = verify_command(_signed(), TOKEN, store, now_ms=0)
+        verdict = verify_command(_signed(), TOKEN, store, **NOW)
     assert verdict.accepted and store.write_failures == 1
     assert any("could not be written" in r.getMessage() for r in caplog.records)
-    assert verify_command(_signed(), TOKEN, store, now_ms=0).reason == "replayed"  # still in memory
+    assert verify_command(_signed(), TOKEN, store, **NOW).reason == "replayed"  # still in memory
 
 
 # ======================================================================= the MQTT boundary
@@ -431,16 +449,17 @@ def test_a_signed_command_is_carried_out_and_the_handler_gets_the_object_that_wa
     assert rig.carried_out[0]["value"] == 1 and rig.acks == []
 
 
-def test_an_unsigned_command_from_a_backend_that_does_not_sign_is_refused_and_answered(tmp_path, caplog):
+def test_an_unsigned_command_is_refused_and_only_logged(tmp_path, caplog):
+    """v1.14.2 review: an unsigned refusal is never posted — the backend moves no command for it, and
+    answering let anyone with the shared login spend the node's answers with made-up ids."""
     rig = _Rig(tmp_path)
     unsigned = json.dumps({"commandId": "Xk3vQ9pL2mN8rT5wY7zA", "type": "setPower", "assetId": "asset_pump1234",
                            "sourceKey": "device.power", "value": 1, "timestamp": 1792042200000})
     with caplog.at_level(logging.WARNING, logger="agal_one_agent.command_signing"):
         rig.send(unsigned)
     assert rig.carried_out == []
-    assert rig.acks == [("Xk3vQ9pL2mN8rT5wY7zA", "failed", None, "refused: unsigned — no sig", "unsigned")]
-    assert rig.mqtt_acks() == [{"nodeUid": "shared-device-login", "commandId": "Xk3vQ9pL2mN8rT5wY7zA",
-                                "status": "failed", "error": "refused: unsigned — no sig", "reason": "unsigned"}]
+    assert rig.acks == [] and rig.mqtt_acks() == []
+    assert rig.gate.refused["unsigned"] == 1 and rig.gate.refusal_acks_sent == 0
     assert [r.getMessage() for r in caplog.records if "command refused" in r.getMessage()] == [
         "command refused: unsigned — commandId Xk3vQ9pL2mN8rT5wY7zA — no sig (not carried out)"]
 
@@ -464,13 +483,14 @@ def test_a_command_signed_for_another_node_is_refused(tmp_path):
     assert rig.carried_out == [] and rig.acks[0][4] == "bad_signature"
 
 
-def test_a_replayed_command_is_carried_out_once(tmp_path):
+def test_a_replayed_command_is_carried_out_once_and_the_replay_is_only_logged(tmp_path, caplog):
     rig = _Rig(tmp_path)
     rig.send(_signed())
-    rig.send(_signed())
+    with caplog.at_level(logging.WARNING, logger="agal_one_agent.command_signing"):
+        rig.send(_signed())
     assert len(rig.carried_out) == 1
-    assert rig.acks == [("Xk3vQ9pL2mN8rT5wY7zA", "failed", None,
-                         "refused: replayed — this commandId was accepted before", "replayed")]
+    assert rig.acks == [] and rig.gate.refused["replayed"] == 1  # the original has its own acks
+    assert any("command refused: replayed setPower" in r.getMessage() for r in caplog.records)
 
 
 def test_a_forged_copy_first_does_not_stop_the_real_command(tmp_path):
@@ -484,13 +504,17 @@ def test_a_forged_copy_first_does_not_stop_the_real_command(tmp_path):
     (True, 11 * 60 * 1000, "stale"),      # trusted clock: signed 11 minutes ago
     (True, -3 * 60 * 1000, "stale"),      # trusted clock: signed 3 minutes in the future
     (True, 9 * 60 * 1000, "accepted"),
-    (False, 3 * 24 * 3600 * 1000, "accepted"),  # no NTP yet: only the replay set and its floor
-], ids=["11 min old", "3 min ahead", "9 min old", "untrusted clock, 3 days"])
-def test_freshness_is_checked_only_against_a_trusted_clock(tmp_path, clock_ok, now_offset_ms, expect):
+    # v1.14.2 review: no trusted now (no backend answer yet, no NTP / RTC) is stale — never skipped.
+    (False, 3 * 24 * 3600 * 1000, "stale"),  # a capture 3 days old, at the next boot: not carried out
+    (False, 5000, "stale"),                  # even a fresh one, until the backend has answered once
+], ids=["11 min old", "3 min ahead", "9 min old", "no trusted now, 3 days", "no trusted now, fresh"])
+def test_freshness_is_always_checked_against_a_trusted_now(tmp_path, clock_ok, now_offset_ms, expect):
     rig = _Rig(tmp_path, clock_ok=clock_ok, now_ms=1792042200000 + now_offset_ms)
     rig.send(_signed())
     got = "accepted" if rig.carried_out else rig.acks[0][4]
     assert got == expect
+    if expect == "stale" and not clock_ok:
+        assert rig.acks[0][3] == "refused: stale — no trusted time yet"
 
 
 def test_the_gate_asks_the_agents_clock_by_default():
@@ -518,21 +542,34 @@ def test_a_message_that_is_not_a_command_is_dropped_and_logged(tmp_path, raw, ca
     assert any("command refused" in r.getMessage() for r in caplog.records)
 
 
-def test_every_refusal_is_logged_but_at_most_20_are_answered_in_10_minutes(tmp_path, caplog):
+def _forged(cid):
+    return json.dumps({"commandId": cid, "type": "setPower", "value": 1, "timestamp": 1,
+                       "sigAlg": "hs256-v1", "sigTs": 1792042200000, "sig": "A" * 43})
+
+
+def test_every_refusal_is_logged_and_answers_are_budgeted_per_reason(tmp_path, caplog):
+    """At most 5 bad_signature and 20 stale answers in any 10 minutes, counted apart: a flood of forged
+    messages (and of unsigned junk, never answered) cannot crowd out a real command's stale answer."""
     clock = [1000.0]
-    rig = _Rig(tmp_path, monotonic=lambda: clock[0])
+    rig = _Rig(tmp_path, monotonic=lambda: clock[0], now_ms=1792042200000 + 11 * 60 * 1000)
     with caplog.at_level(logging.WARNING, logger="agal_one_agent.command_signing"):
-        for i in range(25):
-            rig.send(json.dumps({"commandId": f"Flood{i:015d}", "type": "setPower", "value": 1, "timestamp": 1}))
-    assert len(rig.acks) == 20 and rig.gate.refusal_acks_withheld == 5
-    refusals = [r for r in caplog.records if r.getMessage().startswith("command refused: unsigned")]
-    assert len(refusals) == 25
+        for i in range(30):
+            rig.send(json.dumps({"commandId": f"Junk{i:016d}", "type": "setPower", "value": 1, "timestamp": 1}))
+        for i in range(8):
+            rig.send(_forged(f"Forged{i:014d}"))
+    assert [a[4] for a in rig.acks] == ["bad_signature"] * 5 and rig.gate.refusal_acks_withheld == 3
+    assert len([r for r in caplog.records if r.getMessage().startswith("command refused: unsigned")]) == 30
+    # A real command that arrives 11 minutes late during the flood is still answered (its own budget).
+    for i in range(22):
+        rig.send(_signed(f"Late{i:016d}"))
+    stale = [a for a in rig.acks if a[4] == "stale"]
+    assert len(stale) == 20 and stale[0][3] == "refused: stale — signed more than 10 minutes ago"
     clock[0] += 599.0
-    rig.send(json.dumps({"commandId": "FloodLate00000000001", "type": "setPower", "value": 1, "timestamp": 1}))
-    assert len(rig.acks) == 20
-    clock[0] += 1.0  # the first answer is 10 minutes old now
-    rig.send(json.dumps({"commandId": "FloodLate00000000002", "type": "setPower", "value": 1, "timestamp": 1}))
-    assert len(rig.acks) == 21 and rig.acks[-1][0] == "FloodLate00000000002"
+    rig.send(_forged("ForgedLate0000000001"))
+    assert [a[4] for a in rig.acks].count("bad_signature") == 5
+    clock[0] += 1.0  # the first answers are 10 minutes old now
+    rig.send(_forged("ForgedLate0000000002"))
+    assert rig.acks[-1][0] == "ForgedLate0000000002" and rig.acks[-1][4] == "bad_signature"
 
 
 def _firmware(cid="Nc8Vb6Xm4Zl2Kj0Hg8Fd", ts=1792042200000, token=TOKEN):
@@ -556,6 +593,29 @@ def test_a_stale_firmware_update_is_also_reported_as_a_failed_update(tmp_path):
                                 "status": "failed", "error": error, "reason": "stale"}]
     rig.send(_firmware())  # the same stale copy again: reported once
     assert len(rig.firmware) == 1
+
+
+def test_a_firmware_update_refused_with_no_trusted_now_is_reported(tmp_path):
+    rig = _Rig(tmp_path, clock_ok=False)
+    rig.send(_firmware())
+    assert rig.carried_out == []
+    assert rig.firmware == [{"command_id": "Nc8Vb6Xm4Zl2Kj0Hg8Fd", "to_version": "0.3.4", "rollout_id": "ro_1",
+                             "error": "refused: stale — no trusted time yet"}]
+
+
+def test_a_firmware_update_below_the_replay_floor_is_not_reported(tmp_path):
+    """v1.14.2 review: a captured firmwareUpdate signed more than 7 days before a command the node already
+    carried out is a replay — refused stale by the floor, but never reported as this node's update failing
+    (it would overwrite the node's otaStatus and a finished rollout's record)."""
+    day = 24 * 3600 * 1000
+    t = 1792042200000
+    rig = _Rig(tmp_path, now_ms=t)
+    rig.send(_signed("Recent00000000000001", t))
+    assert len(rig.carried_out) == 1
+    rig.now = t - 8 * day + 1000  # even a clock that would pass the window
+    rig.send(_firmware("OldFw000000000000001", ts=t - 8 * day))
+    assert rig.carried_out[1:] == [] and rig.firmware == []
+    assert rig.gate.refused["stale"] == 1
 
 
 def test_a_forged_firmware_update_is_not_reported_as_an_update(tmp_path):
@@ -584,17 +644,44 @@ def test_the_firmware_report_goes_through_the_http_reporter(monkeypatch, tmp_pat
         "rolloutId": "ro_1", "error": "refused: stale — signed more than 10 minutes ago"}
 
 
-def test_a_node_without_a_token_checks_nothing_and_says_so_once(tmp_path, caplog):
+def test_a_node_without_a_token_carries_out_nothing_and_says_so_every_minute(tmp_path, caplog):
+    """v1.14.2 review (§5.5): a node that can check nothing carries out nothing — the backend never
+    publishes to a node it holds no token for, so whatever arrives is someone else's."""
+    clock = [5000.0]
     with caplog.at_level(logging.ERROR, logger="agal_one_agent.command_signing"):
-        rig = _Rig(tmp_path, token="")
+        rig = _Rig(tmp_path, token="", monotonic=lambda: clock[0])
     unsigned = json.dumps({"commandId": "Xk3vQ9pL2mN8rT5wY7zA", "type": "setPower", "value": 1, "timestamp": 1})
     with caplog.at_level(logging.WARNING, logger="agal_one_agent.command_signing"):
         rig.send(unsigned)
+        rig.send(_signed())  # signed with a token the node does not hold: refused too
+        clock[0] += 61.0
         rig.send(unsigned)
-    assert len(rig.carried_out) == 2 and rig.acks == []  # legacy: unchecked, as agents up to 0.3.3
-    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
-    assert len(errors) == 1 and "NOT verified" in errors[0].getMessage()
-    assert not rig.gate.protected
+    assert rig.carried_out == [] and rig.acks == [] and rig.mqtt_acks() == []
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 2  # at start, then once a minute while messages keep arriving
+    assert "carries out NOTHING" in errors[0] and "join this node again" in errors[0]
+    assert "no token: join this node again" in errors[1]
+    assert rig.gate.refused["bad_signature"] == 3 and not rig.gate.protected
+
+
+def test_the_gate_prefers_the_backends_time_to_a_wrong_wall_clock(tmp_path):
+    """A Pi 5 with /dev/rtc0 but no battery, after a power cut: clock_ok() says trusted, the wall clock
+    is 3 days behind. Once the backend has answered, its time decides: a fresh command is carried out,
+    a 3-day-old capture is not."""
+    from agal_one_agent.server_time import ServerTime, trusted_now
+    mono = [100.0]
+    st = ServerTime(monotonic=lambda: mono[0])
+    t = 1792042200000
+    wall = [t - 3 * 24 * 3600 * 1000]
+    gate = CommandGate(TOKEN, ReplayStore(str(tmp_path / "state")), ack=lambda *a, **k: None,
+                       trusted_now=trusted_now(st, lambda: True, wall_ms=lambda: wall[0]))
+    # Before any answer: the (wrong) wall clock — the fresh command looks 3 days ahead: stale.
+    assert gate.admit(_signed("Fresh000000000000001", t)) is None
+    assert st.observe({"Date": "Thu, 15 Oct 2026 05:30:00 GMT"}, "https://ingress.example/telemetryIngress")
+    mono[0] += 4.0
+    assert gate.admit(_signed("Fresh000000000000001", t)) is not None  # the refused copy burnt nothing
+    assert gate.admit(_signed("Capture0000000000001", t - 3 * 24 * 3600 * 1000)) is None
+    assert gate.refused["stale"] == 2
 
 
 def test_without_a_gate_the_client_logs_that_commands_are_unchecked(caplog):
@@ -687,9 +774,9 @@ class _WiredHere(Exception):
 def test_main_wires_the_command_gate_with_the_nodes_token_and_state_dir(tmp_path, monkeypatch, offline):
     seen = {}
 
-    def wire(mqtt_client, reporter, *, token, state_dir, offline, clock_ok=None):
+    def wire(mqtt_client, reporter, *, token, state_dir, offline, clock_ok=None, server_time=None):
         seen.update(mqtt=mqtt_client, reporter=reporter, token=token, state_dir=state_dir, offline=offline,
-                    clock_ok=clock_ok, ack_sink=mqtt_client._ack_sink)
+                    clock_ok=clock_ok, ack_sink=mqtt_client._ack_sink, server_time=server_time)
         raise _WiredHere
 
     monkeypatch.delenv("SENTRY_DSN", raising=False)
@@ -702,6 +789,9 @@ def test_main_wires_the_command_gate_with_the_nodes_token_and_state_dir(tmp_path
     assert seen["token"] == "tok" and seen["state_dir"] == str(tmp_path / "state")
     assert seen["offline"] is offline
     assert isinstance(seen["clock_ok"].__self__, SystemClock)
+    from agal_one_agent.server_time import ServerTime
+    # The backend's time: the same reference the reporter feeds from every HTTPS answer.
+    assert isinstance(seen["server_time"], ServerTime) and seen["reporter"].server_time is seen["server_time"]
     assert (seen["ack_sink"] is not None) is (not offline)  # the refusal answers have their queue
 
 
