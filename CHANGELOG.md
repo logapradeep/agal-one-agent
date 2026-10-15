@@ -133,6 +133,80 @@ may carry its own `clockTrusted` / `nowMs`), `tests/test_server_time.py` (13: th
 http and unreadable Dates ignored, the order backend → trusted wall clock → none, every reporter
 call and an error answer feed it, the first probe, node events). Full suite 685 passed.
 
+**Join safety — the one last join that takes the Pi to 0.3.4 (contracts v1.14.2 join safety,
+`Agal/contracts/nodes/README.md` §10, `command-signing.md` §7; SYNC.md v1.14.2 item 8 c).** The
+only production node (a Raspberry Pi 3B on agent 0.3.1, joined by the join command, no git) gets
+0.3.4 by one last join; after it every update is over the air. A compatibility check of that join
+(2026-10-15) found three hazards; the agent's part of each:
+
+- **H3 — no placeholder version, ever.** On every clean stop (the join's `systemctl restart`, an
+  update's restart, a shutdown) `heartbeat.stop()` posted the offline status without a version, so
+  `HttpReporter.report_status` / `AgalOneMqttClient.publish_status` filled in their default
+  `"0.1.0"`, and the backend stored it: the app showed the node on agent 0.1.0 during every restart.
+  The online heartbeat also fell back to `"0.1.0"` whenever `heartbeat._get_agent_version()` could
+  not read the installed package's metadata, and otherwise re-read that metadata on every beat —
+  which names the NEW version as soon as pip has replaced the files (a join; an update waiting up to
+  30 min for a pump to stop) while the old process still runs. Now every status — online and
+  offline, HTTPS and MQTT, and the MQTT last will — carries `agal_one_agent.__version__`, the
+  version of the code that is running, resolved once when the package is imported
+  (`HeartbeatPublisher(agent_version=…)`, main.py passes it); `_get_agent_version()` is gone; the two
+  reporters take `firmware_version: Optional[str] = None` and send no `firmwareVersion` without one.
+  The offline status goes over HTTPS even when the MQTT publish raises (each channel on its own;
+  the online heartbeat too). The backend's half (an offline status never writes the version, an
+  online one never `0.1.0`) is separate; the last join's own restart is agent 0.3.1's clean stop,
+  which still says 0.1.0 — only the backend's half covers that one.
+- **H1 — the agent's side of the guard.** The served join script refused the board's own config as
+  "already linked to another Agal One node": it looked for `uid: "<nodeUid>"`, and `update_pins`
+  (identical in 0.3.1 and 0.3.4) rewrites `config.yaml` with `yaml.dump` on every `syncPinConfig` —
+  every card link and unlink — which writes the uid bare, or in single quotes when it would read as
+  another type. The new guard is the backend's (contracts §10.1); nothing in the agent changes for
+  it. Checked here: the vectors' `guard.script` (bash) proceeds on the `config.yaml` that
+  `update_pins` writes from the join's own file, for 14 node ids (among them every kind `yaml.dump`
+  single-quotes: hex, decimal, octal, a date, true / No / null, `1_000`, `-1`, a 128-character id),
+  refuses another node's and a near one, and the old guard refuses it (H1 reproduced); the file has
+  one `uid:` line; nothing else in the agent reads the uid as text — `AgentConfig.from_yaml`
+  (`yaml.safe_load`; main, the OTA reports, balena's `render_config.py` with `safe_dump`) reads back
+  the same `str` uid, token, topics and pins, after one rewrite and after several.
+- **H2 — the token at boot, and a command signed just before the promotion.** The backend's half
+  (the join fetch writes a PENDING token; the board's first request with it promotes it) needs no
+  agent change: the agent holds one token, its `config.yaml`. Checked here, with `main()` run as
+  systemd starts it after the join's restart (urlopen and the broker faked): the first HTTPS request
+  is the hardware report to `reportHardware` (a door that reads the credential fresh), from a thread
+  started before MQTT, with `Authorization: Bearer <config token>` — 8 ms after start on the
+  development Mac, with the broker never answering (on a board the inventory before it includes an
+  I2C read of 112 addresses per bus — not measured on the Pi; a bus that hangs delays it, and then
+  the first heartbeat, posted as soon as MQTT is up, is the first request); every request at boot
+  (hardware report, heartbeat, the legacy
+  `getBootState` — its token in the body too —, the clean stop) carries that token. A command the
+  backend signed with the OLD token in the seconds before the promotion is refused `bad_signature`
+  (never carried out) and answered with a failed ack carrying `reason: bad_signature` — a 20-character
+  auto-id, i.e. every app command; at most 5 such answers in 10 minutes — and that answer is posted
+  with the NEW token, so it promotes the pending token and is then handled: the command shows
+  `failed` (refusal `bad_signature`) instead of waiting for its timeout; a 503 (the promotion could
+  not commit) is tried again until it lands; the next command, signed with the new token, is carried
+  out. A prefixed node poke (`sync_…`, `scan_bus_…`, `test_port_…`) refused in that window is only
+  logged (it has no document); what it would have started the agent does at every start anyway (the
+  hardware report, the program pull). Commands published while no agent is subscribed (the restart
+  itself) are not delivered (clean MQTT session) and time out in the app, as before.
+
+Verified: `tests/test_join_safety.py` (72) — the 12 status vectors through a port of the contract's
+`storedFirmwareVersion` (then applied to what this agent sends: its heartbeat stores
+`__version__`, its clean stop leaves it); `__version__` matches the iot-node pattern and is not
+`0.1.0`; the `__init__.py` fallback = setup.py's version; stop() on both channels; the metadata
+changed or unreadable mid-run; no default; the MQTT failure; the last will; all 21 guard vectors
+through bash; the update_pins round trip for 14 ids; nothing else reads the uid as text; the first
+request at boot with no broker; a full boot to the main loop and a clean stop; a command signed with
+the old token before the promotion, with and without a 503. Mutation-checked, each fails a test: the
+0.3.3 heartbeat and reporters, stop() without a version, the `0.1.0` default back, the heartbeat
+re-reading the metadata (either channel), no per-channel try in stop(), the hardware report moved
+after MQTT, the reporter without its token, `bad_signature` not answered. Full suite 757 passed. Not
+run on a Pi, against the broker, or against a backend with the pending credential (not built yet).
+Found, not fixed: in a development venv with a stale editable install `__version__` is that install's
+metadata, not the checkout's (this worktree's tests run as 0.2.1) — on a board the join and the
+over-the-air update install the archive with its metadata, so they agree; the MQTT copies of every
+status still name `mqtt.username` (the shared login on such a node) as `nodeUid` — nothing consumes
+them; `getBootState` is posted to the fixed production URL whatever `telemetry.ingress_url` says.
+
 **Fix — a firmware update needed the board's terminal (founder, 2026-10-15: "once the rpi is
 linked, there should not be a need to do anything on the pi terminal especially the updates").**
 The app's Update firmware button (`updateNodeFirmware` → `/nodeCommands` → `firmwareUpdate

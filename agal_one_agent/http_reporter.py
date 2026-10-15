@@ -42,14 +42,19 @@ class HttpReporter:
         self.base_url = base_url or TELEMETRY_INGRESS_URL
         self.last_status: Optional[int] = None  # HTTP status of the last POST (429 → callers back off)
 
-    def report_status(self, online: bool, uptime: int, firmware_version: str = "0.1.0",
+    def report_status(self, online: bool, uptime: int, firmware_version: Optional[str] = None,
                       extra: Optional[dict] = None) -> None:
+        """POST a status. ``firmware_version``: the version of the code that is running (the
+        heartbeat passes ``agal_one_agent.__version__``); without one the status carries no
+        ``firmwareVersion`` at all — never a placeholder (contracts v1.14.2 join safety: this
+        default was "0.1.0", and the backend stored it from every clean stop)."""
         payload = {
             "nodeUid": self.node_uid,
             "online": online,
             "uptime": uptime,
-            "firmwareVersion": firmware_version,
         }
+        if firmware_version:
+            payload["firmwareVersion"] = firmware_version
         from .net_info import get_primary_mac
         mac = get_primary_mac()
         if mac:

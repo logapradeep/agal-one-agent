@@ -617,8 +617,10 @@ def main():
         from .blocks.cloud import heartbeat_extra
         return heartbeat_extra(runtime, config, cloud_sink)
 
+    # Every status carries the version of the code that is running, resolved once at start
+    # (contracts v1.14.2 join safety; tests/test_join_safety.py).
     heartbeat = HeartbeatPublisher(config, mqtt_client, http_reporter=http_reporter,
-                                   extra_provider=_heartbeat_extra)
+                                   extra_provider=_heartbeat_extra, agent_version=__version__)
 
     # Graceful shutdown
     running = True

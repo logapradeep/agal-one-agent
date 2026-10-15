@@ -8,6 +8,7 @@ from typing import Callable, Optional
 
 import paho.mqtt.client as mqtt
 
+from . import __version__
 from .config import MqttConfig
 
 logger = logging.getLogger(__name__)
@@ -70,12 +71,15 @@ class AgalOneMqttClient:
 
         # Set Last Will and Testament — broker publishes this when client
         # disconnects ungracefully (power loss, crash, network drop).
+        # It carries this agent's version like every status it sends (contracts v1.14.2, nodes/README.md
+        # §10.3); the backend stores no version from an offline status anyway.
         will_payload = json.dumps({
             "type": "status",
             "payload": {
                 "nodeUid": self.config.username,
                 "online": False,
                 "uptime": 0,
+                "firmwareVersion": __version__,
             },
         })
         self._client.will_set(
@@ -134,8 +138,10 @@ class AgalOneMqttClient:
             qos=1,
         )
 
-    def publish_status(self, online: bool, uptime: int, firmware_version: str = "0.1.0",
+    def publish_status(self, online: bool, uptime: int, firmware_version: Optional[str] = None,
                        extra: Optional[dict] = None) -> None:
+        """Publish a status. ``firmware_version`` as ``HttpReporter.report_status``: the running
+        code's version, or no ``firmwareVersion`` at all — never the old "0.1.0" default."""
         if not self._client or not self._connected:
             logger.warning("Cannot publish status: not connected")
             return
@@ -145,8 +151,9 @@ class AgalOneMqttClient:
             "nodeUid": self.config.username,
             "online": online,
             "uptime": uptime,
-            "firmwareVersion": firmware_version,
         }
+        if firmware_version:
+            payload["firmwareVersion"] = firmware_version
         # Report the primary MAC so the cloud can register/​index it (best-effort,
         # non-authoritative — hardwareSerial is the binding anchor).
         from .net_info import get_primary_mac
