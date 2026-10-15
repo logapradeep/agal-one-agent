@@ -189,6 +189,21 @@ only production node (a Raspberry Pi 3B on agent 0.3.1, joined by the join comma
   hardware report, the program pull). Commands published while no agent is subscribed (the restart
   itself) are not delivered (clean MQTT session) and time out in the app, as before.
 
+- **`config.yaml` is never half written** (SYNC.md v1.14.2 item 8 f — listed there as found and not
+  fixed; beyond the contract's agent item c). `update_pins` opened `config.yaml` for writing and
+  streamed `yaml.dump` into it, so a power cut or an error mid-write left it truncated: the agent
+  cannot start on it — no over-the-air update can reach a board then — and the next join's guard
+  refuses it, i.e. the terminal again; and 0.3.4 is the last version a terminal installs. Now the
+  whole text is dumped first, written to `.config.yaml.pins-*` in the same directory (mode 600, then
+  the old file's mode — it holds the token), fsynced, renamed over `config.yaml`, and the directory
+  fsynced: a power cut leaves the old file or the new one. A temporary file left by a cut-off write
+  is removed by the next one (it is not the join's `config.yaml.new`). Where the rename is refused
+  (a `config.yaml` bind-mounted on its own) it writes in place, logged. Tests (4): an error halfway
+  leaves the file byte for byte, nothing left behind, the pins still applied in memory; a cut between
+  the write and the rename leaves the old file, the next write cleans up and the guard proceeds; a
+  new inode with mode 600 / 640 kept; the in-place fallback. Mutation-checked: the old in-place
+  write, the mode not carried over, no clean-up — each fails them.
+
 Verified: `tests/test_join_safety.py` (72) — the 12 status vectors through a port of the contract's
 `storedFirmwareVersion` (then applied to what this agent sends: its heartbeat stores
 `__version__`, its clean stop leaves it); `__version__` matches the iot-node pattern and is not
@@ -196,10 +211,11 @@ Verified: `tests/test_join_safety.py` (72) — the 12 status vectors through a p
 changed or unreadable mid-run; no default; the MQTT failure; the last will; all 21 guard vectors
 through bash; the update_pins round trip for 14 ids; nothing else reads the uid as text; the first
 request at boot with no broker; a full boot to the main loop and a clean stop; a command signed with
-the old token before the promotion, with and without a 503. Mutation-checked, each fails a test: the
+the old token before the promotion, with and without a 503 (and 4 more for the config write, above:
+76 in all). Mutation-checked, each fails a test: the
 0.3.3 heartbeat and reporters, stop() without a version, the `0.1.0` default back, the heartbeat
 re-reading the metadata (either channel), no per-channel try in stop(), the hardware report moved
-after MQTT, the reporter without its token, `bad_signature` not answered. Full suite 757 passed. Not
+after MQTT, the reporter without its token, `bad_signature` not answered. Full suite 761 passed. Not
 run on a Pi, against the broker, or against a backend with the pending credential (not built yet).
 Found, not fixed: in a development venv with a stale editable install `__version__` is that install's
 metadata, not the checkout's (this worktree's tests run as 0.2.1) — on a board the join and the

@@ -434,6 +434,88 @@ def test_nothing_else_in_the_agent_reads_the_uid_as_text(node_uid, tmp_path):
                 assert not re.search(r"""uid:\s*["']""", text), f"{n} matches the uid's quoting in config.yaml"
 
 
+# ====================================================================== config.yaml is never half written
+# SYNC.md v1.14.2 item 8 f: update_pins rewrote config.yaml in place (open(..., "w") then yaml.dump),
+# so a power cut or an error mid-write left it truncated — the agent cannot start on it (no update can
+# reach it then) and the next join's guard refuses it: the terminal again.
+
+def _written_config(tmp_path, node_uid=GUARD_UID):
+    conf = tmp_path / "config.yaml"
+    conf.write_text(_join_config(node_uid), encoding="utf-8")
+    os.chmod(conf, 0o600)
+    return conf
+
+
+def test_a_write_that_fails_halfway_leaves_config_yaml_as_it_was(tmp_path, monkeypatch, caplog):
+    import agal_one_agent.config as config_mod
+    conf = _written_config(tmp_path)
+    before = conf.read_bytes()
+    cfg = AgentConfig.from_yaml(str(conf))
+
+    def dump(*a, **kw):
+        stream = a[1] if len(a) > 1 else kw.get("stream")
+        if stream is not None:
+            stream.write("node:\n  uid: ")  # as far as a streaming dump gets before the error
+        raise yaml.representer.RepresenterError("cannot represent an object")
+
+    monkeypatch.setattr(config_mod.yaml, "dump", dump)
+    cfg.update_pins(SYNCED_PINS, str(conf))
+    assert conf.read_bytes() == before
+    assert os.listdir(tmp_path) == ["config.yaml"], "no temporary file left behind"
+    assert any("Failed to persist pin config" in r.getMessage() for r in caplog.records)
+    assert [p.physical_pin for p in cfg.pins] == [11, 3], "the pins still apply in memory"
+
+
+def test_a_cut_off_write_leaves_the_old_file_and_the_next_one_cleans_up(tmp_path, monkeypatch):
+    import agal_one_agent.config as config_mod
+    conf = _written_config(tmp_path)
+    before = conf.read_bytes()
+    cfg = AgentConfig.from_yaml(str(conf))
+
+    def power_cut(src, dst):
+        raise SystemExit("power cut between the write and the rename")
+
+    monkeypatch.setattr(config_mod.os, "replace", power_cut)
+    with pytest.raises(SystemExit):
+        cfg.update_pins(SYNCED_PINS, str(conf))
+    assert conf.read_bytes() == before
+    # A real power cut leaves the temporary file (it holds the token, mode 600): the next write removes it.
+    stale = tmp_path / ".config.yaml.pins-left"
+    stale.write_text("node:\n  uid: Nd7", encoding="utf-8")
+    monkeypatch.undo()
+    cfg.update_pins(SYNCED_PINS, str(conf))
+    assert sorted(os.listdir(tmp_path)) == ["config.yaml"]
+    assert _run_guard(GUARD_UID, str(conf)) == "proceed"
+
+
+def test_the_new_file_is_renamed_into_place_with_the_old_files_mode(tmp_path):
+    conf = _written_config(tmp_path)
+    inode = os.stat(conf).st_ino
+    AgentConfig.from_yaml(str(conf)).update_pins(SYNCED_PINS, str(conf))
+    st = os.stat(conf)
+    assert st.st_ino != inode, "replaced by a rename, not rewritten in place"
+    assert (st.st_mode & 0o777) == 0o600, "config.yaml holds the token: it stays 600"
+    os.chmod(conf, 0o640)
+    AgentConfig.from_yaml(str(conf)).update_pins(SYNCED_PINS[:1], str(conf))
+    assert (os.stat(conf).st_mode & 0o777) == 0o640
+    assert [p.physical_pin for p in AgentConfig.from_yaml(str(conf)).pins] == [11]
+
+
+def test_where_the_rename_is_refused_it_writes_in_place(tmp_path, monkeypatch, caplog):
+    import errno
+    import agal_one_agent.config as config_mod
+    conf = _written_config(tmp_path)
+
+    def busy(src, dst):
+        raise OSError(errno.EBUSY, "Device or resource busy")  # config.yaml bind-mounted on its own
+
+    monkeypatch.setattr(config_mod.os, "replace", busy)
+    AgentConfig.from_yaml(str(conf)).update_pins(SYNCED_PINS, str(conf))
+    assert [p.physical_pin for p in AgentConfig.from_yaml(str(conf)).pins] == [11, 3]
+    assert os.listdir(tmp_path) == ["config.yaml"]
+    assert any("writing it in place" in r.getMessage() for r in caplog.records)
+
+
 # ====================================================================== H2: the token at boot
 
 class _Stop(Exception):

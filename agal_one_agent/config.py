@@ -1,8 +1,72 @@
 """YAML configuration loader for Agal One Agent."""
 
+import glob
+import logging
+import os
+import stat
+import tempfile
 from dataclasses import dataclass, field
 from typing import Optional
 import yaml
+
+logger = logging.getLogger(__name__)
+
+#: The temporary file update_pins writes next to config.yaml before renaming it into place. Not
+#: config.yaml.new, which is the join script's own (it removes one left by an earlier run).
+_PINS_TMP_PREFIX = ".config.yaml.pins-"
+
+
+def _replace_config(path: str, text: str) -> None:
+    """Replace ``path`` with ``text`` so that it is never half written: a temporary file in the same
+    directory (mode 600 while written, then the old file's mode — config.yaml holds the node's
+    token), flushed and fsynced, renamed over it, the directory fsynced. A power cut leaves the old
+    file or the new one, never a truncated one (contracts v1.14.2 join safety, SYNC.md item 8 f:
+    agents up to 0.3.4 as first built rewrote it in place, and a truncated config.yaml stops the
+    agent from starting — no over-the-air update can reach it then, and the join's guard refuses the
+    file: only the terminal is left). Where the rename is refused (a bind-mounted single file) it
+    falls back to writing in place, logged."""
+    path = os.path.abspath(path)
+    directory = os.path.dirname(path)
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        mode = 0o600
+    for stale in glob.glob(os.path.join(directory, _PINS_TMP_PREFIX + "*")):
+        try:
+            os.unlink(stale)  # left by a write that was cut off; it may hold the token
+        except OSError:
+            pass
+    fd, tmp = tempfile.mkstemp(prefix=_PINS_TMP_PREFIX, dir=directory)  # 0600
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        try:
+            os.replace(tmp, path)
+        except OSError as e:
+            logger.warning("config.yaml could not be replaced by a rename (%s); writing it in place", e)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.unlink(tmp)
+            return
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        dfd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass  # a directory that cannot be opened for fsync (not on a Linux board)
 
 
 @dataclass
@@ -308,12 +372,11 @@ class AgentConfig:
 
             data["pins"] = yaml_pins
 
-            with open(config_path, "w") as f:
-                yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+            # The whole text first, then one rename: a failure anywhere leaves config.yaml as it was.
+            _replace_config(config_path, yaml.dump(data, default_flow_style=False, sort_keys=False))
 
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).error("Failed to persist pin config: %s", e)
+            logger.error("Failed to persist pin config: %s", e)
 
     @classmethod
     def from_yaml(cls, path: str) -> "AgentConfig":
