@@ -380,6 +380,12 @@ def _safety(p: Program, safety: dict) -> None:
         ref = card.ports.get(sk) if card else None
         if ref is None or is_output_port(ref.transport):
             raise CompileError(f"{what}: {sk} of card {aid} is not an input of this node")
+        if not is_digital_input(ref.transport):
+            # A sense the node judges present or absent is a contact: an analog reading has no threshold in the
+            # contract (iot-node powerSense allows an AI port), and "not exactly zero" would read noise or an
+            # offset as present — a mains cut never sensed, a latching valve never put in FAULT.
+            raise CompileError(f"{what}: {sk} of card {aid} is an analog input — the node senses it present or absent "
+                               "only on a digital input")
         return aid, sk
     e = safety.get("emergencyStop")
     if e:

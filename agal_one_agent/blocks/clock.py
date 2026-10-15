@@ -38,7 +38,7 @@ class SystemClock(Clock):
     def __init__(self, probe_interval: float = 60.0, assume_ok: Optional[bool] = None):
         self._probe_interval = probe_interval
         self._assume_ok = assume_ok
-        self._last_probe = 0.0
+        self._last_probe: Optional[float] = None  # the first call probes (monotonic time can be under a minute at boot)
         self._ok = True
 
     def monotonic(self) -> float:
@@ -54,7 +54,7 @@ class SystemClock(Clock):
         if self._assume_ok is not None:
             return self._assume_ok
         now = time.monotonic()
-        if now - self._last_probe < self._probe_interval:
+        if self._last_probe is not None and now - self._last_probe < self._probe_interval:
             return self._ok
         self._last_probe = now
         self._ok = _probe_clock()

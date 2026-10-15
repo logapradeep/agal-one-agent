@@ -94,18 +94,61 @@ while its part holds (a latching valve in FAULT after an unclean boot) is announ
 before; after a restart every output starts off (a latching valve known open gets one close pulse); a valve reset
 when it is not in fault is refused.
 
+**Review fixes (same version, still not tagged).** A review of 0.4.0 found paths where a built-in could be lost or a
+line left driven; each is fixed, with a test in `tests/test_v3_corners.py` that fails without its fix:
+
+- **The E-stop latch is never taken off on the node** (§7.10). A program without the E-stop is refused while it is
+  latched — a take-over, a cold load after a restart with the latch persisted, and a switch back to language 1 alike
+  (`refused: the E-stop is latched at the panel …`). Before, the latch belonged to no program after such a
+  recompile: the held blocks resumed and the pump restarted with no reset at the panel. An unreadable state file is
+  read as latched (the safe reading, as for an unreadable contact).
+- **Debounced inputs at boot**: the first reading of a digital input is its value (a debounce filters changes). It
+  was withheld, so with `debounceMs` on the E-stop or a supply sense every boot latched the E-stop and put each
+  latching valve in FAULT.
+- **A state directory that cannot be written** (a read-only SD card): no latching pulse is sent when its
+  pulse-in-progress mark cannot be recorded (FAULT `position_unknown`), and a start that cannot record itself as not
+  clean puts every latching valve in FAULT. Before, a restart could vouch for a valve that had opened since.
+- **Never both coils at once**: each latching coil's line is tracked; the other coil is written off before a pulse
+  unless it is known off, and no pulse is sent when it cannot be; a pulse that fails is followed by an off-write, and
+  a coil not known off is written off with every pass's switch-offs. A pulse mark found at boot leaves that coil
+  unknown (written off at the boot pass).
+- **A line an old output drove** (§7.5): written off before the new program reads it as an input (at the commit of
+  the take-over, before the sampler can read it), so `output_released {level: off}` is true; a line that becomes a
+  latching coil — a continuous valve reconfigured as latching on its line while open — is written off before any
+  pulse. Before, the line stayed driven.
+- **A run interrupted by a power cut whose schedule a reload removes** runs its old end actions when the power is
+  back, before the rules restart (`run_cut_short`, a notice). Before, a latching valve it had open stayed open and
+  the pump restarted with no run to end it.
+- **The guard**: its settings are held to the `MotorGuardSettings` bounds (a NaN or an out-of-range value is the
+  default or the bound, logged), so a bundle cannot switch it off in all but name; a lockout restored after a
+  restart is never longer than the lockout (on a clock that cannot be trusted it runs its full length from the
+  boot); a card that becomes a guarded motor while its output is on is judged from the switch.
+- **A clock that cannot be trusted** (no RTC, no NTP yet): interrupted runs wait to resume until it is trusted, or
+  until their window has certainly passed by the monotonic clock (then `run_cut_short`) — the node is not held
+  meanwhile; the node's date is the last date a trusted clock gave, and no part switches on an untrusted date; a
+  timed pause is never more than 7 days ahead, and one restored on an untrusted clock waits for a trusted one.
+  `SystemClock` probes on its first call (it answered "trusted" for the first minute of uptime without probing).
+- **A today-only part that keeps a schedule id at a later start** runs it, after the every-day run of that id;
+  a run carried into a part that moves its start does not run twice.
+- **An analog input is refused** as the mains sense, the UPS sense or a latching valve's supply: the node senses
+  presence only on a digital input (the contract allows AI there, with no threshold — reported).
+
 Not covered — contract gaps reported with this version: a v3 card's live values (on/off, current) have no message of
 their own (the v1 `variables` message carried AAB variables, and v3 has none); data cards (§4b) are not built in
 this agent; how a `setPower` names a valve card in v3 (`valve.open` here); a block suspended by the backend reaches
 the node as a recompile, so its switch is announced with cause `confirmed`; port ids (DI3) are not in the bundle,
 so refusals name the card and its port; `three_or_two_phase` motors are judged as three phase; an AI phase-sense
-input counts as present when non-zero. The bench page and its physics (`blocks.simulated_io`) and the simulator CLI
-still drive language-1 bundles only.
+input counts as present when non-zero; a gpio port's `debounceMs` is not in the v3 `CompiledTransport` (a strict
+`PortTransport`), so the node table's debounce (a flow switch's 200 ms) does not reach a v3 node; an AI port as a
+power or supply sense has no presence threshold; `instruction_switched.cause` has no value for a part change when the
+clock comes good on another date (the node switches without the event); the golden vectors fix the boot pass's
+writes, so a cold load cannot write the latching coils off (the migration from language 1 does). The bench page and
+its physics (`blocks.simulated_io`) and the simulator CLI still drive language-1 bundles only.
 
 Found on the way, not changed: `--offline` still posts the one-shot hardware report and the program ack over HTTPS,
 and the default ingress URL is the production one.
 
-93 tests in `tests/test_v3_*.py` (a fake I/O, a SimClock, no hardware): the golden vectors of
+121 tests in `tests/test_v3_*.py` (a fake I/O, a SimClock, no hardware): the golden vectors of
 `contracts/programs/vectors` run through the runtime in 1 s passes — `instruction-switch.json` (adding Valve 2 while
 Valve 1 runs: the motor and Valve 1 never stop), `rule-edit-swap.json`, `rewire-swap.json` — with both bundles of
 `two-node-layout.json`, the cross-node cases of `cross-node-refused.json` and the field box side of the rewire; one

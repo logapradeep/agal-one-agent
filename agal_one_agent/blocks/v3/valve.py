@@ -69,9 +69,21 @@ class ValveDriver:
         self.fault_at: Optional[datetime] = None
         self.pulse_mark: Optional[str] = None    # "open" | "close" while a pulse is in progress
         self.coil_written: Optional[bool] = None  # continuous: the coil level last written
+        # Latching: what each coil line is known to be — False known off, True left on (a line the old program
+        # drove as a level), None unknown (an off-write that failed, a pulse cut short). Every output starts off
+        # at a cold load, so both coils start known off; a coil that is not known off is written off before
+        # any pulse of the other one ("never both at once").
+        self.coil_state: dict[str, Optional[bool]] = {k: False for k in (self.open_key, self.close_key) if k} if self.latching else {}
 
     def coil_ports(self) -> list[PortRef]:
         return [p for p in (self.open_port, self.close_port) if p is not None]
+
+    def coils(self) -> list[tuple[str, PortRef]]:
+        """Latching: (coil key, port) of the open and the close coil."""
+        return [(k, p) for k, p in ((self.open_key, self.open_port), (self.close_key, self.close_port)) if k and p is not None]
+
+    def coils_known_off(self) -> bool:
+        return all(v is False for v in self.coil_state.values())
 
     def coil_level(self, want_open: bool) -> bool:
         """Continuous: the coil level that gives ``want_open``."""
@@ -103,8 +115,15 @@ class ValveDriver:
     def carry_from(self, old: "ValveDriver") -> None:
         for f in ("position", "fault", "fault_detail", "fault_at", "pulse_mark"):
             setattr(self, f, getattr(old, f))
-        if old.open_port.transport == self.open_port.transport:
-            self.coil_written = old.coil_written  # the same line: nothing to write
+        if old.open_port.transport == self.open_port.transport and not old.latching and not self.latching:
+            self.coil_written = old.coil_written  # the same line, the same use: nothing to write
+        if old.latching and self.latching:
+            # A coil on the line the old driver's same coil used keeps what it is known to be; any other coil line
+            # is set by the runtime's take-over from what the old program drove there.
+            for k, p in self.coils():
+                ok = dict(old.coils()).get(k)
+                if ok is not None and ok.transport == p.transport:
+                    self.coil_state[k] = old.coil_state.get(k)
 
     def to_state(self) -> dict:
         if not self.latching:

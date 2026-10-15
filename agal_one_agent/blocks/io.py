@@ -124,6 +124,9 @@ class SimulatedIO(IOAdapter):
         # (the shape of the bundle-v3 golden vectors' `writes`).
         self.log: list[dict] = []
         self.pulses: list[tuple[str, str, int]] = []
+        # For each pulse: the outputs that were on while it ran (the coil being pulsed excluded) — what a test
+        # checks "never both coils at once" against.
+        self.on_during_pulse: list[tuple[tuple[str, str], set[tuple[str, str]]]] = []
         self._allowed = allowed_gpios
         self._listener: Optional[Callable[[], None]] = None
 
@@ -146,8 +149,12 @@ class SimulatedIO(IOAdapter):
         self.log.append({"assetId": port.asset_id, "sourceKey": port.source_key, "value": value})
 
     def pulse(self, port: PortRef, ms: int) -> None:
+        key = (port.asset_id, port.source_key)
         self.pulses.append((port.asset_id, port.source_key, int(ms)))
         self.log.append({"assetId": port.asset_id, "sourceKey": port.source_key, "pulseMs": int(ms)})
+        self.outputs[key] = True  # on for ms, then off: the coil ends off
+        self.on_during_pulse.append((key, {k for k, v in self.outputs.items() if v and k != key}))
+        self.outputs[key] = False
 
     def output(self, asset_id: str, source_key: str, default=None) -> Any:
         return self.outputs.get((asset_id, source_key), default)

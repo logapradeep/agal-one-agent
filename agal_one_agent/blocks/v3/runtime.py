@@ -50,6 +50,12 @@ logger = logging.getLogger(__name__)
 STATE_FILE = "blocks_v3_state.json"
 KEEPALIVE_PERSIST_SECONDS = 60.0  # while a run is in progress: what a restart needs to know how long it had left
 NODE = "node"                      # event source of the built-ins (functions.yaml 1.11.0: "source node")
+PAUSE_MAX_SECONDS = 7 * 86400      # functions.yaml pauseAutomation `until`: at most 7 days ahead
+# README §7.10: removing the E-stop is refused while it is latched, and never clears a latch. The cloud refuses it
+# too, but it sees the latch only through the heartbeat; the node is the one that knows.
+LATCH_KEPT = ("refused: the E-stop is latched at the panel — a program without it is not taken while it is latched; "
+              "it clears only at the panel")
+UNREADABLE = "__unreadable__"
 
 
 def _iso(dt: Optional[datetime]) -> Optional[str]:
@@ -79,6 +85,13 @@ def _parse(s) -> Optional[datetime]:
         return None
 
 
+def _start_spec(sd: dict) -> str:
+    """What a schedule starts at, in words that survive a swap: its HH:MM, or its sun event and offset."""
+    if sd.get("start"):
+        return str(sd["start"])
+    return f"{sd.get('sunEvent')}{int(sd.get('offsetMinutes') or 0):+d}"
+
+
 class Run:
     """A schedule run in progress on a layout — carried by (layout, schedule id) across the layout's parts."""
 
@@ -101,6 +114,9 @@ class Run:
         self.cut_short_at_end = False           # it ends at its window's end, before its time was up
         self.over_while_held = False            # its planned end passed while its block held
         self.resumed_at: Optional[float] = None
+        # Interrupted: the monotonic time by which its window has certainly passed, whatever the wall clock says
+        # (from the room it had when it was interrupted, or at the stop) — what decides it on a clock not trusted.
+        self.window_mono_end: Optional[float] = None
 
     @property
     def window_end(self) -> datetime:
@@ -150,6 +166,10 @@ class _State:
         self.resume_at: Optional[float] = None
         self.resume_cause = "power"
         self.date: Optional[str] = None
+        self.date_trusted = True                # st.date came from a clock that could be trusted
+        self.pause_rederive = False             # a timed pause restored on a clock not trusted: re-derived when it is
+        self.await_clock: Optional[str] = None  # interrupted runs wait for a trusted clock to resume (the cause)
+        self.commit_offs: list[tuple[PortRef, bool]] = []  # lines written off when the take-over is committed
 
     def copy(self) -> "_State":
         s = _State.__new__(_State)
@@ -157,7 +177,7 @@ class _State:
         s.runs = {k: r.copy() for k, r in self.runs.items()}
         s.sched = {k: dict(v) for k, v in self.sched.items()}
         for f in ("orphans", "releases", "now_releases", "line_releases", "release_events", "switches",
-                  "pending_events", "manual_on"):
+                  "pending_events", "manual_on", "commit_offs"):
             setattr(s, f, list(getattr(self, f)))
         s.held = {k: set(v) for k, v in self.held.items()}
         s.hold_runs = {k: dict(v) for k, v in self.hold_runs.items()}
@@ -197,6 +217,7 @@ class RuntimeV3:
         self._noted_runs: set[str] = set()
         self._events_now: list[tuple[str, dict]] = []
         self._alert_last: dict[tuple[str, str], float] = {}
+        self._persist_failing = False
         if listen:
             self.io.set_change_listener(self._on_input_change)
 
@@ -229,6 +250,10 @@ class RuntimeV3:
         prog = P.build(bundle, self.io)
         with self._lock:
             warm = self.prog is not None and not self._cold
+            refusal = self.latch_refusal(prog)
+            if refusal:
+                logger.error("program v%s refused: %s", prog.version, refusal)
+                raise CompileError(refusal)
             try:
                 st = self._take_over(prog) if warm else self._cold_load(prog)
             except CompileError:
@@ -236,24 +261,73 @@ class RuntimeV3:
             except Exception as e:  # noqa: BLE001
                 logger.error("program v%s could not take over from the running program: %s", prog.version, e, exc_info=True)
                 raise CompileError(f"could not take over from the running program: {e}") from e
+            if not warm and not self._persist(prog=prog, st=st):
+                # The start is recorded as not clean before anything moves (README §7.9): if it cannot be, a later
+                # restart would vouch for positions that changed since. Nothing pulses a latching valve until the
+                # node can remember what it did.
+                self._cannot_record(prog, st)
             self.prog, self.st = prog, st
             self._cold = False
             self._applied_pending = True
             self._persist_due = True
+            self._commit_offs()
         logger.info("program v%d (language 3) compiled%s: %d cards, %d rule slots, %d instruction parts",
                     prog.version, " (took over from the running program)" if warm else "", len(prog.cards),
                     len(prog.rules), len(prog.parts))
+
+    def latch_refusal(self, prog: Program) -> Optional[str]:
+        """README §7.10: a program without the E-stop is refused while the E-stop is latched — the latch belongs
+        to no program then, and nothing would keep the motors off until the panel reset. Checked against the
+        running program, and, before a cold load, against the latch the node persisted."""
+        if prog.estop is not None:
+            return None
+        with self._lock:
+            if self.prog is not None and self.prog.estop is not None and self.prog.estop.latched:
+                return LATCH_KEPT
+            if self.prog is None or self._cold:
+                saved = self._read_state() or {}
+                if (saved.get("estop") or {}).get("latched"):
+                    return LATCH_KEPT
+        return None
+
+    def _cannot_record(self, prog: Program, st: _State) -> None:
+        wall = self.clock.now(prog.tz)
+        detail = "the node cannot write its state directory: it could not vouch for the position after a restart"
+        for aid, drv in prog.valves.items():
+            if drv.latching and drv.set_fault("position_unknown", detail, wall):
+                st.pending_events.append(("__valve_fault__", {"assetId": aid, "reason": "position_unknown", "detail": detail}))
+        logger.error("the v3 state cannot be written: every latching valve is in FAULT until it can be")
+
+    def _commit_offs(self) -> None:
+        """Lines an old output drove that the new program reads as inputs: written off and let go of as the
+        take-over is committed — before anything samples them as an input (the sampler runs between passes)."""
+        offs, self.st.commit_offs = self.st.commit_offs, []
+        for port, _ in sorted(offs, key=lambda o: 0 if o[1] else 1):  # motors first
+            try:
+                self.io.write_output(port, False)
+                self.io.release_output(port)
+            except Exception as e:  # noqa: BLE001
+                logger.error("switching off %s of card %s before it is read as an input failed: %s", port.source_key,
+                             port.asset_id, e)
 
     # --------------------------------------------------------- the cold load
 
     def _cold_load(self, prog: Program) -> _State:
         """The first program, or the first after a stop: built from the persisted state, as after a restart."""
         now, wall = self.clock.monotonic(), self.clock.now(prog.tz)
+        clock_ok = self.clock.clock_ok()
         st = _State()
-        st.date = wall.date().isoformat()
         saved = self._read_state()
         first_start = saved is None
         saved = saved or {}
+        unreadable = bool(saved.get(UNREADABLE))
+        # The node's date. On a clock that cannot be trusted (no RTC, no NTP yet) it is the last date a trusted
+        # clock gave, kept in the state; the midnight switch waits for a trusted clock (README §7.6).
+        if clock_ok:
+            st.date, st.date_trusted = wall.date().isoformat(), True
+        else:
+            kept = saved.get("date") if saved.get("dateTrusted") else None
+            st.date, st.date_trusted = (kept or wall.date().isoformat()), bool(kept)
         clean = bool(saved.get("cleanStop"))
         valves = saved.get("valves") or {}
         for aid, drv in prog.valves.items():
@@ -284,15 +358,22 @@ class RuntimeV3:
             if reason:
                 drv.set_fault(reason, FAULT_WORDS[reason], wall)
                 st.pending_events.append(("__valve_fault__", {"assetId": aid, "reason": reason}))
+            if isinstance(ent, dict) and ent.get("pulse") in ("open", "close"):
+                # A pulse was in progress when the node stopped: that coil may still be on. Written off at the
+                # boot pass, before anything else is pulsed.
+                drv.coil_state[drv.open_key if ent["pulse"] == "open" else drv.close_key] = None
         for aid, g in prog.guards.items():
             ent = (saved.get("guards") or {}).get(aid)
             if isinstance(ent, dict):
-                g.load_state(ent, now, wall)
+                g.load_state(ent, now, wall, clock_ok)
         es = saved.get("estop") or {}
-        if prog.estop is not None and es.get("latched"):
+        if prog.estop is not None and (es.get("latched") or unreadable):
+            # An unreadable state is read as latched — the safe reading, as for an unreadable contact.
             prog.estop.latched = True
             prog.estop.pressed_at = _parse(es.get("pressedAt"))
             prog.estop.latched_mono = now
+            if unreadable:
+                logger.error("the v3 state is unreadable: the E-stop is taken as latched — it clears at the panel")
         auto = saved.get("automation") or {}
         if auto.get("state") == "paused":
             st.paused = True
@@ -300,10 +381,15 @@ class RuntimeV3:
             st.manual_on = list(auto.get("manualOn") or [])
             st.paused_mono = now
             until = _parse(auto.get("resumeAt"))
-            st.pause_until = now + max(0.0, (until - wall).total_seconds()) if until else None
+            if until is not None and not clock_ok:
+                st.pause_until, st.pause_rederive = None, True  # how long it has left is known once the clock is
+            else:
+                st.pause_until = self._pause_end(until, now, wall)
         for k, v in (saved.get("schedules") or {}).items():
             if isinstance(v, dict):
                 st.sched[k] = {"lastRunDate": v.get("lastRunDate"), "missedDate": v.get("missedDate")}
+                if v.get("lastRunStart") is not None:
+                    st.sched[k]["lastRunStart"] = v["lastRunStart"]
         # Runs in progress when the node stopped were interrupted by the restart: they resume 30 s after
         # the boot pass, inside their window (README §7.8). Their outputs start off, as every output does.
         saved_at = _parse(saved.get("savedAt"))
@@ -312,6 +398,11 @@ class RuntimeV3:
             if run is None:
                 continue
             part = prog.active_part(run.layout, st.date)
+            if (part is None or run.sid not in part.schedules) and not clock_ok:
+                # On a clock not trusted the date may be wrong: the part it ran in, if the program still has it.
+                # Whether it resumes is decided once the clock is trusted (or its window has certainly passed).
+                kept = prog.block(run.part_key)
+                part = kept if kept is not None and kept.kind == "part" and run.sid in kept.schedules else part
             if part is None or run.sid not in part.schedules:
                 logger.info("run %s was in progress at the stop; its schedule is not in the program now: it is over", run.key)
                 continue
@@ -330,13 +421,14 @@ class RuntimeV3:
             run = Run(r["layout"], r["sid"], r["partKey"], start, float(r["duration"]), float(r.get("window") or 3600), now)
             run.planned_end = planned_end
             run.state = "interrupted"
+            ref = saved_at or start
             if r.get("state") == "interrupted" and r.get("remaining") is not None:
                 run.remaining = float(r["remaining"])
             else:
-                ref = saved_at or start
                 run.remaining = max(0.0, (planned_end - ref).total_seconds())
             run.end_mono = None
             run.interrupted_at = now
+            run.window_mono_end = now + max(0.0, (run.window_end - ref).total_seconds())
             run.lost = float(r.get("lost") or 0.0)
             for s in r.get("onKeys") or []:
                 a, _, k = str(s).partition(" ")
@@ -377,36 +469,45 @@ class RuntimeV3:
         if new.estop is not None and old.estop is not None:
             new.estop.carry_from(old.estop)
         elif old.estop is not None and old.estop.latched:
-            logger.error("the E-stop left the bundle while latched: the latch is kept off the program — nothing restarts by it")
+            raise CompileError(LATCH_KEPT)  # compile() refuses it first; never taken whatever the path
         if new.power is not None and old.power is not None:
             new.power.carry_from(old.power)
         # Outputs: carried by their stable key.
-        in_use = new.physical_in_use()
         for key, out in new.outputs.items():
             o = old.outputs.get(key)
             if o is None:
                 continue
             out.level, out.changed_at, out.last_writer = o.level, o.changed_at, o.last_writer
-            if out.port is not None and o.port is not None:
-                if out.port.transport == o.port.transport:
-                    out.written = o.written
-                elif physical_port(o.port.transport) not in in_use:
-                    st.line_releases.append((o.port, o.is_motor))
-        for key, o in old.outputs.items():
-            if key in new.outputs:
+            if out.port is not None and o.port is not None and out.port.transport == o.port.transport:
+                out.written = o.written
+        for key in old.outputs:
+            if key not in new.outputs:
+                st.release_events.append(key)
+        # Every line the old program drove, by what uses it now (§7.5: the swap switches nothing by itself, and
+        # what it lets go of is let go of switched off):
+        # * nothing — written off and freed at the switch pass;
+        # * the same output, or the same valve coil — carried, nothing written;
+        # * an input — written off and freed as the take-over is committed, before anything reads it;
+        # * a latching coil — the driver writes it off before any pulse ("never both coils at once");
+        # * another output or a continuous coil — its first write at the switch pass sets the line.
+        now_roles = self._line_roles(new)
+        for line, (port, is_motor, level, role) in self._lines_driven(old).items():
+            use = now_roles.get(line)
+            if use is None:
+                st.line_releases.append((port, is_motor))
+            elif use == role:
                 continue
-            ports = [o.port] if o.port is not None else (o.valve.coil_ports() if o.valve is not None else [])
-            for port in ports:
-                if physical_port(port.transport) not in in_use:
-                    st.line_releases.append((port, o.is_motor))
-            st.release_events.append(key)
-        for aid, od in old.valves.items():  # a valve's coils moved to other lines
-            nd = new.valves.get(aid)
-            if nd is None:
-                continue
-            for op, np_ in ((od.open_port, nd.open_port), (od.close_port, nd.close_port)):
-                if op is not None and (np_ is None or np_.transport != op.transport) and physical_port(op.transport) not in in_use:
-                    st.line_releases.append((op, False))
+            elif use[0] == "in":
+                if level is not False:
+                    st.commit_offs.append((port, is_motor))
+            elif use[0] == "coil" and use[2] != "continuous":
+                new.valves[use[1]].coil_state[use[2]] = level
+        # A card that becomes a guarded motor while its output is on: the guard judges it from the switch (its
+        # inrush window starts now) — it is always on (§7.11).
+        for aid, g in new.guards.items():
+            out = new.outputs.get((aid, g.output))
+            if aid not in old.guards and out is not None and out.written is not None and is_on(out.written):
+                g.started(now)
         # Inputs keep their sampled value (and since()) by their key.
         keep = {(r.asset_id, r.source_key) for r in new.inputs}
         for d in (st.inputs, st.input_changed, st.debounce):
@@ -431,6 +532,49 @@ class RuntimeV3:
         # What no block writes any more (ADR-029 decision 7).
         self._plan_releases(st, old, new, today, now, wall)
         return st
+
+    @staticmethod
+    def _line_roles(prog: Program) -> dict:
+        """physical line → what the program uses it as: ("in",), ("out", key), ("coil", assetId, "continuous") or a
+        latching coil ("coil", assetId, coil key)."""
+        roles: dict = {}
+        for aid in prog.card_order:
+            drv = prog.valves.get(aid)
+            coils = ({k: k for k, _ in drv.coils()} if drv.latching else {drv.open_key: "continuous"}) if drv is not None else {}
+            for sk, ref in prog.cards[aid].ports.items():
+                line = physical_port(ref.transport)
+                if not P.is_output_port(ref.transport):
+                    roles.setdefault(line, ("in",))
+                elif sk in coils:
+                    roles[line] = ("coil", aid, coils[sk])
+                else:
+                    roles[line] = ("out", (aid, sk))
+        return roles
+
+    @classmethod
+    def _lines_driven(cls, prog: Program) -> dict:
+        """physical line → (port, is a motor, how the program left it — True on, False off, None unknown, role) for
+        every output line of the program. A line never written is off: every output starts off at a cold load."""
+        roles = cls._line_roles(prog)
+        out: dict = {}
+        for aid in prog.card_order:
+            drv = prog.valves.get(aid)
+            for sk, ref in prog.cards[aid].ports.items():
+                if not P.is_output_port(ref.transport):
+                    continue
+                line = physical_port(ref.transport)
+                role = roles[line]
+                if role[0] == "coil" and role[2] != "continuous":
+                    level = drv.coil_state.get(sk, False)
+                elif role[0] == "coil":
+                    level = bool(drv.coil_written) if drv.coil_written is not None else False
+                else:
+                    o = prog.outputs.get(role[1])
+                    level = is_on(o.written) if o is not None and o.written is not None else False
+                    out[line] = (ref, bool(o is not None and o.is_motor), level, role)
+                    continue
+                out[line] = (ref, False, level, role)
+        return out
 
     @staticmethod
     def _carry_block(ob: Block, blk: Block) -> None:
@@ -481,14 +625,28 @@ class RuntimeV3:
                 if diff:
                     run.pending = (run.pending or []) + diff
                 run.on_keys |= P.start_set(new_part, s_new)
+                # The carried run IS that schedule's run today: its new start does not start it again.
+                st.sched.setdefault(key, {})["lastRunStart"] = _start_spec(s_new)
                 continue
             st.runs.pop(key)
-            if run.state != "running" or src is None or s_old is None:
-                logger.info("run %s left the program while interrupted: it is over", key)
+            if src is None or s_old is None:
+                logger.info("run %s left the program: it is over", key)
                 continue
-            st.orphans.append({"end": run.end_mono, "layout": layout, "sid": run.sid, "partKey": run.part_key,
-                               "actions": [P.stable_action(src, a) for a in s_old.get("endActions") or []],
-                               "raw": [dict(a) for a in s_old.get("endActions") or []], "planned_end": _iso(run.planned_end)})
+            ends = {"layout": layout, "sid": run.sid, "partKey": run.part_key,
+                    "actions": [P.stable_action(src, a) for a in s_old.get("endActions") or []],
+                    "raw": [dict(a) for a in s_old.get("endActions") or []], "planned_end": _iso(run.planned_end)}
+            if run.state == "running":
+                st.orphans.append(dict(ends, end=run.end_mono))
+                continue
+            # Interrupted (a power cut, a restart) and gone: it can never resume, but it is still a run in progress —
+            # what it opened stays open (a latching valve on its UPS) until its old end actions run. They run at
+            # once; an orphaned end waits while the power does, so they run when the power is back, before the rules
+            # start the pump again. A notice that its run was cut short.
+            logger.info("run %s left the program while interrupted: its old end actions run when the power is back", key)
+            st.orphans.append(dict(ends, end=now, quiet=True))
+            gap = round(max(0.0, now - (run.interrupted_at if run.interrupted_at is not None else now)), 1)
+            st.pending_events.append(("__emit__", {"type": "run_cut_short", "source": "program", "layout": layout,
+                                                   "payload": {"scheduleId": run.sid, "gapSeconds": gap}}))
 
     def _switch_record(self, layout: str, old_part: Optional[Block], new_part: Optional[Block], cause: str) -> dict:
         ck, _, cid = layout.partition(":")
@@ -572,6 +730,11 @@ class RuntimeV3:
                         coil = drv.coil_level(False)
                         self.io.write_output(drv.open_port, coil)
                         drv.coil_written = coil
+                    elif drv is not None:
+                        for k, port in drv.coils():  # a coil that is not known off is written off; the valve stays
+                            if drv.coil_state.get(k, False) is not False:
+                                self.io.write_output(port, False)
+                                drv.coil_state[k] = False
                     continue
                 if out.card.safe_state == "last_state":
                     continue
@@ -632,8 +795,14 @@ class RuntimeV3:
                 if st.power_wait == "restart":
                     st.resume_at = now + P.RESUME_AFTER_POWER_SECONDS
             for t, pl in [e for e in st.pending_events if e[0] == "__valve_fault__"]:
-                self._announce_fault(pl["assetId"], pl["reason"], now, wall)
-            st.pending_events = [e for e in st.pending_events if e[0] != "__valve_fault__"]
+                self._announce_fault(pl["assetId"], pl["reason"], now, wall, pl.get("detail", ""))
+            for t, pl in [e for e in st.pending_events if e[0] == "__emit__"]:
+                payload = dict(pl["payload"])
+                if pl.get("layout"):
+                    payload["program"] = {"version": p.version, "block": "instruction", "containerId": pl["layout"].partition(":")[2],
+                                          "slot": "instruction", "nodeUid": self.node_uid}
+                self._emit(pl["type"], payload, pl.get("source") or "program")
+            st.pending_events = [e for e in st.pending_events if e[0] not in ("__valve_fault__", "__emit__")]
             before = {k: is_on(o.level) for k, o in p.outputs.items()}
             self._midnight(now, wall)
             # 2. the built-ins
@@ -646,7 +815,7 @@ class RuntimeV3:
             self._holds(now, wall)
             self._now_releases(now)
             # 3. the instruction parts
-            today = wall.date().isoformat()
+            today = self._today(wall)
             if st.resuming is not None:
                 for blk in p.blocks():
                     if not blk.interlock:
@@ -698,15 +867,21 @@ class RuntimeV3:
                 continue
             if digital:
                 raw = bool(raw)
-                d = st.debounce.setdefault(key, {"raw": raw, "since": now, "last": None})
-                interval = (now - d["last"]) if d["last"] is not None else None
-                d["last"] = now
-                if d["raw"] != raw:
-                    d["raw"], d["since"] = raw, now
-                deb = float(ref.transport.get("debounceMs") or 0) / 1000.0
-                if not ((now - d["since"]) >= deb or (interval is not None and interval >= deb)):
-                    continue
-                val = raw
+                d = st.debounce.get(key)
+                if d is None:
+                    # The first reading of an input is its value: a debounce filters changes, not the first value.
+                    # (Withheld, an E-stop contact would read as pressed and a sensed supply as lost at every boot.)
+                    st.debounce[key] = {"raw": raw, "since": now, "last": now}
+                    val = raw
+                else:
+                    interval = (now - d["last"]) if d["last"] is not None else None
+                    d["last"] = now
+                    if d["raw"] != raw:
+                        d["raw"], d["since"] = raw, now
+                    deb = float(ref.transport.get("debounceMs") or 0) / 1000.0
+                    if not ((now - d["since"]) >= deb or (interval is not None and interval >= deb)):
+                        continue
+                    val = raw
             else:
                 try:
                     val = float(raw)
@@ -732,15 +907,38 @@ class RuntimeV3:
 
     # -------------------------------------------------------------- midnight
 
+    def _today(self, wall: datetime) -> str:
+        """The node's local date: the wall clock's while it can be trusted, else the last date a trusted clock
+        gave (README §7.6 — the node switches part at ITS midnight, on its own clock)."""
+        if self.st.date is not None and not self.clock.clock_ok():
+            return self.st.date
+        return wall.date().isoformat()
+
+    @staticmethod
+    def _pause_end(until: Optional[datetime], now: float, wall: datetime) -> Optional[float]:
+        """A timed pause's end, monotonic: never in the past, never more than 7 days ahead (pauseAutomation)."""
+        if until is None:
+            return None
+        if until.tzinfo is None and wall.tzinfo is not None:
+            until = until.replace(tzinfo=wall.tzinfo)
+        return now + min(float(PAUSE_MAX_SECONDS), max(0.0, (until - wall).total_seconds()))
+
     def _midnight(self, now: float, wall: datetime) -> None:
         st, p = self.st, self.prog
+        if not self.clock.clock_ok():
+            return  # a date from a clock that cannot be trusted switches nothing
         today = wall.date().isoformat()
         if st.date is None:
-            st.date = today
+            st.date, st.date_trusted = today, True
             return
         if today == st.date:
+            st.date_trusted = True
             return
-        yesterday, st.date = st.date, today
+        # The date moved on since the last trusted date: at least one local midnight has passed. When the node's
+        # date itself was a guess (a start on a clock not trusted, with no trusted date kept), the part changes
+        # with no instruction_switched — no midnight is known to have passed, and the event has no other cause.
+        announce = st.date_trusted
+        yesterday, st.date, st.date_trusted = st.date, today, True
         for lk in p.layout_order:
             op, np_ = p.active_part(lk, yesterday), p.active_part(lk, today)
             if op is np_:
@@ -760,8 +958,10 @@ class RuntimeV3:
                 else:
                     st.now_releases.append({"key": key, "layout": lk})
                     rec["released"].append({"assetId": key[0], "sourceKey": key[1], "until": _iso(wall)})
-            st.switches.append(rec)
-            logger.info("midnight: layout %s switches from %s to %s", lk, op.part_id if op else None, np_.part_id if np_ else None)
+            if announce:
+                st.switches.append(rec)
+            logger.info("%s: layout %s switches from %s to %s", "midnight" if announce else "the clock is trusted now", lk,
+                        op.part_id if op else None, np_.part_id if np_ else None)
 
     # ----------------------------------------------------------- power sense
 
@@ -795,14 +995,39 @@ class RuntimeV3:
             if ps is not None and ps.mains_present is False:
                 st.power_wait, st.resume_at = "cut", None  # restarted on the UPS: wait for mains
                 return
-            self._resume_runs(now, wall, st.resume_cause)
-            # "…and the rules start the pump as usual" (README §7.8): the ordinary rule slots restart as after a
-            # program load, so a rule whose condition held through the cut (a latching valve stays open on its
-            # UPS) starts its motor again. Interlocks keep their state: they ran through the cut.
-            for blk in p.blocks():
-                if not blk.interlock:
-                    self._reset_rules(blk)
+            cause = st.resume_cause
             st.power_wait, st.resume_at, st.resume_cause = None, None, "power"
+            if self._clock_decides(now):
+                self._resume_now(now, wall, cause)
+            else:
+                # Where a run is in its window cannot be known on a clock that cannot be trusted (no RTC, no NTP
+                # yet): the interrupted runs wait — their outputs off — until the clock is trusted, or until their
+                # window has certainly passed by the monotonic clock (README §7.8: a run runs only inside its
+                # window). The node is not held meanwhile: the rules run, and a person may switch a motor.
+                st.await_clock = cause
+                logger.warning("the clock cannot be trusted: %s wait to resume until it can",
+                               ", ".join(sorted(k for k, r in st.runs.items() if r.state == "interrupted")))
+        elif st.await_clock is not None and st.power_wait is None and self._clock_decides(now):
+            cause, st.await_clock = st.await_clock, None
+            self._resume_now(now, wall, cause)
+
+    def _clock_decides(self, now: float) -> bool:
+        """Whether the interrupted runs can be resumed or cut short now: on a trusted clock, or when every one's
+        window has certainly passed by the monotonic clock."""
+        if self.clock.clock_ok():
+            return True
+        return all(r.window_mono_end is not None and now >= r.window_mono_end
+                   for r in self.st.runs.values() if r.state == "interrupted")
+
+    def _resume_now(self, now: float, wall: datetime, cause: str) -> None:
+        self.st.await_clock = None
+        self._resume_runs(now, wall, cause, self.clock.clock_ok())
+        # "…and the rules start the pump as usual" (README §7.8): the ordinary rule slots restart as after a
+        # program load, so a rule whose condition held through the cut (a latching valve stays open on its
+        # UPS) starts its motor again. Interlocks keep their state: they ran through the cut.
+        for blk in self.prog.blocks():
+            if not blk.interlock:
+                self._reset_rules(blk)
 
     def _interrupt_runs(self, now: float, wall: datetime) -> None:
         """Mains dropped: each running run is interrupted; motors are switched off, then the continuous
@@ -814,13 +1039,15 @@ class RuntimeV3:
                 run.remaining = max(0.0, (run.end_mono or now) - now)
                 run.end_mono = None
                 run.interrupted_at = now
+                run.window_mono_end = now + max(0.0, (run.window_end - wall).total_seconds())
         for out in p.outputs.values():
             if out.is_motor or (out.kind == "valve" and out.valve is not None and not out.valve.latching):
                 self._set_level(out, off_value(out.type), None, now)
 
-    def _resume_runs(self, now: float, wall: datetime, cause: str) -> None:
+    def _resume_runs(self, now: float, wall: datetime, cause: str, clock_ok: bool = True) -> None:
         """30 s after the power is back (or after the boot pass): each interrupted run resumes for the time it
-        had left, inside its window — planned start to planned end + its startWindowMinutes (README §7.8)."""
+        had left, inside its window — planned start to planned end + its startWindowMinutes (README §7.8). On a
+        clock that cannot be trusted only runs whose window has certainly passed get here: they are cut short."""
         st = self.st
         for key in list(st.runs):
             run = st.runs[key]
@@ -829,7 +1056,17 @@ class RuntimeV3:
             lost = now - (run.interrupted_at if run.interrupted_at is not None else now)
             run.lost += max(0.0, lost)
             left = run.remaining or 0.0
-            room = (run.window_end - wall).total_seconds()
+            if clock_ok:
+                part = self.prog.active_part(run.layout, self._today(wall))
+                if part is None or run.sid not in part.schedules:
+                    # Kept through a start on a clock not trusted; the part that runs today has no such schedule.
+                    st.runs.pop(key)
+                    logger.info("run %s: its schedule is not in the part that runs today: it is over", key)
+                    continue
+                run.part_key = part.key
+                room = (run.window_end - wall).total_seconds()
+            else:
+                room = (run.window_mono_end - now) if run.window_mono_end is not None else 0.0
             if room <= 0 or left <= 0:
                 # Its window passed: a notice, never a ring (README §7.8).
                 st.runs.pop(key)
@@ -1380,10 +1617,15 @@ class RuntimeV3:
                 continue
             window = timedelta(minutes=int(sd.get("startWindowMinutes") or 60))
             ss = st.sched.setdefault(key, {})
-            if ss.get("lastRunDate") == today:
+            spec = _start_spec(sd)
+            # The runs are kept by (layout, schedule id) across the layout's parts: what ran today is that id at
+            # its start. A today-only part that keeps the id at a new start is a new run; the same start, or a run
+            # carried into the part (which records the part's start), is not run twice.
+            ran_today = ss.get("lastRunDate") == today
+            if ran_today and ss.get("lastRunStart", spec) == spec:
                 continue
             if start <= wall < start + window:
-                ss["lastRunDate"] = today
+                ss["lastRunDate"], ss["lastRunStart"] = today, spec
                 run = Run(part.layout, sid, part.key, wall, float(sd["durationMinutes"]) * 60.0, window.total_seconds(), now)
                 run.on_keys = P.start_set(part, sd)
                 st.runs[key] = run
@@ -1391,7 +1633,7 @@ class RuntimeV3:
                 self._emit("schedule_started", {"scheduleId": sid, "program": self._prog_ref(run)})
                 self._queue("schedule_started", {"scheduleId": sid})
                 self._do_actions(part, sd.get("actions") or [], now, wall, sid)
-            elif wall >= start + window and ss.get("missedDate") != today:
+            elif wall >= start + window and not ran_today and ss.get("missedDate") != today:
                 ss["missedDate"] = today
                 self._persist_due = True
                 self._emit("run_missed", {"scheduleId": sid, "reason": "start window elapsed", "program": self._prog_ref_of(part)})
@@ -1454,6 +1696,12 @@ class RuntimeV3:
         for port, is_motor in st.line_releases:
             writes.append((0, 0 if is_motor else 1, -1, ("release", port)))
         st.line_releases = []
+        for drv in p.valves.values():
+            # A latching coil not known off (a line the old program drove as a level, an off-write that failed, a
+            # pulse cut short): written off with the switch-offs, before any pulse — in FAULT too.
+            for k, port in drv.coils():
+                if drv.coil_state.get(k, False) is not False:
+                    writes.append((0, 1, -1, ("coiloff", drv, k, port)))
         for key in p.output_order:
             out = p.outputs[key]
             on = is_on(out.level)
@@ -1489,6 +1737,14 @@ class RuntimeV3:
                     out = w[1]
                     self.io.write_output(out.valve.open_port, w[2])
                     out.valve.coil_written = w[2]
+                elif kind == "coiloff":
+                    try:
+                        self.io.write_output(w[3], False)
+                        w[1].coil_state[w[2]] = False
+                    except Exception as e:  # noqa: BLE001 — retried every pass; said once
+                        if w[1].coil_state.get(w[2]) is not None:
+                            logger.error("valve %s: the %s coil cannot be written off: %s", w[1].asset_id, w[2], e)
+                        w[1].coil_state[w[2]] = None
                 elif kind == "pulse":
                     self._pulse(w[1].valve, w[2], now, wall)
             except Exception as e:  # noqa: BLE001
@@ -1496,16 +1752,18 @@ class RuntimeV3:
 
     def _pulse(self, drv, want_open: bool, now: float, wall: datetime) -> bool:
         """One pulse of a latching valve: the pulse-in-progress mark is persisted first, the position after.
-        Never both coils at once: only one is ever driven, and only for pulseMs."""
-        port = drv.open_port if want_open else drv.close_port
+        Never both coils at once: the other coil is written off first unless it is known off, and no pulse is
+        sent when it cannot be. No pulse is sent when the mark cannot be recorded either — a restart would then
+        vouch for a position the node no longer has."""
+        key = drv.open_key if want_open else drv.close_key
+        if not self._other_coil_off(drv, key, wall, now):
+            return False
         drv.pulse_mark = "open" if want_open else "close"
-        self._persist()
-        ok = True
-        try:
-            self.io.pulse(port, drv.pulse_ms)
-        except Exception as e:  # noqa: BLE001
-            logger.error("pulse %s of valve %s failed: %s", drv.pulse_mark, drv.asset_id, e)
-            ok = False
+        if not self._persist():
+            drv.pulse_mark = None
+            self._fault(drv, "position_unknown", "the pulse could not be recorded in the state directory: no pulse sent", now, wall)
+            return False
+        ok = self._send_pulse(drv, key)
         supply = None
         if drv.supply and drv.supply[0] in self.prog.cards:
             try:
@@ -1515,13 +1773,50 @@ class RuntimeV3:
         drv.pulse_mark = None
         if not ok or supply is None or not bool(supply):
             detail = "the pulse could not be sent" if not ok else "the supply was not present after the pulse"
-            if drv.set_fault("pulse_cut_short", detail, wall):
-                self._announce_fault(drv.asset_id, "pulse_cut_short", now, wall, detail)
+            self._fault(drv, "pulse_cut_short", detail, now, wall)
             self._persist()
             return False
         drv.position = "open" if want_open else "closed"
         self._persist()
         return True
+
+    def _other_coil_off(self, drv, key: str, wall: datetime, now: float) -> bool:
+        """Before a pulse of coil `key`: the other coil is off — known off, or written off now. False (the valve in
+        FAULT, no pulse) when it cannot be written."""
+        for k, port in drv.coils():
+            if k == key or drv.coil_state.get(k, False) is False:
+                continue
+            try:
+                self.io.write_output(port, False)
+                drv.coil_state[k] = False
+            except Exception as e:  # noqa: BLE001
+                logger.error("valve %s: the %s coil could not be written off (%s): no pulse sent", drv.asset_id, k, e)
+                self._fault(drv, "position_unknown", "the other coil could not be switched off: no pulse sent", now, wall)
+                return False
+        return True
+
+    def _send_pulse(self, drv, key: str) -> bool:
+        """The pulse itself. When it fails, the coil is written off once more: a coil that cannot be is left
+        unknown, written off again with the next pass's switch-offs, and the valve stays in FAULT."""
+        port = dict(drv.coils())[key]
+        drv.coil_state[key] = None  # on while it runs
+        try:
+            self.io.pulse(port, drv.pulse_ms)
+            drv.coil_state[key] = False
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.error("pulse %s of valve %s failed: %s", key, drv.asset_id, e)
+        try:
+            self.io.write_output(port, False)
+            drv.coil_state[key] = False
+        except Exception as e:  # noqa: BLE001
+            logger.error("valve %s: the %s coil could not be written off after the pulse (%s) — it may still be on",
+                         drv.asset_id, key, e)
+        return False
+
+    def _fault(self, drv, reason: str, detail: str, now: float, wall: datetime) -> None:
+        if drv.set_fault(reason, detail, wall):
+            self._announce_fault(drv.asset_id, reason, now, wall, detail)
 
     # ----------------------------------------------------------- announcing
 
@@ -1723,16 +2018,23 @@ class RuntimeV3:
         out = p.outputs[(aid, P.VALVE_OPEN)]
         resumed = [b.ref() for b in p.blocks() if aid in b.uses_valves and b.key in self.st.held
                    and all(r == ("valve_fault", aid) for r in self.st.held[b.key])]
-        port = drv.close_port
-        drv.pulse_mark = "close"
-        self._persist()
-        try:
-            self.io.pulse(port, drv.pulse_ms)
-        except Exception as e:  # noqa: BLE001
-            drv.pulse_mark = None
-            drv.fault, drv.fault_detail = "pulse_cut_short", f"the reset's close pulse could not be sent: {e}"[:200]
+        # Never both coils at once: the open coil is off before the close pulse (it stays in FAULT if it cannot be).
+        if not self._other_coil_off(drv, drv.close_key, wall, now):
+            drv.fault_detail = "the open coil could not be switched off: no reset pulse sent"
             self._persist()
-            raise
+            logger.warning("resetValve %s at the pass: the open coil could not be switched off — no pulse sent", aid)
+            return
+        drv.pulse_mark = "close"
+        if not self._persist():
+            drv.pulse_mark = None
+            drv.fault_detail = "the reset could not be recorded in the state directory: no pulse sent"
+            logger.warning("resetValve %s at the pass: the pulse cannot be recorded — no pulse sent, the valve stays in FAULT", aid)
+            return
+        if not self._send_pulse(drv, drv.close_key):
+            drv.pulse_mark = None
+            drv.fault, drv.fault_detail = "pulse_cut_short", "the reset's close pulse could not be sent"
+            self._persist()
+            raise RuntimeError(f"the reset's close pulse of valve {aid} could not be sent")
         drv.pulse_mark = None
         drv.cleared()
         self._set_level(out, False, None, now)
@@ -1749,7 +2051,7 @@ class RuntimeV3:
         st.paused = True
         st.paused_mono = now
         until = _parse(c.get("until"))
-        st.pause_until = now + max(0.0, (until - wall).total_seconds()) if until else None
+        st.pause_until, st.pause_rederive = self._pause_end(until, now, wall), False
         st.manual_on = []
         st.automation = {"state": "paused", "pausedAt": wall.isoformat(), "manualOn": []}
         by = _author(c.get("actor"), wall)
@@ -1831,6 +2133,10 @@ class RuntimeV3:
                 out = p.outputs.get(key)
                 if out is not None:
                     self._manual_set(out, False, None, now)
+        if st.paused and st.pause_rederive and self.clock.clock_ok():
+            # A timed pause restored on a clock that could not be trusted: what it has left is known now.
+            st.pause_rederive = False
+            st.pause_until = self._pause_end(_parse(st.automation.get("resumeAt")), now, wall)
         if st.paused and st.pause_until is not None and now >= st.pause_until:
             self._resume(None, "timer", now, wall)
 
@@ -1943,25 +2249,34 @@ class RuntimeV3:
         return os.path.join(self.state_dir, STATE_FILE) if self.state_dir else None
 
     def _read_state(self) -> Optional[dict]:
+        """The persisted state; None when there is none (a first start); ``{UNREADABLE: True}`` when it cannot
+        be read — the node then starts as after an unclean stop, with the E-stop taken as latched."""
         p = self._state_path()
         if not p or not os.path.exists(p):
             return None
         try:
             with open(p) as f:
                 d = json.load(f)
-            return d if isinstance(d, dict) else {}
+            if isinstance(d, dict):
+                return d
+            raise ValueError("not an object")
         except Exception as e:  # noqa: BLE001
-            logger.warning("%s unreadable (%s): the node starts as after an unclean stop", p, e)
-            return {}
+            logger.error("%s unreadable (%s): the node starts as after an unclean stop, the E-stop latched", p, e)
+            return {UNREADABLE: True}
 
-    def _persist(self, clean: bool = False) -> None:
+    def _persist(self, clean: bool = False, prog: Optional[Program] = None, st: Optional[_State] = None) -> bool:
+        """Write the state (atomically: a temporary file, then a rename). True when it is on disk — the callers
+        that must not act on what they cannot record (a latching pulse, the start) check it."""
         self._persist_due = False
         path = self._state_path()
-        p, st = self.prog, self.st
-        if not path or p is None:
-            return
+        p, st = prog or self.prog, st or self.st
+        if p is None:
+            return False
+        if not path:
+            return True  # no state directory: nothing is vouched for after a restart (every start is a first start)
         self._last_persist = self.clock.monotonic()
         doc = {"language": 3, "version": p.version, "savedAt": self.clock.now(p.tz).isoformat(), "cleanStop": bool(clean),
+               "date": st.date, "dateTrusted": bool(st.date_trusted),
                "valves": {aid: d.to_state() for aid, d in p.valves.items()},
                "guards": {aid: g.to_state() for aid, g in p.guards.items()},
                "estop": p.estop.to_state() if p.estop else None,
@@ -1980,7 +2295,14 @@ class RuntimeV3:
                     pass
             os.replace(tmp, path)
         except Exception as e:  # noqa: BLE001
-            logger.warning("v3 state persist failed: %s", e)
+            if not self._persist_failing:
+                logger.error("v3 state persist failed: %s — no latching valve is pulsed until it can be written", e)
+            self._persist_failing = True
+            return False
+        if self._persist_failing:
+            logger.warning("v3 state written again")
+        self._persist_failing = False
+        return True
 
 
 class _Refused(Exception):

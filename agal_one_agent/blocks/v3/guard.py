@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable, Optional
@@ -71,11 +72,38 @@ class Trip:
     unit: str
 
 
-def _num(v, default: float) -> float:
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return float(default)
+# asset.schema.json MotorGuardSettings: the bounds of each setting. The cloud checks a guard on write; the node
+# is the last line, so a bundle can never switch the guard off in all but name (a dry-run limit of 0, an
+# overload at 1000 ×, an inrush that never ends, a NaN that makes every comparison false).
+BOUNDS = {
+    "dryRun.dropPct": (5.0, 80.0),
+    "dryRun.holdSeconds": (1.0, 60.0),
+    "overload.multiple": (1.05, 3.0),
+    "overload.holdSeconds": (1.0, 60.0),
+    "phase.imbalancePct": (5.0, 50.0),
+    "phase.holdSeconds": (0.5, 30.0),
+    "voltage.holdSeconds": (1.0, 60.0),
+    "voltage.minV": (0.0, 480.0),
+    "voltage.maxV": (0.0, 480.0),
+    "inrushIgnoreSeconds": (0.0, 30.0),
+    "restartLockoutSeconds": (float(30), 86400.0),
+}
+
+
+def _setting(asset_id: str, name: str, v, default: Optional[float]) -> Optional[float]:
+    """A guard setting within its MotorGuardSettings bounds. Absent: the default. Not a finite number (a string,
+    a bool, NaN, an infinity): the default, logged. Outside its bounds: clamped to them, logged."""
+    if v is None:
+        return default
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+        logger.warning("guard %s: %s %r is not a number — %s is used", asset_id, name, v, default)
+        return default
+    lo, hi = BOUNDS[name]
+    f = float(v)
+    c = min(hi, max(lo, f))
+    if c != f:
+        logger.warning("guard %s: %s %s is outside %s..%s — %s is used", asset_id, name, f, lo, hi, c)
+    return c
 
 
 class MotorGuard:
@@ -92,22 +120,27 @@ class MotorGuard:
         self.voltage: Optional[str] = cfg.get("voltage")
         s = cfg.get("settings") or {}
         dry, over = s.get("dryRun") or {}, s.get("overload") or {}
-        self.drop_pct = _num(dry.get("dropPct"), DEFAULT_SETTINGS["dryRun"]["dropPct"])
-        self.dry_hold = _num(dry.get("holdSeconds"), DEFAULT_SETTINGS["dryRun"]["holdSeconds"])
-        self.multiple = _num(over.get("multiple"), DEFAULT_SETTINGS["overload"]["multiple"])
-        self.over_hold = _num(over.get("holdSeconds"), DEFAULT_SETTINGS["overload"]["holdSeconds"])
+
+        def setting(name: str, v, default: Optional[float]) -> Optional[float]:
+            return _setting(asset_id, name, v, default)
+        self.drop_pct = setting("dryRun.dropPct", dry.get("dropPct"), DEFAULT_SETTINGS["dryRun"]["dropPct"])
+        self.dry_hold = setting("dryRun.holdSeconds", dry.get("holdSeconds"), DEFAULT_SETTINGS["dryRun"]["holdSeconds"])
+        self.multiple = setting("overload.multiple", over.get("multiple"), DEFAULT_SETTINGS["overload"]["multiple"])
+        self.over_hold = setting("overload.holdSeconds", over.get("holdSeconds"), DEFAULT_SETTINGS["overload"]["holdSeconds"])
         ph = s.get("phase") or {}
-        self.imbalance_pct = _num(ph.get("imbalancePct"), PHASE_DEFAULTS["imbalancePct"])
-        self.phase_hold = _num(ph.get("holdSeconds"), PHASE_DEFAULTS["holdSeconds"])
+        self.imbalance_pct = setting("phase.imbalancePct", ph.get("imbalancePct"), PHASE_DEFAULTS["imbalancePct"])
+        self.phase_hold = setting("phase.holdSeconds", ph.get("holdSeconds"), PHASE_DEFAULTS["holdSeconds"])
         vo = s.get("voltage") or {}
-        self.min_v = float(vo["minV"]) if vo.get("minV") is not None else None
-        self.max_v = float(vo["maxV"]) if vo.get("maxV") is not None else None
-        self.volt_hold = _num(vo.get("holdSeconds"), VOLTAGE_HOLD_DEFAULT)
-        self.inrush = _num(s.get("inrushIgnoreSeconds"), DEFAULT_SETTINGS["inrushIgnoreSeconds"])
+        self.min_v = setting("voltage.minV", vo.get("minV"), None)  # not set (or not a number): not judged
+        self.max_v = setting("voltage.maxV", vo.get("maxV"), None)
+        self.volt_hold = setting("voltage.holdSeconds", vo.get("holdSeconds"), VOLTAGE_HOLD_DEFAULT)
+        self.inrush = setting("inrushIgnoreSeconds", s.get("inrushIgnoreSeconds"), DEFAULT_SETTINGS["inrushIgnoreSeconds"])
         # "at least 30": a lockout can never be shorter, whatever a bundle says.
-        self.lockout_seconds = max(MIN_LOCKOUT_SECONDS, int(_num(s.get("restartLockoutSeconds"), DEFAULT_SETTINGS["restartLockoutSeconds"])))
-        rated = cfg.get("ratedCurrentA")
-        self.rated: Optional[float] = float(rated) if isinstance(rated, (int, float)) and not isinstance(rated, bool) and rated > 0 else None
+        self.lockout_seconds = max(MIN_LOCKOUT_SECONDS, int(setting("restartLockoutSeconds", s.get("restartLockoutSeconds"),
+                                                                    float(DEFAULT_SETTINGS["restartLockoutSeconds"]))))
+        rated = cfg.get("ratedCurrentA")  # CompiledGuard: 0..200 A; not a finite positive number = not set
+        ok = isinstance(rated, (int, float)) and not isinstance(rated, bool) and math.isfinite(rated) and rated > 0
+        self.rated: Optional[float] = min(float(rated), 200.0) if ok else None
         pt = cfg.get("phaseType")
         self.three_phase = pt in THREE_PHASE if pt else (len(self.current) == 3 or len(self.phase_sense) == 3)
         # ---- state
@@ -141,16 +174,28 @@ class MotorGuard:
                 "trippedAt": self.tripped_at.isoformat() if self.tripped_at else None,
                 "lockoutUntil": self.lockout_until_wall.isoformat() if self.lockout_until_wall else None}
 
-    def load_state(self, st: dict, now: float, wall: datetime) -> None:
+    def load_state(self, st: dict, now: float, wall: datetime, clock_ok: bool = True) -> None:
+        """After a restart. A lockout still running is restored for what it had left — never more than its full
+        length, whatever the wall clock says. On a clock that cannot be trusted (no RTC, no NTP yet) what it had
+        left cannot be known: it runs its full length from now (safe, and bounded)."""
         b = st.get("baselineA")
-        if isinstance(b, (int, float)) and not isinstance(b, bool) and b >= MIN_BASELINE_A:
+        if isinstance(b, (int, float)) and not isinstance(b, bool) and math.isfinite(b) and b >= MIN_BASELINE_A:
             self.baseline = float(b)
         until = _parse(st.get("lockoutUntil"))
-        if st.get("tripped") and until is not None and until > wall:
-            self.tripped, self.reason = True, st.get("reason")
-            self.tripped_at = _parse(st.get("trippedAt"))
-            self.lockout_until_wall = until
-            self.lockout_until = now + (until - wall).total_seconds()
+        if not st.get("tripped") or until is None:
+            return
+        if clock_ok:
+            if until.tzinfo is None and wall.tzinfo is not None:
+                until = until.replace(tzinfo=wall.tzinfo)
+            left = min(max(0.0, (until - wall).total_seconds()), float(self.lockout_seconds))
+        else:
+            left = float(self.lockout_seconds)
+        if left <= 0:
+            return
+        self.tripped, self.reason = True, st.get("reason")
+        self.tripped_at = _parse(st.get("trippedAt"))
+        self.lockout_until = now + left
+        self.lockout_until_wall = wall + timedelta(seconds=left)
 
     # --------------------------------------------------------------- the motor
 
