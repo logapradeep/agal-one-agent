@@ -77,10 +77,11 @@ MQTT client's event sink, like the ack sink), which posts `{type: "sensor_event"
 The MQTT copy is kept (harmless; whether to drop it is the founder's, SYNC.md v1.14.2 item 6).
 Events are not persisted: a restart while the ingress is unreachable loses the ones waiting.
 
-Verified (signing + events): `tests/test_command_signing.py` (178) — the 13 signing vectors (canonical
+Verified (signing + events): `tests/test_command_signing.py` (179) — the 13 signing vectors (canonical
 text and sig) and all 31 verifying sequences of `Agal/contracts/nodes/vectors/command-signing.json`,
 each against the in-memory set and the persisted one; eviction at 10,000 (and after a restart);
-35 number literals against the text Node's `String()` gives for each; escapes; UTF-16 key order; 300 random nested
+a message nested past Python's recursion limit refused, not a crash; 35 number literals against
+the text Node's `String()` gives for each; escapes; UTF-16 key order; 300 random nested
 messages canonicalised and MACed by the reference `signing.mjs` in Node (run when `node` is on the
 PATH); the replay set across restarts, its floor, aging, a torn journal line, a damaged snapshot,
 the fold, an unwritable card, the id on disk before the handler runs; the gate at the MQTT
