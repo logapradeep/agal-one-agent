@@ -11,7 +11,8 @@ The runtime addresses I/O by the resolved transport in the compiled bundle
   not reported is rejected at compile time).
 
 Debounce is applied by the runtime's sampler using the timestamps it passes in,
-so adapters only return the *raw* value.
+so adapters only return the *raw* value. A GPIO input's ``pull`` is the adapter's: it is the
+bias the line is requested with (programs/README.md §7.2).
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,10 @@ class PortRef:
     asset_id: str
     source_key: str
     transport: dict  # PortTransport (kind, gpioNumber, direction, ...)
+    # A safety input (programs/README.md §7.2 — an E-stop's contact or reset, a mains or UPS sense, a latching
+    # valve's supply sense): when the pull it asks for cannot be applied it is read as unknown, never as a value
+    # from a floating line — so the E-stop reads pressed, its reset is never seen, a supply is never sensed.
+    safety: bool = field(default=False, compare=False)
 
     @property
     def kind(self) -> str:
@@ -169,11 +174,12 @@ class SimulatedIO(IOAdapter):
 class _Pin:
     """Minimal PinConfig look-alike the GPIO/PWM handlers accept."""
 
-    def __init__(self, gpio: int, protocol: str, label: str):
+    def __init__(self, gpio: int, protocol: str, label: str, pull: Optional[str] = None):
         self.gpio_number = gpio
         self.physical_pin = gpio
         self.protocol = protocol
         self.label = label
+        self.pull = pull  # an input's bias (up / down / none), applied by the GPIO handler at set-up
         self.pwm_frequency_hz = None
         self.pwm_duty_cycle_pct = None
         self.pwm_polarity = None
@@ -196,6 +202,22 @@ class HardwareIO(IOAdapter):
         self._lock = threading.Lock()
         self._lines = lines  # ports.gpiochip.LineIO — the character-device path (ADR-024)
         self._analog = analog  # ports.analog.AnalogReader — an AI port read from its own wiring facts (v1.9.1)
+        self._bias_warned: set[tuple[str, str, str]] = set()
+
+    def _warn_bias(self, port: PortRef, why: str, safety: bool) -> None:
+        """Once per card port and reason: the pull the port asks for is not on its line."""
+        key = (port.asset_id, port.source_key, why)
+        if key in self._bias_warned:
+            return
+        self._bias_warned.add(key)
+        where = f"{port.source_key} of card {port.asset_id} ({describe_port(port.transport)})"
+        if safety:
+            logger.warning("safety input %s: pull %s could not be applied (%s) — read as unknown until it can be: "
+                           "an E-stop contact reads pressed, its reset is never seen, a supply is never sensed present",
+                           where, port.transport.get("pull"), why)
+        else:
+            logger.warning("input %s: pull %s could not be applied (%s) — read with no bias; it may float unless "
+                           "the board has its own resistor", where, port.transport.get("pull"), why)
 
     def has_port(self, port: PortRef) -> bool:
         if port.kind == "gpio" and port.line is not None:
@@ -238,15 +260,25 @@ class HardwareIO(IOAdapter):
                 logger.debug("analog read %s failed: %s", port.source_key, e)
                 return None
         if port.kind == "gpio" and port.line is not None and self._lines is not None:
+            from ..ports.gpiochip import BiasNotApplied  # noqa: PLC0415
+            label, line = port.line
             try:
-                return self._lines.read(port.line[0], port.line[1], bool(port.transport.get("activeLow")))
+                value = self._lines.read(label, line, bool(port.transport.get("activeLow")),
+                                         pull=port.transport.get("pull"), require_bias=port.safety)
+            except BiasNotApplied:
+                self._warn_bias(port, self._lines.bias_error(label, line) or "not applied", safety=True)
+                return None
             except Exception as e:  # noqa: BLE001
                 logger.debug("line read %s failed: %s", port.source_key, e)
                 return None
+            why = self._lines.bias_error(label, line)
+            if why is not None:
+                self._warn_bias(port, why, safety=False)
+            return value
         if port.kind == "gpio" and port.gpio is not None:
             with self._lock:
                 handler = self._get_handler("gpio_input")
-                pin = _Pin(port.gpio, "gpio_input", port.source_key)
+                pin = _Pin(port.gpio, "gpio_input", port.source_key, pull=port.transport.get("pull"))
                 v = handler.read(pin) if handler else None
             if v is None:
                 return None

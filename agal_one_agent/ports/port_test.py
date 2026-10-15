@@ -84,18 +84,23 @@ def run_port_test(command: dict, lines: LineIO, busy: Optional[Callable[[str, in
             return {**out, "result": "passed", "detail": f"on for {seconds} s, then off"}
         if action == "read":
             seconds = max(1, min(MAX_READ_S, int(command.get("seconds") or 10)))
-            first = lines.read(label, line, active_low)
+            # The port's pull is the line's bias while it is watched (programs/README.md §7.2), as when it runs.
+            pull = transport.get("pull")
+            first = lines.read(label, line, active_low, pull=pull)
+            no_bias = lines.bias_error(label, line)
             last, changes, waited = first, 0, 0.0
             while waited < seconds:
                 sleep(0.1)
                 waited += 0.1
-                now = lines.read(label, line, active_low)
+                now = lines.read(label, line, active_low, pull=pull)
                 if now != last:
                     changes += 1
                     last = now
             lines.release(label, line)
-            return {**out, "result": "passed", "value": bool(last),
-                    "detail": f"{'on' if last else 'off'} after {seconds} s; changed {changes} time(s)"}
+            detail = f"{'on' if last else 'off'} after {seconds} s; changed {changes} time(s)"
+            if no_bias is not None:
+                detail += f"; pull {pull} could not be applied ({no_bias}), so it was read with no bias"
+            return {**out, "result": "passed", "value": bool(last), "detail": detail[:200]}
         return {**out, "result": "failed", "detail": f"unknown action {action!r}"}
     except PortUnavailable as e:
         return {**out, "result": "failed", "detail": str(e)[:200]}

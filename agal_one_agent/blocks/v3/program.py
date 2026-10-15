@@ -38,6 +38,9 @@ LANGUAGE = 3
 RESUME_AFTER_POWER_SECONDS = 30  # fixed (founder 2026-10-14); settings.resumeAfterPowerSeconds is const 30
 MOTOR_TYPES = ("motor_controller",)
 VALVE_TYPES = ("valve_controller", "fertigation_valve")
+# The cards whose inputs are safety inputs — an E-stop's contact and reset, a mains or UPS sense (README §7.2;
+# the reference compiler's SAFETY_INPUT_TYPES). A GPIO input of one that states no `pull` is pulled up.
+SAFETY_INPUT_TYPES = ("emergency_stop", "power_sense")
 VALVE_OPEN = "valve.open"
 # The settings a v3 block may read without declaring them — the reference validator's
 # BLOCK_RUNTIME_SETTINGS (validate.mjs semantic(…, "block")).
@@ -83,7 +86,47 @@ def is_output_port(t: dict) -> bool:
 
 
 def is_digital_input(t: dict) -> bool:
-    return str((t or {}).get("kind", "gpio")) == "gpio" and not ((t or {}).get("measure") or (t or {}).get("transform"))
+    """A GPIO input, or any input that states a ``debounceMs`` (a wiring fact of a digital input only — an I/O
+    expander's or a Modbus discrete input, automation-block CompiledTransport): sampled every 100 ms, read as
+    on/off and debounced. An AI port (measure / transform) never is."""
+    t = t or {}
+    if t.get("measure") or t.get("transform"):
+        return False
+    return str(t.get("kind", "gpio")) == "gpio" or t.get("debounceMs") is not None
+
+
+def _safety_keys(bundle: dict) -> set[tuple[str, str]]:
+    """The inputs the safety built-ins read, by (assetId, sourceKey): the E-stop's contact and reset, the mains and
+    UPS sense, each latching valve's supply sense. With the inputs of SAFETY_INPUT_TYPES cards these are read as
+    unknown — never from a floating line — when the pull they ask for cannot be applied (README §7.2)."""
+    keys: set[tuple[str, str]] = set()
+
+    def add(pk) -> None:
+        if isinstance(pk, dict) and pk.get("assetId") and pk.get("sourceKey"):
+            keys.add((str(pk["assetId"]), str(pk["sourceKey"])))
+    s = bundle.get("safety") or {}
+    e, ps = s.get("emergencyStop") or {}, s.get("powerSense") or {}
+    for pk in (e.get("input"), e.get("reset"), ps.get("mains"), ps.get("ups")):
+        add(pk)
+    for a in bundle.get("assets") or []:
+        if isinstance(a, dict) and isinstance(a.get("valve"), dict):
+            add(a["valve"].get("supply"))
+    return keys
+
+
+def _port_ref(aid: str, sk: str, t: dict, asset_type: str, safety_keys: set[tuple[str, str]]) -> PortRef:
+    """A card's port as the node reads it: the bundle's entry (with its wiring facts — README §7.2), a safety input
+    marked, and the README's default applied when an older compiler left it out: a GPIO input of an E-stop or
+    power-sense card that states no pull is pulled up (a contact to ground, so a broken wire reads as pressed or as
+    no supply). A pull the port states — `down` on a driven, active-high sense module, `none` — always wins."""
+    t = dict(t)
+    is_input = not is_output_port(t)
+    safety = is_input and (asset_type in SAFETY_INPUT_TYPES or (aid, sk) in safety_keys)
+    if is_input and asset_type in SAFETY_INPUT_TYPES and str(t.get("kind", "gpio")) == "gpio" and t.get("pull") is None:
+        t["pull"] = "up"
+        logger.info("%s of card %s (%s): a safety input with no pull stated — requested pulled up (README §7.2)",
+                    sk, aid, describe_port(t))
+    return PortRef(aid, sk, t, safety=safety)
 
 
 class Output:
@@ -254,6 +297,7 @@ def _build(bundle: dict, io: IOAdapter) -> Program:
         logger.warning("bundle v%s carries %d data cards: data card capture (README §4b) is not built in this agent; "
                        "they record nothing", version, len(bundle["dataCards"]))
     p = Program(bundle)
+    safety_keys = _safety_keys(bundle)
     for i, a in enumerate(bundle.get("assets") or []):
         aid = a.get("assetId")
         if not aid or aid in p.cards:
@@ -262,7 +306,7 @@ def _build(bundle: dict, io: IOAdapter) -> Program:
         for sk, t in (a.get("ports") or {}).items():
             if not isinstance(t, dict):
                 raise CompileError(f"{aid}.{sk}: the port has no transport")
-            ref = PortRef(aid, sk, dict(t))
+            ref = _port_ref(aid, sk, t, card.asset_type, safety_keys)
             if not io.has_port(ref):
                 raise CompileError(f"{aid}: this node has no port for '{sk}' ({describe_port(t)})")
             card.ports[sk] = ref

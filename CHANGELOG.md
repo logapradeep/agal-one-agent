@@ -133,16 +133,56 @@ line left driven; each is fixed, with a test in `tests/test_v3_corners.py` that 
 - **An analog input is refused** as the mains sense, the UPS sense or a latching valve's supply: the node senses
   presence only on a digital input (the contract allows AI there, with no threshold — reported).
 
+**Integration fixes (same version, still not tagged; contracts v1.15.0 as amended — `CompiledGpioInput`,
+programs/README.md §7.2).** The wave-1 integration check (the backend's compiler fed into this runtime) found that
+two of a port's wiring facts never reached the hardware. Both are fixed here, against a fake gpiochip in
+`tests/test_input_pull_debounce.py` (29 tests); each fix, undone on its own, fails at least one of them.
+
+- **`pull` is the line's bias** — a gap since 0.3.0 (1ef380a): `LineIO.read` took a `pull` and ignored it, and
+  `HardwareIO` never passed one, so an E-stop input with no pull-up on the board floated. Now a GPIO input is
+  requested with its entry's `pull` as python-periphery's `bias` — `up` → `pull_up`, `down` → `pull_down`, `none` →
+  `disable` (stated wiring: an external resistor, so the internal pull is switched off); an entry with no `pull` is
+  requested with no bias flag. That is the bias flag of the character device's line request (kernel 5.5+). A line is
+  requested again when a reload changes its pull, and kept when a read asks for none. The legacy Broadcom-numbered
+  path sets RPi.GPIO's `pull_up_down` the same way, and a port test that watches an input applies the port's pull.
+- **README §7.2's default**: a GPIO input of an `emergency_stop` or `power_sense` card whose entry states no pull is
+  requested pulled up (the reference compiler's rule, for a bundle from a compiler that left it out); a stated pull —
+  `down` on a driven, active-high sense module, `none` — always wins.
+- **A bias that cannot be applied** (a kernel older than 5.5, a library with no bias, a chip that refuses it): the
+  line is requested once more with no bias, and a warning names the line and then the card's port. A **safety input**
+  — an input of an E-stop or power-sense card, the E-stop's contact or reset, the mains or UPS sense, a latching
+  valve's supply — is then never read from the floating line: it reads unknown. So the E-stop reads pressed and
+  latches, its reset is never seen, and a sense is never sensed present: the power status stays `unknown`, and a
+  latching valve on that supply goes into FAULT `supply_lost` and sends no pulse. This holds even when the contact is
+  in fact closed. Any other input is read with no bias, with the warning.
+- **`debounceMs` from the bundle's port entry, for every input.** The v3 runtime already read it there; the contract
+  had no place for it, so it never arrived. With v1.15.0 it does: the field box's flow switch keeps its 200 ms on a
+  v3 node (a 100 ms bounce on the line never becomes a value; a change that holds is taken after 200 ms). An input on
+  a bus that states `debounceMs` (an I/O expander's, a Modbus discrete input) is now a digital input — read as on/off
+  every 100 ms and debounced — not an analog reading taken once a pass; as one, it is also accepted as an E-stop
+  contact or a sense input (an analog one is still refused). This agent reads no expander or Modbus input yet, so
+  such a port reads unknown, and the E-stop takes unknown as pressed. On a language-1 node an input whose variable
+  states no `debounceMs` takes the port entry's (nodes/README.md §1: a variable-level value overrides it).
+- **The golden vectors with their new expectations**: every GPIO input of the nine v3 bundles the vectors carry
+  (two-node-layout, instruction-switch, rule-edit-swap, rewire-swap) is requested on the fake chip with the bias its
+  entry states, and every safety input states one. The runtime vectors replay unchanged.
+
+Owed elsewhere, seen while checking (not changed here): the backend bundles the integration check emitted carry no
+`pull` on the mains and UPS sense (site-north DI2 / DI3, stated `down` since this amendment), so on those bundles this
+agent pulls them **up**: a broken wire to a driven, active-high sense module would then read as supply present. The
+backend must copy the port's `pull` and `debounceMs` (SYNC.md v1.15.0 7(g)) before a v3 bundle reaches a node wired
+that way. The integration check's `hw_check.py` fake opener takes no `bias`, so on this agent it now fails safe (the
+E-stop latches); with an opener that takes one, every line request carries its bias.
+
 Not covered — contract gaps reported with this version: a v3 card's live values (on/off, current) have no message of
 their own (the v1 `variables` message carried AAB variables, and v3 has none); data cards (§4b) are not built in
 this agent; how a `setPower` names a valve card in v3 (`valve.open` here); a block suspended by the backend reaches
 the node as a recompile, so its switch is announced with cause `confirmed`; port ids (DI3) are not in the bundle,
 so refusals name the card and its port; `three_or_two_phase` motors are judged as three phase; an AI phase-sense
-input counts as present when non-zero; a gpio port's `debounceMs` is not in the v3 `CompiledTransport` (a strict
-`PortTransport`), so the node table's debounce (a flow switch's 200 ms) does not reach a v3 node; an AI port as a
-power or supply sense has no presence threshold; `instruction_switched.cause` has no value for a part change when the
-clock comes good on another date (the node switches without the event); the golden vectors fix the boot pass's
-writes, so a cold load cannot write the latching coils off (the migration from language 1 does). The bench page and
+input counts as present when non-zero; a bias that could not be applied is in the log only (the heartbeat has no
+field for it); an AI port as a power or supply sense has no presence threshold; `instruction_switched.cause` has no
+value for a part change when the clock comes good on another date (the node switches without the event); the
+golden vectors fix the boot pass's writes, so a cold load cannot write the latching coils off (the migration from language 1 does). The bench page and
 its physics (`blocks.simulated_io`) and the simulator CLI still drive language-1 bundles only.
 
 Found on the way, not changed: `--offline` still posts the one-shot hardware report and the program ack over HTTPS,

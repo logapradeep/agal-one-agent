@@ -1031,7 +1031,12 @@ class BlockRuntime:
                     st["last"] = now
                     if st["raw"] != raw:
                         st["raw"], st["since"] = raw, now
-                    debounce_s = float(node.get("debounceMs") or 0) / 1000.0
+                    # The variable's debounceMs, else the port entry's (a wiring fact of the port, nodes/README.md
+                    # §1: a variable-level value overrides it).
+                    deb_ms = node.get("debounceMs")
+                    if deb_ms is None:
+                        deb_ms = v.port.transport.get("debounceMs")
+                    debounce_s = float(deb_ms or 0) / 1000.0
                     # Accept once the value has held for the debounce window, or when
                     # this sampler runs slower than the window (1 s ticks on the bench):
                     # then the sample interval itself is the debounce.
