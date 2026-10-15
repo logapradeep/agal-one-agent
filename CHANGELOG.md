@@ -223,6 +223,21 @@ over-the-air update install the archive with its metadata, so they agree; the MQ
 status still name `mqtt.username` (the shared login on such a node) as `nodeUid` — nothing consumes
 them; `getBootState` is posted to the fixed production URL whatever `telemetry.ingress_url` says.
 
+**Join safety, the review (2026-10-15; contracts v1.14.2 join-safety review, vectors `join.json`
+1.1.0; README §10.1).** The guard as first built read every `uid:` line in `config.yaml`, and
+`update_pins` copies what the cloud sends verbatim before `yaml.dump`: a pin label with a newline, a
+label `yaml.dump` folds at 80 columns right before `uid: …`, a `sensor_params` or `protection` key
+named `uid`, or a node name over several lines put more `uid:` lines in the file (indented deeper than
+the node block's keys), and the guard took them for another node's — the board's own last join refused
+again, the terminal again. The contract's guard now reads only the `uid` keys of the top-level `node:`
+block at its own indentation (awk + grep). Nothing in the agent changes for it; tests added
+(`tests/test_join_safety.py`, 97 now): for each of those four pin kinds and two ids (one `yaml.dump`
+single-quotes) the file `update_pins` writes has the extra `uid:` lines, the vectors' guard proceeds
+for this node and refuses another, the first guard refused it (control), and `from_yaml` reads back the
+same uid, token, labels and parameters; the same for a node name over several lines; and the 33 guard
+vectors (21 before) through bash. Agent 0.3.1's `update_pins` is the same code, so the same files come
+from the production Pi.
+
 **Fix — a firmware update needed the board's terminal (founder, 2026-10-15: "once the rpi is
 linked, there should not be a need to do anything on the pi terminal especially the updates").**
 The app's Update firmware button (`updateNodeFirmware` → `/nodeCommands` → `firmwareUpdate

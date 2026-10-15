@@ -11,7 +11,10 @@ part of each, tested here:
 - H1: the served script's guard must accept the config.yaml THIS agent leaves — ``update_pins``
   rewrites it with ``yaml.dump`` on every syncPinConfig, which writes the uid bare (or in single
   quotes). The vectors' ``guard.script`` runs here, through bash, on the file update_pins wrote,
-  and nothing else in the agent reads the uid as text.
+  and nothing else in the agent reads the uid as text. Join-safety review: the guard reads only the
+  node block's own uid keys — ``update_pins`` re-dumps what the cloud sent, and a pin label or a node
+  name over several lines, a label folded at 80 columns or a sensor_params key named uid put other
+  ``uid:`` lines in the file, which the first guard took for another node's.
 - H2 (fixed by the backend's pending credential, command-signing.md §7): the agent holds one token,
   its config.yaml. Owed here: the first HTTPS request after the join's restart presents that token
   at once and without MQTT (it promotes the pending token, §7.3), and a command the backend signed
@@ -349,13 +352,13 @@ def test_the_vectors_guard_through_bash(case, tmp_path):
     assert _run_guard(case.get("nodeUid", GUARD_UID), str(conf)) == case["expect"]
 
 
-def _join_config(node_uid: str, token: str = NEW_TOKEN) -> str:
+def _join_config(node_uid: str, token: str = NEW_TOKEN, name: str = "Pump house") -> str:
     """config.yaml exactly as the join writes it (agal-one enroll.ts installerScript: every string a
     JSON string, which is a valid YAML scalar)."""
     q = json.dumps
     base = "https://asia-south1-agal-one-prod.cloudfunctions.net"
     return "\n".join([
-        "node:", f"  uid: {q(node_uid)}", f"  name: {q('Pump house')}", f"  auth_token: {q(token)}", "",
+        "node:", f"  uid: {q(node_uid)}", f"  name: {q(name)}", f"  auth_token: {q(token)}", "",
         "mqtt:", f"  broker: {q('broker.example.invalid')}", "  port: 8883", "  tls: true",
         f"  username: {q('device-login')}", f"  password: {q('device-password')}", "  topics:",
         f"    commands: {q(f'agal/{node_uid}/commands')}", f"    telemetry: {q(f'agal/{node_uid}/telemetry')}",
@@ -402,6 +405,73 @@ def test_the_join_guard_accepts_the_config_yaml_update_pins_writes(node_uid, tmp
     assert _run_guard(other, str(conf)) == "refuse", "another node's join is still refused"
     near = node_uid + "x" if len(node_uid) < 128 else "x" + node_uid[1:]  # an id this one is part of / differs by one
     assert _run_guard(near, str(conf)) == "refuse"
+
+
+OTHER_UID = "Hm3Wc8Rt1Yb6Pk2Qz9Lx"
+
+#: What a syncPinConfig may carry that yaml.dump writes as more `uid:` lines (join-safety review): a
+#: label over several lines, a label folded at 80 columns right before "uid: …", a sensor_params key
+#: named uid (a 1-Wire sensor's id), and a protection block with one. update_pins copies them verbatim.
+UID_LIKE_PINS = {
+    "a label over several lines": [{"physical_pin": 11, "gpio_number": 17, "protocol": "gpio_output",
+                                    "label": f"Pump\n\nuid: {OTHER_UID}"}],
+    "a label folded at 80 columns": [{"physical_pin": 11, "gpio_number": 17, "protocol": "gpio_output",
+                                      "label": f"Pump house main line motor starter relay for the second borewell north-field-feeder uid: {OTHER_UID}"}],
+    "a sensor's uid parameter": [{"physical_pin": 7, "gpio_number": 4, "protocol": "one_wire",
+                                  "sensor_type": "temperature_ds18b20", "sensor_params": {"uid": "28-00000abc1234"}}],
+    "a protection block with a uid key": [{"physical_pin": 3, "gpio_number": 2, "protocol": "i2c", "sensor_type": "current_acs758",
+                                           "protection": {"cut_pin_label": "Pump", "uid": OTHER_UID}}],
+}
+
+
+def _first_guard_proceeds(node_uid: str, conf: str) -> bool:
+    """The guard as first built for join safety (agal-one 457b134): every `uid:` line in the file."""
+    first = "  UID_LINES=$(LC_ALL=C grep -E '^[[:space:]]*uid[[:space:]]*:' \"$CONF\" || true)"
+    lines = _guard_script(node_uid, conf).split("\n")
+    at = [i for i, line in enumerate(lines) if line.lstrip().startswith("UID_LINES=")]
+    assert len(at) == 1
+    lines[at[0]] = first
+    r = subprocess.run([BASH, "-c", "set -euo pipefail\n" + "\n".join(lines) + "echo GUARD_PROCEEDS\n"],
+                       capture_output=True, text=True, timeout=30, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
+    return r.returncode == 0 and "GUARD_PROCEEDS" in r.stdout
+
+
+@pytest.mark.parametrize("node_uid", [GUARD_UID, "0x1F2E3D4C5B6A798877"])
+@pytest.mark.parametrize("kind", list(UID_LIKE_PINS))
+def test_the_guard_reads_only_the_node_block_of_what_update_pins_writes(kind, node_uid, tmp_path):
+    """Join-safety review (README §10.1): what the cloud sends lands in config.yaml as yaml.dump
+    writes it, and a pin's label or a sensor's parameters can put more `uid:` lines in the file —
+    never at the node block's own indentation. The guard reads only those: this node's join goes
+    on, another node's is refused, and the first guard (every `uid:` line) refused this node's."""
+    conf = tmp_path / "config.yaml"
+    conf.write_text(_join_config(node_uid), encoding="utf-8")
+    cfg = AgentConfig.from_yaml(str(conf))
+    cfg.update_pins(UID_LIKE_PINS[kind], str(conf))
+    written = conf.read_text(encoding="utf-8")
+    others = [line for line in written.splitlines() if re.match(r"\s*uid\s*:", line) and not re.fullmatch(rf"  uid: '?{re.escape(node_uid)}'?", line)]
+    assert others and all(line.startswith("    ") for line in others), others  # deeper than the node block's keys
+    assert _run_guard(node_uid, str(conf)) == "proceed"
+    assert _run_guard(OTHER_UID, str(conf)) == "refuse"
+    assert not _first_guard_proceeds(node_uid, str(conf)), "the first guard refused the board's own config.yaml"
+    back = AgentConfig.from_yaml(str(conf))
+    assert back.node.uid == node_uid and back.node.auth_token == NEW_TOKEN
+    assert [(p.label, p.sensor_params, p.protection) for p in back.pins] == [
+        (p.get("label", ""), p.get("sensor_params") or {}, p.get("protection")) for p in UID_LIKE_PINS[kind]]
+
+
+def test_the_guard_reads_only_the_node_block_with_a_node_name_over_several_lines(tmp_path):
+    """The node's own name, as the join writes it (one JSON-quoted line), then yaml.dump: a quoted
+    scalar over several lines whose continuation reads `uid: <another node>` — indented under `name:`."""
+    conf = tmp_path / "config.yaml"
+    conf.write_text(_join_config(GUARD_UID, name=f"Pump house\nuid: {OTHER_UID}"), encoding="utf-8")
+    assert _run_guard(GUARD_UID, str(conf)) == "proceed"  # as the join wrote it: the name on one line
+    AgentConfig.from_yaml(str(conf)).update_pins(SYNCED_PINS, str(conf))
+    written = conf.read_text(encoding="utf-8")
+    assert f"\n    uid: {OTHER_UID}'\n" in written, written
+    assert _run_guard(GUARD_UID, str(conf)) == "proceed"
+    assert _run_guard(OTHER_UID, str(conf)) == "refuse"
+    assert not _first_guard_proceeds(GUARD_UID, str(conf))
+    assert AgentConfig.from_yaml(str(conf)).node.name == f"Pump house\nuid: {OTHER_UID}"
 
 
 @pytest.mark.parametrize("node_uid", NODE_UIDS)
