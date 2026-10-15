@@ -1,6 +1,6 @@
 # Changelog — agal-one-agent
 
-## 0.3.4 (unreleased — not tagged)
+## 0.3.4 (2026-10-16)
 
 **Security — any board's config could command every other node; now a node carries out only
 commands signed for it (contracts v1.14.2, `Agal/contracts/nodes/command-signing.md`; founder
