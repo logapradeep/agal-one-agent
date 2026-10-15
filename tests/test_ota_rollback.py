@@ -7,6 +7,7 @@ RECORD, console script) — so the snapshot and the restore run for real against
 """
 import hashlib
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -45,6 +46,9 @@ class FakeVenv:
         self.bin.mkdir()
         (self.site / "paho").mkdir()
         (self.site / "paho" / "__init__.py").write_text("# a dependency: never touched\n")
+        (self.site / "paho_mqtt-2.1.0.dist-info").mkdir()
+        (self.site / "paho_mqtt-2.1.0.dist-info" / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: paho-mqtt\nVersion: 2.1.0\n")
         (self.bin / "pip").write_text("#!pip\n")
 
     def uninstall(self):
@@ -105,7 +109,10 @@ def ota(tmp_path, monkeypatch):
 
     h.archives: url → bytes the fake download returns (anything else is "not reached").
     h.pip_fail: versions whose install fails (half-way: the old version is gone).
-    h.git: whether the board has git. h.now: the fake monotonic clock (sleep advances it)."""
+    h.git: whether the board has git. h.now: the fake monotonic clock (sleep advances it).
+    h.dry_report: what pip's dry run says it would install (default: each requirement, new).
+    h.runs: what the "does the restored agent start" check answers, one per call (default: it does).
+    h.order: pip installs and syncs to the SD card, in the order they happened."""
     venv = FakeVenv(tmp_path)
     venv.install("0.3.3")
     state = tmp_path / "state"
@@ -115,11 +122,12 @@ def ota(tmp_path, monkeypatch):
     monkeypatch.setattr(ota_updater, "VENV_PREFIX", str(venv.prefix))
     monkeypatch.setattr(ota_updater, "SYSTEMD_DIR", str(tmp_path / "systemd"))
     monkeypatch.setattr(ota_updater, "BUSY_WAIT_S", 600)
+    monkeypatch.setattr(ota_updater, "JOIN_REQUIREMENTS", str(tmp_path / "opt" / "agent.requirements"))
 
     h = types.SimpleNamespace(
         venv=venv, archives={}, archive_versions={}, pip_fail=set(), pip=[], downloads=[], git=True,
         git_asked=0, systemctl=[], systemctl_rc=0, restarts=0, emits=[], now=0.0, sleeps=[],
-        check_out=[], deps_installed=[],
+        check_out=[], deps_installed=[], dry_runs=[], dry_report=None, runs=[], runs_asked=[], order=[],
     )
 
     def add_release(tag, data=None):
@@ -146,6 +154,16 @@ def ota(tmp_path, monkeypatch):
 
     def fake_run_pip(args):
         h.pip.append(list(args))
+        if "--dry-run" in args:
+            reqs = [a for a in args[args.index("--report") + 2:]]
+            h.dry_runs.append(reqs)
+            report = h.dry_report if h.dry_report is not None else {
+                "install": [{"metadata": {"name": r.split(">")[0].split("=")[0], "version": "1.0"}} for r in reqs]}
+            with open(args[args.index("--report") + 1], "w") as f:
+                json.dump(report, f)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[0] == "install":
+            h.order.append("pip install")
         if args[0] == "check":
             out = h.check_out.pop(0) if h.check_out else ""
             return subprocess.CompletedProcess(args, 1 if out else 0, out, "")
@@ -184,8 +202,15 @@ def ota(tmp_path, monkeypatch):
     monkeypatch.setattr(ota_updater, "_systemctl", fake_systemctl)
     monkeypatch.setattr(ota_updater, "_restart_service", fake_restart)
     monkeypatch.setattr(ota_updater, "_emit", fake_emit)
+    def fake_check_runs(version):
+        h.runs_asked.append(version)
+        return h.runs.pop(0) if h.runs else None
+
     monkeypatch.setattr(ota_updater, "_sleep", fake_sleep)
     monkeypatch.setattr(ota_updater, "_monotonic", lambda: h.now)
+    monkeypatch.setattr(ota_updater, "_check_runs", fake_check_runs)
+    monkeypatch.setattr(ota_updater, "_sync_all", lambda: h.order.append("sync"))
+    monkeypatch.setattr(ota_updater, "_preload_package", lambda: h.order.append("preload"))
     return h
 
 
@@ -335,8 +360,14 @@ def test_a_damaged_saved_copy_is_not_put_back(ota):
     out = ota_updater.run_verify()
     assert "FAILED" in out and "damaged" in out
     assert ota.venv.tree() == now, "nothing was taken out when the way back was not whole"
-    assert ota_updater.read_state()["phase"] == "failed"
-    assert ota.restarts == 2
+    st = ota_updater.read_state()
+    assert st["phase"] == "pending_verify", "a failed rollback is tried again, never given up"
+    assert st["rollbackAttempts"] == 1 and st["rollbackRetryEpoch"] > time.time()
+    assert ota.restarts == 1, "no restart: nothing was put back"
+    assert _phases(ota)[-1] == "failed" and "keeps trying" in ota.emits[-1][1]
+    # the next check, before the backoff is over, does nothing
+    assert "tried again in" in ota_updater.run_verify()
+    assert ota_updater.read_state()["rollbackAttempts"] == 1
 
 
 def test_an_install_without_a_record_is_not_updated(ota):
@@ -361,7 +392,8 @@ def test_a_library_the_new_version_added_is_installed(ota):
     ota.requires = ("paho-mqtt>=2.0.0", "newlib>=1.2", 'RPi.GPIO>=0.7.1; extra == "rpi"')
     ota.check_out = ["agal-one-agent 0.3.4 requires newlib, which is not installed.", ""]
     _update(ota)
-    assert ota.deps_installed == [["paho-mqtt>=2.0.0", "newlib>=1.2"]], "extras are not installed"
+    assert ota.dry_runs == [["newlib>=1.2"]], "pip is asked first what installing it would change"
+    assert ota.deps_installed == [["newlib>=1.2"]], "only the missing library: not the met ones, not the extras"
     assert ota_updater.read_state()["phase"] == "pending_verify" and ota.restarts == 1
 
 
@@ -578,7 +610,7 @@ def test_run_verify_rolls_back_a_state_without_a_snapshot_through_git(ota):
     out = ota_updater.run_verify()
     st = ota_updater.read_state()
     assert st["phase"] == "rolled_back"
-    assert _installs(ota) == [["install", "--upgrade", "--force-reinstall",
+    assert _installs(ota) == [["install", "--no-deps", "--force-reinstall",
                                "git+https://github.com/logapradeep/agal-one-agent.git@v0.1.5"]]
     assert ota.restarts == 1
     assert "rolled_back" in _phases(ota)
@@ -611,9 +643,9 @@ def test_run_verify_rollback_failure_marks_failed(ota):
     })
     ota_updater.run_verify()
     st = ota_updater.read_state()
-    assert st["phase"] == "failed"
-    assert "boom" in st.get("error", "")
-    assert ota.restarts == 1          # still restart to leave the device in *a* known state
+    assert st["phase"] == "pending_verify" and st["rollbackAttempts"] == 1, "tried again, never given up"
+    assert "boom" in st.get("rollbackError", "")
+    assert ota.restarts == 0
     assert "failed" in _phases(ota)
 
 
@@ -831,3 +863,419 @@ def test_an_unexpected_error_during_the_install_puts_the_previous_version_back(o
     st = ota_updater.read_state()
     assert st["phase"] == "failed" and "broke off" in st["error"]
     assert ota.venv.tree() == before and ota.restarts == 0
+
+
+# ---- review fixes (2026-10-15) ------------------------------------------------------
+
+def _past_deadline(**extra):
+    st = ota_updater.read_state()
+    st.update({"deadlineEpoch": int(time.time()) - 1, **extra})
+    ota_updater.write_state(st)
+    return st
+
+
+def _damage_snapshot():
+    snap = os.path.join(ota_updater.STATE_DIR, "ota", "previous", "tree", "lib", PY, "site-packages",
+                        "agal_one_agent", "main.py")
+    with open(snap, "w") as f:
+        f.write("# came back empty after a power cut")
+
+
+def _join(ota, tag="v0.3.3"):
+    """The join script's requirement line for the agent it installed (enroll.ts installerScript)."""
+    url, sha = ota.add_release(tag)
+    req = ota_updater.JOIN_REQUIREMENTS
+    os.makedirs(os.path.dirname(req), exist_ok=True)
+    with open(req, "w") as f:
+        f.write(f"agal-one-agent @ {url} --hash=sha256:{sha}\n")
+    return url, sha
+
+
+# power cuts: the saved copy and the state are on the SD card before pip runs
+
+def test_the_saved_copy_and_the_state_reach_the_card_before_pip_runs(ota):
+    _update(ota)
+    first_install = ota.order.index("pip install")
+    assert ota.order[:first_install].count("sync") >= 2, "the snapshot and the pending_verify state are synced"
+    assert "preload" in ota.order[:first_install], "every old module is loaded before pip replaces them"
+    assert ota.order[-1] == "sync", "the new files are synced before the restart"
+
+
+def test_write_state_flushes_the_file_and_its_directory(ota, monkeypatch):
+    synced = []
+    real = os.fsync
+    monkeypatch.setattr(ota_updater.os, "fsync", lambda fd: synced.append(fd) or real(fd))
+    ota_updater.write_state({"phase": "idle"})
+    assert len(synced) == 2, "the temporary file before the rename, the directory after it"
+    assert ota_updater.read_state()["phase"] == "idle"
+
+
+# a rollback that fails is tried again, and the network way back is used
+
+def test_a_damaged_saved_copy_is_replaced_by_the_previous_release_archive(ota):
+    _join(ota, "v0.3.3")
+    before = ota.venv.tree()
+    _update(ota)
+    assert ota_updater.read_state()["previousPackage"]["source"].endswith("/v0.3.3.tar.gz")
+    _damage_snapshot()
+    _past_deadline()
+    out = ota_updater.run_verify()
+    st = ota_updater.read_state()
+    assert st["phase"] == "rolled_back", out
+    assert "again from its release archive" in out
+    assert ota.downloads[-1].endswith("/v0.3.3.tar.gz")
+    assert ota_updater.installed_version() == "v0.3.3" and ota.venv.tree() == before
+    assert ota.runs_asked == ["v0.3.3"], "the reinstalled version is checked to start"
+    assert ota.restarts == 2 and _phases(ota)[-1] == "rolled_back"
+
+
+def test_a_restored_version_that_does_not_start_is_not_a_way_back(ota):
+    _update(ota)
+    _past_deadline()
+    ota.runs = ["it does not import: ModuleNotFoundError: No module named 'newlib'"]
+    out = ota_updater.run_verify()
+    st = ota_updater.read_state()
+    assert st["phase"] == "pending_verify" and st["rollbackAttempts"] == 1
+    assert "does not start" in st["rollbackError"] and "no release archive of v0.3.3" in st["rollbackError"]
+    assert "FAILED" in out and ota.restarts == 1
+
+
+def test_a_failed_rollback_is_retried_after_its_backoff(ota):
+    _update(ota)
+    _damage_snapshot()
+    _past_deadline()
+    assert "FAILED" in ota_updater.run_verify()
+    _join(ota, "v0.3.3")  # the archive is known by the next attempt (not to this update's state, though)
+    st = ota_updater.read_state()
+    st["previousPackage"] = ota_updater._known_package("v0.3.3")
+    st["rollbackRetryEpoch"] = int(time.time()) - 1
+    ota_updater.write_state(st)
+    out = ota_updater.run_verify()
+    assert ota_updater.read_state()["phase"] == "rolled_back", out
+    assert _phases(ota).count("failed") == 1, "the failure was reported once, then the way back"
+    assert _phases(ota)[-1] == "rolled_back"
+
+
+def test_backoff_grows_and_is_never_given_up(ota):
+    _update(ota)
+    _damage_snapshot()
+    _past_deadline()
+    delays = []
+    for _ in range(7):
+        st = ota_updater.read_state()
+        st["rollbackRetryEpoch"] = 0
+        ota_updater.write_state(st)
+        before = int(time.time())
+        ota_updater.run_verify()
+        st = ota_updater.read_state()
+        delays.append(st["rollbackRetryEpoch"] - before)
+    assert st["phase"] == "pending_verify" and st["rollbackAttempts"] == 7
+    assert [round(d, -1) for d in delays[:5]] == [60, 120, 300, 600, 1800]
+    assert all(d >= 1800 for d in delays[5:])
+    assert _phases(ota).count("failed") == 1
+
+
+def test_confirm_waits_while_a_rollback_is_under_way(ota):
+    _update(ota)
+    st = _past_deadline(rollbackAttempts=1)
+    assert ota_updater.confirm_update("node-x", running="v0.3.4") is False
+    assert ota_updater.read_state()["phase"] == "pending_verify"
+
+
+def test_an_undo_that_cannot_put_the_files_back_leaves_it_to_the_verify_timer(ota, monkeypatch):
+    ota.pip_fail = {"0.3.4"}
+    restore = {"result": (False, "disk full")}
+    monkeypatch.setattr(ota_updater, "_restore_snapshot", lambda expected=None: restore["result"])
+    out = _update(ota)
+    st = ota_updater.read_state()
+    assert st["phase"] == "pending_verify" and st["runningPrevious"] is True
+    assert st["deadlineEpoch"] <= time.time() and st["rollbackAttempts"] == 1
+    assert "tries again" in st["error"] and "disk full" in out
+    assert ota.restarts == 0 and _phases(ota) == ["started", "failed"]
+    # the next attempt works: the files match the running agent again, which is left running
+    restore["result"] = (True, "put v0.3.3 back")
+    st["rollbackRetryEpoch"] = 0
+    ota_updater.write_state(st)
+    assert "already v0.3.3" in ota_updater.run_verify()
+    assert ota_updater.read_state()["phase"] == "rolled_back"
+    assert ota.restarts == 0, "no restart: it would switch off what the running agent drives"
+
+
+def test_a_new_update_does_not_overwrite_one_still_in_probation(ota):
+    _update(ota)
+    before = ota_updater.read_state()
+    emits = len(ota.emits)
+    out = _update(ota, tag="v0.3.5")
+    assert "still being checked or undone" in out
+    assert ota_updater.read_state() == before and len(ota.emits) == emits
+
+
+# no downgrade, never below the first agent that updates without git
+
+def test_an_older_version_than_the_running_one_is_refused(ota):
+    ota.venv.install("0.3.6")
+    out = _update(ota, tag="v0.3.5")
+    st = ota_updater.read_state()
+    assert st["phase"] == "failed" and "older than the running v0.3.6" in st["error"], out
+    assert ota.downloads == [] and ota.pip == [] and ota.restarts == 0
+    assert _phases(ota) == ["failed"]
+
+
+@pytest.mark.parametrize("tag", ["v0.3.1", "v0.3.3", "v0.2.0", "v0.3.4-rc.1"])
+def test_a_version_below_the_first_archive_updater_is_refused(ota, tag):
+    ota.venv.install("0.3.2")  # even when it would be an upgrade
+    _update(ota, tag=tag)
+    st = ota_updater.read_state()
+    assert st["phase"] == "failed" and "older than v0.3.4" in st["error"]
+    assert ota.downloads == [] and ota.pip == []
+
+
+def test_version_order():
+    k = ota_updater._version_key
+    assert k("v0.3.4-rc.1") < k("v0.3.4") < k("0.3.5") < k("v0.10.0") < k("v1.0.0")
+    assert k("v0.3.4-rc.2") > k("v0.3.4-rc.1") and k("main") is None
+
+
+# libraries: added when missing, never changed
+
+def test_a_release_that_needs_a_library_upgraded_is_not_installed(ota):
+    before = ota.venv.tree()
+    ota.requires = ("paho-mqtt>=3.0",)
+    ota.check_out = ["agal-one-agent 0.3.4 has requirement paho-mqtt>=3.0, but you have paho-mqtt 2.1.0."]
+    _update(ota)
+    st = ota_updater.read_state()
+    assert st["phase"] == "failed" and "another version" in st["error"] and "paho-mqtt>=3.0" in st["error"]
+    assert ota.deps_installed == [] and ota.dry_runs == [], "the libraries were never touched"
+    assert ota.venv.tree() == before and ota.restarts == 0
+
+
+def test_a_new_library_that_would_upgrade_one_the_board_has_is_not_installed(ota):
+    before = ota.venv.tree()
+    ota.requires = ("newlib>=1.2",)
+    ota.check_out = ["agal-one-agent 0.3.4 requires newlib, which is not installed."]
+    ota.dry_report = {"install": [{"metadata": {"name": "newlib", "version": "1.2"}},
+                                  {"metadata": {"name": "paho_mqtt", "version": "3.0.0"}}]}
+    _update(ota)
+    st = ota_updater.read_state()
+    assert st["phase"] == "failed" and "paho_mqtt 2.1.0 → 3.0.0" in st["error"]
+    assert ota.deps_installed == [], "only the dry run"
+    assert ota.venv.tree() == before
+
+
+# probation, owned by the new process
+
+def _probation_state(**extra):
+    st = {"phase": "pending_verify", "previous": "v0.3.3", "target": "v0.3.4", "nodeUid": "node-x",
+          "snapshot": {"version": "v0.3.3"}, "deadlineEpoch": int(time.time()) + 10, **extra}
+    ota_updater.write_state(st)
+    return st
+
+
+def test_begin_probation_counts_the_deadline_from_the_boot_once(ota):
+    ota.venv.install("0.3.4")
+    _probation_state(deadlineEpoch=int(time.time()) - 5)  # a slow shutdown used up the old deadline
+    assert ota_updater.begin_probation("0.3.4") is True
+    st = ota_updater.read_state()
+    assert st["deadlineEpoch"] >= time.time() + ota_updater.PROBATION_DEADLINE_S - 2
+    first = st["deadlineEpoch"]
+    # a version that crash-loops after this point does not get its deadline moved again
+    st["deadlineEpoch"] = int(time.time()) + 3
+    ota_updater.write_state(st)
+    assert ota_updater.begin_probation("0.3.4") is True
+    assert ota_updater.read_state()["deadlineEpoch"] < first
+
+
+def test_begin_probation_leaves_the_old_versions_deadline(ota):
+    st = _probation_state()
+    assert ota_updater.begin_probation("0.3.3") is True, "confirm reports that the old version came up"
+    assert ota_updater.read_state()["deadlineEpoch"] == st["deadlineEpoch"]
+    ota_updater.write_state({"phase": "idle"})
+    assert ota_updater.begin_probation("0.3.4") is False
+
+
+def test_probation_confirms_at_the_first_healthy_check_not_one_instant(ota):
+    ota.venv.install("0.3.4")
+    _probation_state(package={"source": ARCHIVE.format(tag="v0.3.4"), "sha256": "a" * 64})
+    connected = {"now": False}
+    p = ota_updater.Probation("node-x", "0.3.4", lambda: connected["now"])
+    p.tick()
+    assert p.check() is False, "a reconnecting MQTT at one check is not a failed probation"
+    assert ota_updater.read_state()["phase"] == "pending_verify"
+    connected["now"] = True
+    p.tick()
+    assert p.check() is True
+    st = ota_updater.read_state()
+    assert st["phase"] == "idle" and st["previous"] == "v0.3.4"
+    assert _phases(ota) == ["succeeded"]
+    assert ota_updater._known_package("v0.3.4") == {"source": ARCHIVE.format(tag="v0.3.4"), "sha256": "a" * 64}, \
+        "the confirmed version's archive is recorded for the way back of the next update"
+
+
+def test_probation_is_not_healthy_when_the_main_loop_stopped(ota):
+    ota.venv.install("0.3.4")
+    _probation_state()
+    p = ota_updater.Probation("node-x", "0.3.4", lambda: True)
+    p.tick()
+    ota.now += ota_updater.LOOP_STALE_S + 1
+    assert p.check() is False and ota_updater.read_state()["phase"] == "pending_verify"
+
+
+def test_the_heartbeat_names_the_version_the_connection_and_what_is_on(ota):
+    _probation_state()
+    p = ota_updater.Probation("node-x", "0.3.4", lambda: False, outputs_on=lambda: ["Pump (device.power)"])
+    p.tick()
+    beat = ota_updater.read_heartbeat()
+    assert (beat["version"], beat["connected"], beat["outputsOn"]) == ("v0.3.4", False, ["Pump (device.power)"])
+    epoch = beat["epoch"]
+    p.tick()  # not rewritten before HEARTBEAT_EVERY_S
+    ota.now += ota_updater.HEARTBEAT_EVERY_S
+    p.tick()
+    assert ota_updater.read_heartbeat()["epoch"] >= epoch
+
+
+def _beat(version="v0.3.4", age=0, connected=False, on=()):
+    os.makedirs(os.path.join(ota_updater.STATE_DIR, "ota"), exist_ok=True)
+    with open(os.path.join(ota_updater.STATE_DIR, "ota", "heartbeat.json"), "w") as f:
+        json.dump({"epoch": int(time.time()) - age, "version": version, "connected": connected,
+                   "outputsOn": list(on)}, f)
+
+
+def test_the_rollback_waits_while_the_new_version_runs_a_pump(ota):
+    _update(ota)
+    _past_deadline()
+    _beat(on=["Pump (device.power)"])
+    out = ota_updater.run_verify()
+    assert "holding the rollback" in out and "Pump" in out
+    assert ota_updater.read_state()["phase"] == "pending_verify" and ota.restarts == 1
+    # bounded: past the deadline by more than the busy wait, it goes back anyway
+    _past_deadline(deadlineEpoch=int(time.time()) - ota_updater.BUSY_WAIT_S - 1)
+    _beat(on=["Pump (device.power)"])
+    assert "rolled back" in ota_updater.run_verify()
+
+
+def test_the_rollback_waits_briefly_for_an_up_and_connected_new_version(ota):
+    _update(ota)
+    _past_deadline()
+    _beat(connected=True)
+    assert "confirms itself" in ota_updater.run_verify()
+    _past_deadline(deadlineEpoch=int(time.time()) - ota_updater.CONFIRM_GRACE_S - 1)
+    assert "rolled back" in ota_updater.run_verify()
+
+
+@pytest.mark.parametrize("beat", [dict(age=120, on=["Pump"]), dict(version="v0.3.3", on=["Pump"])],
+                         ids=["stale", "other-version"])
+def test_a_stale_or_foreign_heartbeat_does_not_hold_the_rollback(ota, beat):
+    _update(ota)
+    _past_deadline()
+    _beat(**beat)
+    assert "rolled back" in ota_updater.run_verify()
+
+
+def test_run_verify_does_not_act_while_the_state_is_locked(ota):
+    _update(ota)
+    _past_deadline()
+    with ota_updater._state_lock() as held:
+        assert held
+        assert "busy" in ota_updater.run_verify()
+    assert ota_updater.read_state()["phase"] == "pending_verify"
+
+
+# the restart reaches systemd; the boot clean-up never touches a running update
+
+def test_the_restart_is_queued_and_waited_for(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ota_updater, "_systemctl",
+                        lambda *a: calls.append(a) or subprocess.CompletedProcess(a, 0, "", ""))
+    ota_updater._restart_service()
+    assert calls == [("restart", "--no-block", "agal-one-agent")]
+
+
+def test_settle_interrupted_leaves_a_running_update_alone(ota):
+    ota_updater.write_state({"phase": "downloading", "previous": "v0.3.3", "target": "v0.3.4", "nodeUid": "node-x"})
+    with ota_updater._UPDATE_LOCK:
+        assert ota_updater.settle_interrupted() is False
+    assert ota_updater.read_state()["phase"] == "downloading" and ota.emits == []
+
+
+# the verify launcher
+
+def test_the_verify_launcher_imports_nothing_when_no_update_is_in_probation(ota, tmp_path):
+    _update(ota)
+    ota_updater.write_state({"phase": "idle"})
+    marker = tmp_path / "marker"
+    launcher = os.path.join(ota_updater.STATE_DIR, "ota", "verify.py")
+    r = subprocess.run([sys.executable, "-I", launcher], env={**os.environ, "OTA_MARKER": str(marker)},
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert not marker.exists()
+
+
+def test_the_verify_launcher_uses_the_installed_code_when_the_saved_copy_is_damaged(ota, tmp_path):
+    _update(ota)
+    _damage_snapshot()
+    marker = tmp_path / "marker"
+    launcher = os.path.join(ota_updater.STATE_DIR, "ota", "verify.py")
+    r = subprocess.run([sys.executable, launcher],
+                       env={**os.environ, "OTA_MARKER": str(marker), "PYTHONPATH": str(ota.venv.site)},
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert marker.read_text() == "0.3.4", "a damaged saved copy is not imported"
+
+
+def test_main_settles_and_begins_probation_before_mqtt_connects(tmp_path, monkeypatch):
+    import yaml
+    from agal_one_agent import main as agent_main
+    from agal_one_agent.http_reporter import HttpReporter
+    from agal_one_agent.mqtt_client import AgalOneMqttClient
+
+    class Captured(Exception):
+        pass
+
+    order = []
+
+    def connect(self):
+        order.append("connect")
+        raise Captured
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(yaml.dump({
+        "node": {"uid": "node-1", "name": "Bench", "auth_token": "tok"}, "mqtt": {"broker": "broker.example"},
+        "telemetry": {"ingress_url": "https://ingress.example/x", "buffer_db_path": str(tmp_path / "buf.db")},
+        "blocks": {"state_dir": str(tmp_path / "blocks")}}))
+    monkeypatch.delenv("SENTRY_DSN", raising=False)
+    monkeypatch.setattr(AgalOneMqttClient, "connect", connect)
+    monkeypatch.setattr(HttpReporter, "report_hardware", lambda self, report: None)
+    monkeypatch.setattr(ota_updater, "settle_interrupted", lambda node_uid="": order.append("settle"))
+    monkeypatch.setattr(ota_updater, "begin_probation", lambda v: order.append(("probation", v)) or False)
+    monkeypatch.setattr("sys.argv", ["agal-one-agent", "--config", str(cfg)])
+    with pytest.raises(Captured):
+        agent_main.main()
+    assert order == ["settle", ("probation", agent_main.__version__), "connect"]
+
+
+# what an update waits on
+
+def test_an_active_low_gpio_port_that_is_off_is_not_reported_on(monkeypatch):
+    from agal_one_agent import main as agent_main
+    from agal_one_agent.blocks.io import HardwareIO, PortRef
+    from agal_one_agent.handlers import gpio_handler, pwm_handler
+
+    monkeypatch.setattr(gpio_handler, "_levels", {})
+    monkeypatch.setattr(pwm_handler, "_duties", {})
+    port = PortRef("pump-1", "device.power", {"kind": "gpio", "gpioNumber": 17, "direction": "out", "activeLow": True})
+    io_ = HardwareIO()
+    io_.write_output(port, False)
+    assert agent_main.outputs_on_for(None) == [], "OFF is held HIGH on an active-low relay: still OFF"
+    io_.write_output(port, True)
+    assert agent_main.outputs_on_for(None) == ["device.power (GPIO17)"]
+    io_.write_output(port, False)
+    assert agent_main.outputs_on_for(None) == []
+
+
+def test_preload_imports_every_module_of_the_running_agent():
+    for name in ["agal_one_agent.handlers.uart_handler", "agal_one_agent.handlers.onewire_handler"]:
+        sys.modules.pop(name, None)
+    ota_updater._preload_package()
+    assert "agal_one_agent.handlers.uart_handler" in sys.modules
+    assert "agal_one_agent.handlers.onewire_handler" in sys.modules
+    assert "agal_one_agent.__main__" not in sys.modules

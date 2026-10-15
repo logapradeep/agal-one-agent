@@ -601,6 +601,15 @@ def main():
 
     # Start
     legacy_started = False
+    probation = None
+    from . import ota_updater
+    in_probation = False
+    if not args.offline:
+        # Before MQTT connects, so no firmwareUpdate command can have started yet: an update this
+        # agent was waiting on or downloading when it stopped installed nothing (reported failed),
+        # and an update in probation counts its rollback deadline from this boot (once per update).
+        ota_updater.settle_interrupted(node_uid=config.node.uid)
+        in_probation = ota_updater.begin_probation(__version__)
     try:
         if args.offline:
             logger.warning("OFFLINE: not connecting to MQTT or the ingress; running the persisted program only")
@@ -664,33 +673,21 @@ def main():
             if program_sync is not None:
                 program_sync.pull()
 
-        # OTA probation: if we just booted after an OTA install, confirm health
-        # once we've stayed connected for the probation window. If we crash or
-        # never connect before then, the independent verify-timer rolls us back.
-        from . import ota_updater
-        if not args.offline:
-            # An update this agent was waiting on or downloading when it stopped installed nothing.
-            ota_updater.settle_interrupted(node_uid=config.node.uid)
-        if not args.offline and ota_updater.read_state().get("phase") == "pending_verify":
-            logger.info(
-                "OTA: booted in probation (target=%s); self-confirming in %ds if still healthy",
-                ota_updater.read_state().get("target"), ota_updater.PROBATION_WINDOW_S,
-            )
-
-            def _confirm_if_healthy():
-                if mqtt_client.is_connected:
-                    ota_updater.confirm_update(node_uid=config.node.uid)
-                else:
-                    logger.warning("OTA: not connected at probation check; leaving to verify-timer")
-
-            _probation = threading.Timer(ota_updater.PROBATION_WINDOW_S, _confirm_if_healthy)
-            _probation.daemon = True
-            _probation.start()
+        # OTA probation: if we just booted after an OTA install, this process confirms itself at
+        # the first healthy check (connected, main loop alive) from PROBATION_WINDOW_S on; the main
+        # loop's tick() writes the heartbeat the verify-timer reads. If we crash, hang or never
+        # connect, the independent verify-timer rolls us back.
+        if in_probation and ota_updater.read_state().get("phase") == "pending_verify":
+            probation = ota_updater.Probation(
+                config.node.uid, __version__, lambda: mqtt_client.is_connected,
+                outputs_on=lambda: outputs_on_for(runtime)).start()
 
         logger.info("Agent running. Press Ctrl+C to stop.")
 
         while running:
             time.sleep(1)
+            if probation is not None:
+                probation.tick()
             # A program that arrives after boot starts the runtime and retires the
             # legacy protection thread (single writer per output).
             if runtime is not None and runtime.nab is not None and not runtime._running:
@@ -705,6 +702,8 @@ def main():
         pass
     finally:
         logger.info("Stopping services...")
+        if probation is not None:
+            probation.stop()
         if runtime is not None:
             try:
                 runtime.stop(safe_state=True)

@@ -21,8 +21,12 @@ every update failed and every upgrade so far was a fresh join command typed on t
   does: one `agal-one-agent @ file:///… --hash=sha256:…` line, `pip install --no-deps
   --require-hashes -r` (pip checks the hash a second time). If `pip check` then says the new
   version needs a library the board lacks, that library is installed from PyPI the way the join
-  script installs the agent's libraries; the installed version must be the target, or the update
-  is undone. The archive is deleted after the install.
+  script installs the agent's libraries — only a MISSING one, and only after pip's dry run
+  (`pip install --dry-run --report`) shows it changes no library the board has. A release that
+  needs an installed library at another version (directly, or through the library it adds) is not
+  installed: the update is undone with the libraries untouched (see the review fixes below). The
+  installed version must be the target, or the update is undone. The archive is deleted after the
+  install.
 - **the way back needs no network.** Before installing, the agent saves the running version to
   `/var/lib/agal-one-agent/ota/previous/`: every file its pip RECORD lists — the `agal_one_agent`
   package, its `agal_one_agent-X.Y.Z.dist-info` and its console scripts in `venv/bin` — each with
@@ -30,9 +34,10 @@ every update failed and every upgrade so far was a fresh join command typed on t
   of the old version is needed. Putting it back (on a pip failure, and in the verify-timer's
   rollback) checks every saved file first, removes the files of whatever agal-one-agent is
   installed (its RECORD, the package directory, every agal_one_agent-*.dist-info), and copies the
-  saved files back. Dependencies are not part of it — the archive path installs `--no-deps`; a
-  library a new version added stays, harmless. An install with no RECORD (an editable `pip
-  install -e .`, as `scripts/install.sh` does) cannot be saved, so it is not updated over the air.
+  saved files back. Libraries are not part of it, which is why an update never changes one the
+  board has (it may add a missing one — harmless after a rollback). An install with no RECORD (an
+  editable `pip install -e .`, as `scripts/install.sh` does) cannot be saved, so it is not updated
+  over the air.
 - **the verify-timer, on every board.** The join script installs only `agal-one-agent.service`, so
   the joined boards never had the independent rollback check. Before an update the agent writes
   `agal-one-agent-ota-verify.service` / `.timer` (where missing or different), `daemon-reload`s
@@ -56,19 +61,99 @@ every update failed and every upgrade so far was a fresh join command typed on t
   callback, so for the whole pip install no command reached the node — now the command that
   switches the pump off arrives while the update waits for it. A second `firmwareUpdate` while one
   runs is ignored (logged).
-- **git only for an older backend.** A command without `source` installs from git as before
-  (deps included), logs that this needs git, and — on a board without git — ends `failed` at once
-  saying the backend has to send the archive. It gets the saved version and the verify-timer too.
+- **git only for an older backend.** A command without `source` installs from git (`--no-deps
+  --force-reinstall`, then only missing libraries, as the archive), logs that this needs git, and —
+  on a board without git — ends `failed` at once saying the backend has to send the archive. It
+  gets the saved version and the verify-timer too.
 - **honest outcomes.** An update the agent was waiting on or downloading when it stopped is
   reported `failed` ("interrupted") at the next boot, instead of the app showing "updating" for
   ever. A probation that finds the OLD version running (the agent restarted while pip ran) reports
   `failed`, not `succeeded`. The events go to the config's `ingress_url` with the node's token.
   pip's `ERROR:` lines, not a traceback, are the event's error.
 
-Unchanged: `firmware_update_started/succeeded/rolled_back/failed` over HTTPS, the probation
-(60 s healthy uptime, then `confirm_update`), the verify deadline (150 s after the restart; kept
-ahead while pip runs), `rolled_back` / `failed` + restart from `run_verify`, and a state written by
-an older agent (no saved version) rolled back through git as before.
+Unchanged: `firmware_update_started/succeeded/rolled_back/failed` over HTTPS, and a state written
+by an older agent (no saved version) rolled back through git as before. The probation, the verify
+deadline and what `run_verify` does on a failed rollback changed in the review fixes below.
+
+**Review fixes (2026-10-15, same unreleased 0.3.4).**
+
+- **a power cut during the install no longer bricks the node.** Nothing was flushed: on ext4 a
+  file created and renamed less than ~30 s before a power cut can come back empty while the rename
+  survives, and pip runs 30–90 s right after the snapshot. Now the snapshot is `os.sync()`ed before
+  it is renamed into place (and its directory fsynced), `ota_state.json` and the verify units are
+  written fsync + rename + directory fsync, and the board syncs after writing `pending_verify`
+  (before pip), before the restart into the new version and after a rollback.
+- **a failed rollback is tried again, never given up.** It used to end `failed` for good (the
+  timer acts only on `pending_verify`), with a crash-looping venv left for the terminal. Now the
+  state stays `pending_verify` with `rollbackAttempts` and a backoff (1, 2, 5, 10, then every
+  30 min); the failure is reported once (`firmware_update_failed`, "… the board keeps trying"). The
+  way back is the saved copy, and — when a saved file is damaged, or what it put back does not
+  start — the previous version's release archive with the sha256 this board recorded for it
+  (`ota/installed.json`, written when an update is confirmed or rolled back, or the join script's
+  `/opt/agal-one-agent/agent.requirements`), downloaded, hash-checked and installed `--no-deps
+  --require-hashes --force-reinstall`. Either way the restored agent must import in a fresh
+  interpreter (`venv/bin/python -I -c 'import agal_one_agent.main'`) and be the previous version
+  before it is called `rolled_back`. When the update's own process could not put the files back,
+  the state is left to the verify-timer the same way (it no longer ends `failed` with a half venv),
+  and once the files are back that running process is not restarted (it already runs that version).
+  The verify launcher now hash-checks the saved copy before it runs the saved version's rollback
+  code (else the installed agent's), and imports nothing at all unless an update is in probation.
+- **updates only move forward, and never below 0.3.4.** The command's sha256 proves only that the
+  archive matches the message, and every board shares one MQTT login (ADR-012: topics apart by
+  convention), so anyone holding a config could send any old tag. The agent now refuses a target
+  older than `MIN_OTA_VERSION` = v0.3.4 (the first that updates from the archive: anything older
+  would need git, and the terminal, for its next update — and 0.3.1 and older pulse an active-low
+  output on at boot) and a target older than the running version ("a newer release is how a bad
+  one is undone"). The backend refuses the button when the pin is older than the node's
+  `firmwareVersion`. Binding the hash to the backend (the agent confirming the command over its
+  own HTTPS token) needs a contract change first — listed, not built.
+- **the new process owns its probation.** It was one check, 60 s after the boot reconcile and the
+  program pull, passing only if MQTT was connected at that instant, against a deadline written
+  before the old process even stopped; now that the agent installs the verify-timer, that rollback
+  is live on every board. Now `begin_probation()` at boot, before MQTT, counts the deadline from
+  that boot (`AGAL_ONE_AGENT_OTA_PROBATION_DEADLINE_S`, 300 s; once per update, so a version that
+  crash-loops after that point is still rolled back); from 60 s on the new process checks every
+  5 s and confirms at the first healthy check (connected and the main loop alive), as long as the
+  update is pending. Its main loop writes `ota/heartbeat.json` (version, connected, what is ON)
+  every 10 s during probation only; past the deadline the verify-timer holds the rollback while
+  that heartbeat is fresh, names the target and says an output is ON (up to 30 min — a rollback
+  restart would cut a running pump), or says it is connected (up to 2 min, it confirms itself);
+  a stale heartbeat or one naming another version does not hold it. The verify-timer and the
+  confirmation take a lock on the state (`ota.lock`), so one cannot land inside the other; a new
+  firmwareUpdate while an update is still pending is ignored (its state is left alone).
+- **the verify-timer's restart reaches systemd.** It was a detached `systemctl restart` from a
+  oneshot unit, killed with the unit's processes when the check exited, maybe before it asked;
+  now `systemctl restart --no-block` run to the end (it returns once the job is queued).
+- **an active-low output on a Broadcom number is not "on" when it is off.** `gpio_handler` kept
+  the pin's level, and the block runtime writes an active-low port inverted — an OFF relay held
+  HIGH read as ON, so every update waited 30 min and ended `busy:`. It now keeps ON/OFF
+  (`GpioHandler.write(..., logical=)`, passed by `blocks/io.HardwareIO`).
+- **the old process loads nothing from the new version.** Every module of the running agent is
+  imported before pip runs, so a handler or lazy import first used while the update waits (up to
+  30 min, with a pump on) is the old version's, not a new file next to old ones.
+- **the boot clean-up of an interrupted update runs before MQTT connects**, so it can no longer
+  report a live download `failed` and delete it; it also leaves alone an update this process runs.
+
+Backend, same wave (agal-one `fix/2026-10-ota-archive`): the join script resets
+`ota_state.json` to idle and removes the saved copy before it installs the agent (an old
+probation's timer cannot roll a fresh join back), and `uninstall.sh` stops and removes the
+verify-timer the agent installs.
+
+Limit, on purpose: a release that raises a library's minimum (paho-mqtt>=3, say) cannot come over
+the air — the saved copy covers the agent's own files only. Keep library minimums in releases, or
+extend the saved copy to the libraries pip's dry run names before such a release.
+
+Verified (review fixes): 95 tests in `tests/test_ota_rollback.py` (was 61), and with real pip
+26.2.1 on Python 3.14 in a scratch venv (local archives standing in for GitHub's; the download,
+systemctl and the event post faked): joined 0.3.4 → 0.3.5 through the archive, its probation
+confirmed by `Probation.check()` in a fresh 0.3.5 process (archive recorded in `installed.json`);
+0.3.6 needing `requests>=2.32` refused because pip's dry run said it would also change
+charset-normalizer 1.4.1 → 3.5.2 (0.3.5 back, no library changed); 0.3.8 needing paho-mqtt>=3.0
+refused from pip check's "has requirement" (paho stayed 2.1.0); 0.3.7 adding `six` installed it
+and nothing else; then, with the saved `main.py` emptied and the deadline past, `run_verify`
+installed 0.3.5 again from its archive (`--force-reinstall`), a fresh interpreter imported 0.3.5,
+`pip check` clean, `rolled_back`, restart queued `--no-block`. Not run on a Pi, not against GitHub,
+no real power cut or systemd.
 
 **What it does not fix: the board on 0.3.1 / 0.3.3 needs the join command ONE more time.** Those
 versions' own updater is the git one (it runs the update, not the new version), so the step to

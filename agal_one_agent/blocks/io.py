@@ -257,4 +257,5 @@ class HardwareIO(IOAdapter):
             handler = self._get_handler("gpio_output")
             pin = _Pin(port.gpio, "gpio_output", port.source_key)
             if handler:
-                handler.write(pin, 1 if out else 0)
+                # the level (inverted for active low), and whether it is ON — what an OTA update waits on
+                handler.write(pin, 1 if out else 0, logical=bool(value))
