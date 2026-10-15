@@ -1,6 +1,6 @@
 # Changelog — agal-one-agent
 
-## 0.3.3 (unreleased)
+## 0.3.3 (2026-10-15)
 
 A new version rather than more of 0.3.2: 0.3.2 (cb03e4b) is already on `main` as its own
 build, and the OTA path tells builds apart by their version string. Neither is tagged;
