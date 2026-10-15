@@ -16,6 +16,14 @@ except (ImportError, RuntimeError):
 
 
 _setup_pins: dict[int, int] = {}  # gpio -> mode (GPIO.IN or GPIO.OUT)
+# gpio -> (level last written, the pin's name) — what an OTA update waits on (outputs_on).
+# The legacy executor writes 1 for ON (it has no active-low).
+_levels: dict[int, tuple[int, str]] = {}
+
+
+def outputs_on() -> list[str]:
+    """The legacy GPIO outputs last written ON — a restart switches them off (ota_updater waits)."""
+    return [f"{name} (GPIO{gpio})" for gpio, (level, name) in sorted(_levels.items()) if level]
 
 
 class GpioHandler:
@@ -38,6 +46,7 @@ class GpioHandler:
         if gpio is None:
             return None
         self._setup(pin, GPIO.IN if _GPIO_AVAILABLE else None)
+        _levels.pop(gpio, None)  # an input now
         if _GPIO_AVAILABLE:
             return GPIO.input(gpio)
         logger.debug("Simulated read pin GPIO%d = 0", gpio)
@@ -51,5 +60,6 @@ class GpioHandler:
         self._setup(pin, GPIO.OUT if _GPIO_AVAILABLE else None, initial=out)
         if _GPIO_AVAILABLE:
             GPIO.output(gpio, out)
+        _levels[gpio] = (out, getattr(pin, "label", None) or getattr(pin, "assigned_to", None) or f"pin {pin.physical_pin}")
         logger.info("GPIO%d set to %d", gpio, out)
         return out

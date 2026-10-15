@@ -270,7 +270,7 @@ def test_the_ota_receipt_and_its_failure_stay_on_mqtt(monkeypatch, fails):
     # second's wait for a doc that is never there.
     from agal_one_agent import ota_updater
 
-    def perform_update(version, command_id="", rollout_id="", node_uid=""):
+    def perform_update(version, command_id="", rollout_id="", node_uid="", **_archive_and_outputs):
         if fails:
             raise RuntimeError("pip install failed")
         return f"installing {version}"

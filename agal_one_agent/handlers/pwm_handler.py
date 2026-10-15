@@ -29,6 +29,8 @@ DEFAULT_FREQUENCY_HZ = 1000.0
 
 # gpio -> (pwm instance, current frequency in Hz)
 _pwm_instances: dict[int, tuple[object, float]] = {}
+# gpio -> (logical duty last written, the pin's name) — what an OTA update waits on (outputs_on)
+_duties: dict[int, tuple[float, str]] = {}
 
 
 def _effective_frequency(pin) -> float:
@@ -51,6 +53,7 @@ def release(gpio: int) -> None:
     Called when a syncPinConfig remaps a pin away from the pwm protocol so a
     plain GpioHandler (or nothing) can take the pin over cleanly.
     """
+    _duties.pop(gpio, None)
     entry = _pwm_instances.pop(gpio, None)
     if entry is None:
         return
@@ -65,6 +68,11 @@ def release(gpio: int) -> None:
 def active_gpios() -> set[int]:
     """GPIOs with a live PWM channel (used by syncPinConfig reconciliation)."""
     return set(_pwm_instances.keys())
+
+
+def outputs_on() -> list[str]:
+    """The legacy PWM outputs last written above 0 % — a restart stops them (ota_updater waits)."""
+    return [f"{name} (PWM GPIO{gpio})" for gpio, (duty, name) in sorted(_duties.items()) if duty > 0]
 
 
 class PwmHandler:
@@ -94,6 +102,7 @@ class PwmHandler:
                     _pwm_instances[gpio] = (pwm, frequency)
                 pwm.ChangeDutyCycle(hw_duty)
 
+        _duties[gpio] = (logical_duty, getattr(pin, "label", None) or getattr(pin, "assigned_to", None) or f"pin {pin.physical_pin}")
         logger.info(
             "PWM GPIO%d duty=%.1f%% (hw=%.1f%%, freq=%.1fHz, polarity=%s)",
             gpio, logical_duty, hw_duty, frequency,

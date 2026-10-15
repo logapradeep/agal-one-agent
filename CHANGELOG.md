@@ -1,5 +1,96 @@
 # Changelog — agal-one-agent
 
+## 0.3.4 (unreleased — not tagged)
+
+**Fix — a firmware update needed the board's terminal (founder, 2026-10-15: "once the rpi is
+linked, there should not be a need to do anything on the pi terminal especially the updates").**
+The app's Update firmware button (`updateNodeFirmware` → `/nodeCommands` → `firmwareUpdate
+{version}`) made the agent `pip install git+https://github.com/logapradeep/agal-one-agent.git@vX.Y.Z`.
+The joined boards have no git (the join script installs none; the Pi 3B on Debian 13 has none), so
+every update failed and every upgrade so far was a fresh join command typed on the Pi. From 0.3.4
+(`ota_updater.py`):
+
+- **the release archive, no git.** A `firmwareUpdate` may carry `source` + `sha256` — the same
+  pair `/config/agent` pins for the join script. The agent accepts only
+  `https://github.com/logapradeep/agal-one-agent/archive/refs/tags/<the target tag>.tar.gz`
+  (http, another owner or host, another tag, a branch, a query, a zip, a file: URL are refused),
+  and only with a sha256. It downloads the archive over HTTPS into
+  `/var/lib/agal-one-agent/ota/download/` (32 MB cap, 30 s per read, 300 s in all, redirects only
+  to github.com / codeload.github.com over HTTPS), checks the sha256 BEFORE installing (a mismatch
+  ends `failed`, nothing installed, the file deleted), and installs it the way the join script
+  does: one `agal-one-agent @ file:///… --hash=sha256:…` line, `pip install --no-deps
+  --require-hashes -r` (pip checks the hash a second time). If `pip check` then says the new
+  version needs a library the board lacks, that library is installed from PyPI the way the join
+  script installs the agent's libraries; the installed version must be the target, or the update
+  is undone. The archive is deleted after the install.
+- **the way back needs no network.** Before installing, the agent saves the running version to
+  `/var/lib/agal-one-agent/ota/previous/`: every file its pip RECORD lists — the `agal_one_agent`
+  package, its `agal_one_agent-X.Y.Z.dist-info` and its console scripts in `venv/bin` — each with
+  its sha256 (~1–2 MB). This works for the first update from a joined 0.3.x too: no cached archive
+  of the old version is needed. Putting it back (on a pip failure, and in the verify-timer's
+  rollback) checks every saved file first, removes the files of whatever agal-one-agent is
+  installed (its RECORD, the package directory, every agal_one_agent-*.dist-info), and copies the
+  saved files back. Dependencies are not part of it — the archive path installs `--no-deps`; a
+  library a new version added stays, harmless. An install with no RECORD (an editable `pip
+  install -e .`, as `scripts/install.sh` does) cannot be saved, so it is not updated over the air.
+- **the verify-timer, on every board.** The join script installs only `agal-one-agent.service`, so
+  the joined boards never had the independent rollback check. Before an update the agent writes
+  `agal-one-agent-ota-verify.service` / `.timer` (where missing or different), `daemon-reload`s
+  and `enable --now`s the timer; if that fails the update does not go ahead. The service runs
+  `venv/bin/python -I /var/lib/agal-one-agent/ota/verify.py`, which puts the SAVED version first
+  on the import path: the rollback is done by the code that wrote the update's state, so a new
+  version that does not even import is still rolled back. `systemctl` is called directly when the
+  agent is root (it is, under the join script's unit), `sudo -n` otherwise.
+- **not while a motor runs.** A restart switches every output off. Before downloading, the update
+  waits while anything the node drives is ON — every program output at an on level and every plot
+  run (`BlockRuntime.outputs_on`), and the legacy GPIO / PWM outputs (`gpio_handler` /
+  `pwm_handler.outputs_on`) — checking every 10 s for up to 30 min
+  (`AGAL_ONE_AGENT_OTA_BUSY_WAIT_S`). Still on: `failed` with an error starting `busy:` that
+  names them; nothing downloaded. Something switched on while pip ran: the restart waits again
+  (bounded the same way; the verify-timer's deadline kept ahead meanwhile), else the saved version
+  goes back and the update ends `busy:`. Outputs that cannot be read count as on. Chosen over
+  "defer and let the cloud retry" because the backend has no retry for a node command, and
+  `OtaStatus` has no deferred value (contract gap: listed for Agal/contracts). A port test's pulse
+  (≤ 5 s) is not waited on.
+- **the update runs on its own thread** (`main.start_firmware_update`). It ran inside the MQTT
+  callback, so for the whole pip install no command reached the node — now the command that
+  switches the pump off arrives while the update waits for it. A second `firmwareUpdate` while one
+  runs is ignored (logged).
+- **git only for an older backend.** A command without `source` installs from git as before
+  (deps included), logs that this needs git, and — on a board without git — ends `failed` at once
+  saying the backend has to send the archive. It gets the saved version and the verify-timer too.
+- **honest outcomes.** An update the agent was waiting on or downloading when it stopped is
+  reported `failed` ("interrupted") at the next boot, instead of the app showing "updating" for
+  ever. A probation that finds the OLD version running (the agent restarted while pip ran) reports
+  `failed`, not `succeeded`. The events go to the config's `ingress_url` with the node's token.
+  pip's `ERROR:` lines, not a traceback, are the event's error.
+
+Unchanged: `firmware_update_started/succeeded/rolled_back/failed` over HTTPS, the probation
+(60 s healthy uptime, then `confirm_update`), the verify deadline (150 s after the restart; kept
+ahead while pip runs), `rolled_back` / `failed` + restart from `run_verify`, and a state written by
+an older agent (no saved version) rolled back through git as before.
+
+**What it does not fix: the board on 0.3.1 / 0.3.3 needs the join command ONE more time.** Those
+versions' own updater is the git one (it runs the update, not the new version), so the step to
+0.3.4 cannot come over the air on a board without git. From 0.3.4 on, every update can. For the
+button to send the archive the backend has to put `source` + `sha256` (from `/config/agent`) on the
+`firmwareUpdate` command — `onNodeCommandCreated` sends only `{commandId, type, version, rolloutId}`
+today; until it does, 0.3.4 answers an update with "this board has no git … the backend has to send
+them".
+
+Verified: 61 tests in `tests/test_ota_rollback.py` (was 9), no network — a fake downloader, pip,
+systemctl and clock, against a real venv tree in tmp_path so the save and the restore run for
+real; the verify launcher is run in a subprocess and is shown to run the saved version's code.
+And with real pip 26.0.1 in a scratch venv (Python 3.9; local archives standing in for GitHub's,
+the download, systemctl, the restart and the event post faked), on this code: joined as 0.3.4
+with the join script's flags; updated to 0.3.5 through the hashed requirement line; `run_verify`
+past the deadline put 0.3.4 back with no pip call and no download — file for file, one
+dist-info, `pip check` clean, a fresh interpreter imports 0.3.4; an unbuildable 0.3.6 failed in
+pip ("ERROR: Failed to build 'agal-one-agent' …") and 0.3.4 came back the same way, no restart.
+An earlier run of the same, on a venv joined without the libraries, also installed paho-mqtt,
+PyYAML and python-periphery after `pip check` named them. Not run on a Pi, not against GitHub's
+real archive and redirect, systemd and the busy wait not exercised on a board.
+
 ## 0.3.3 (2026-10-15)
 
 A new version rather than more of 0.3.2: 0.3.2 (cb03e4b) is already on `main` as its own

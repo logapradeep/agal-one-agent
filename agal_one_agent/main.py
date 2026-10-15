@@ -34,24 +34,54 @@ logger = logging.getLogger("agal_one_agent")
 BOOT_WAIT_FOR_PORT_TABLE_S = 30.0
 
 
-def handle_firmware_update(command: dict, mqtt_client, node_uid: str) -> None:
+def handle_firmware_update(command: dict, mqtt_client, node_uid: str, outputs_on=None) -> None:
     """A managed OTA update (health-gated rollback). Receipt ack only — the real outcome is
     reported asynchronously via firmware_update_* events (started on install, then succeeded
     once the new version clears probation, or rolled_back by the verify-timer). Its acks stay on
     MQTT (``ingress=False``): the command is a /nodeCommands doc, which the ingress's commandAck
-    does not track, so a post would only cost the backend a lookup of a doc that is not there."""
+    does not track, so a post would only cost the backend a lookup of a doc that is not there.
+
+    The command may carry the release archive to install — ``source`` (its URL) and ``sha256``
+    (agent 0.3.4): then no git is needed on the board. ``outputs_on`` names what the node has ON;
+    the update waits while it names anything (ota_updater.perform_update). Blocking: run it
+    through start_firmware_update, never on the MQTT loop."""
     from .ota_updater import perform_update
     command_id = command.get("commandId", "")
     version = command.get("version", "")
     rollout_id = command.get("rolloutId", "")
+    source = command.get("source") if isinstance(command.get("source"), str) else None
+    sha256 = command.get("sha256") if isinstance(command.get("sha256"), str) else None
     mqtt_client.publish_command_ack(command_id, "executing", ingress=False)
     try:
         msg = perform_update(version, command_id=command_id,
-                             rollout_id=rollout_id, node_uid=node_uid)
+                             rollout_id=rollout_id, node_uid=node_uid,
+                             source=source, sha256=sha256, outputs_on=outputs_on)
         logger.info("OTA: %s", msg)
     except Exception as e:  # noqa: BLE001
         logger.error("OTA: perform_update failed: %s", e)
         mqtt_client.publish_command_ack(command_id, "failed", error=str(e), ingress=False)
+
+
+def start_firmware_update(command: dict, mqtt_client, node_uid: str, outputs_on=None) -> threading.Thread:
+    """handle_firmware_update on its own thread: a download, an install and a wait for the pump to
+    stop take minutes, and the MQTT loop must go on meanwhile — the command that switches the
+    pump off arrives through it."""
+    t = threading.Thread(target=handle_firmware_update, args=(command, mqtt_client, node_uid),
+                         kwargs={"outputs_on": outputs_on}, name="ota-update", daemon=True)
+    t.start()
+    return t
+
+
+def outputs_on_for(runtime) -> list:
+    """What the node has ON now — the program's outputs and plot runs, and the legacy GPIO / PWM
+    outputs — for an OTA update to wait on."""
+    from .handlers import gpio_handler, pwm_handler
+    on = []
+    if runtime is not None and runtime.nab is not None:
+        on.extend(runtime.outputs_on())
+    on.extend(gpio_handler.outputs_on())
+    on.extend(pwm_handler.outputs_on())
+    return on
 
 
 def main():
@@ -386,7 +416,8 @@ def main():
 
         # OTA firmware update (managed, with health-gated rollback)
         if cmd_type == "firmwareUpdate":
-            handle_firmware_update(command, mqtt_client, config.node.uid)
+            start_firmware_update(command, mqtt_client, config.node.uid,
+                                  outputs_on=lambda: outputs_on_for(runtime))
             return
 
         # Adaptive live cadence (ADR-013 §9-D3): the backend forwards a
@@ -637,6 +668,9 @@ def main():
         # once we've stayed connected for the probation window. If we crash or
         # never connect before then, the independent verify-timer rolls us back.
         from . import ota_updater
+        if not args.offline:
+            # An update this agent was waiting on or downloading when it stopped installed nothing.
+            ota_updater.settle_interrupted(node_uid=config.node.uid)
         if not args.offline and ota_updater.read_state().get("phase") == "pending_verify":
             logger.info(
                 "OTA: booted in probation (target=%s); self-confirming in %ds if still healthy",

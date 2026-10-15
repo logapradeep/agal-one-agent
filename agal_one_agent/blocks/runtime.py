@@ -1685,6 +1685,28 @@ class BlockRuntime:
 
     # ------------------------------------------------------------ inspection
 
+    def outputs_on(self) -> list[str]:
+        """What the program has ON now — every output at an on level (a bool true or a number
+        above 0, written or about to be) and every plot run — named for a person. A restart
+        switches these off, so an OTA update waits while this is not empty (ota_updater)."""
+        def on(value) -> bool:
+            if isinstance(value, bool):
+                return value
+            return isinstance(value, (int, float)) and value > 0
+
+        with self._lock:
+            out = []
+            for aid in self.aab_order:
+                blk = self.aabs[aid]
+                name = self._asset_meta(aid).get("name") or aid
+                for v in blk.vars.values():
+                    if v.port is None or v.port.transport.get("direction") != "out":
+                        continue
+                    if on(self._last_written.get((aid, v.port.source_key))) or on(v.value):
+                        out.append(f"{name} ({v.port.source_key})")
+            out.extend(f"the run of plot {pid}" for pid in self._active_runs)
+            return out
+
     def snapshot(self) -> dict:
         with self._lock:
             return {
