@@ -13,10 +13,11 @@ migrated (`migratedAt`, the founder's yes); every other node keeps its language-
 both: `blocks/host.py` `ProgramHost` hands a language-1 bundle (`language` absent or 1) to the unchanged
 `BlockRuntime` — the same as the released 0.3.4 in everything the agent does, checked against the tag itself
 (`tests/test_v1_parity.py`, below) — and a language-3 bundle to the new `blocks/v3/` runtime. Language 2
-(superseded before it was built) is rejected. The one change to the v1 module is additive (an event `source`, a
-shared lock, `loaded`). The migration switch itself is checked
-first (a v3 bundle that does not compile never stops the v1 program), then the v1 runtime stops as on a clean
-stop and v3 loads cold, as after a restart — the contract defines no bumpless take-over across languages.
+(superseded before it was built) is rejected. The changes to the v1 module are additive (an event `source`, a
+shared lock, `loaded`; and, for the switch of language below, an after-pass hook and four read-only helpers). The
+migration switch itself is checked first (a v3 bundle that does not compile never stops the v1 program) and, since
+contracts v1.15.1, is **bumpless** — see "The switch of language" below (it replaced "the v1 runtime stops as on a
+clean stop and v3 loads cold, as after a restart", which would have switched the Pi's Light off).
 
 **Built on 0.3.4 (merged 2026-10-16).** 0.4.0 was first built on 0.3.3; the released agent — what the production Pi
 runs — is 0.3.4, so `main` (`c3fbbec`, tag `v0.3.4`) was merged into `wave/2026-10-wave1` (a merge commit, no
@@ -78,6 +79,45 @@ their `reason` over HTTPS; unsigned and replayed are only logged), the signed on
 likewise; every status names 0.4.0, the online ones `blockLanguage` 3; after a clean restart the first status
 carries Valve 2 `closed`. The five drives (two sessions × two agents, and the v3 one) take about 50 s, run in
 parallel; skipped where git or the tag is missing (a release archive on a board).
+
+**The switch of language — the migration and its rollback (contracts v1.15.1, programs/README.md §7.5a; same
+version, still not tagged).** The backend's migrator (agal-one `scripts/migrate-nodes-v3.mjs`) moves a node to bundle
+v3 once, with the founder's yes, and can roll it back; the node's half:
+
+- **Bumpless, both ways** (`blocks/host.py` `_switch`). The old runtime stops **without** its clean-stop safe state;
+  the new one loads cold (the built-ins from the node's own persisted v3 state) and takes over every output the two
+  programs share — the same card and port, on the same line driven the same way (`io.same_output_line`: one physical
+  port, the same `activeLow`, the same kind) — at the level the old one left: nothing is written for it at the first
+  pass. A continuous valve's `valve.open` comes from its v1 coil (open = the coil at its open level for
+  `normallyClosed`), and goes back to it; a latching valve is never carried. A motor carried on starts its guard's
+  inrush window at the switch. It is not a boot (no `boot` event, no restart resume, no runs carried); rules,
+  variables and sequences start afresh; a schedule id that ran or was missed today keeps that (`lastRunDate` /
+  `missedDate` by id), so a switch at 06:40 does not run the 06:00 schedule again. A line the new program does not
+  drive is switched off and let go of (`output_released`), as at any reload.
+- **Between runs only.** While the running program has a run in progress — a v1 schedule or plot run, an end still
+  due, an output a reload let go of, a command not applied yet; on v3 also a run interrupted by a power cut, an
+  output kept to the end of its run, automation paused, a wait for the power — the host holds the checked bundle
+  (`pending_version`) and switches at the end of the first pass with none. While a runtime thread runs passes the
+  switch is always made from that thread, after its pass (the runtimes' new `after_pass` hook), so no pass can
+  start a run between the check and the switch. A bundle of the running language that arrives meanwhile (a rollback
+  before the switch) replaces the held one. The ack (`program_applied`) comes at the switch.
+- **A v3 program reports its cards' outputs** (`RuntimeV3._report_outputs`, functions.yaml 1.11.2
+  `variables.outputs`): after every load and whenever a level changes, `{sourceKey: level}` per card — a valve by
+  `valve.open` — through `CloudSink.outputs` and the same budgeted HTTPS queue as a v1 card snapshot (no MQTT copy).
+  Found while checking what the Pi relies on: a v3 program reported nothing, so the card's `state.variables.relay` —
+  which the app's live layout reads before `state.power` — would have frozen at its last v1 value. A v1 snapshot is
+  posted exactly as before (no `outputs` key).
+- **A port test of a plain output goes through the v3 program**, as on v1 (`ProgramHost.port_for_line` →
+  `RuntimeV3.plain_output_on_line`): found on the Pi's Light, whose DO1 test v3 refused as busy. A motor's line (its
+  guard supervises it) and a valve's coils (its driver's) stay busy.
+- A line the v1 program left on that the v3 program uses as a latching valve's coil is not known off: written off
+  with the first pass's switch-offs, before any pulse ("never both coils at once", as in a v3 swap).
+- Tests: `tests/test_v3_language_switch.py` (13) — the Pi's Light on across the migration and back with nothing
+  written, its off state reported, its port test; a pump running and a valve open carried across and back; the switch
+  held through a v1 run and the schedule not run twice; a held switch replaced by a rollback; a line let go of; a
+  latching coil written off before any pulse; a bad bundle keeping v1; a runtime thread switching after its pass; the
+  outputs on the wire. Each was shown to fail without its part (the carry in either runtime, the wait, the
+  no-safe-state stop, the coil).
 
 **The pass (§7.5):** inputs → the built-ins (power sense, E-stop latch, valve drivers, motor guards), then the
 commands and which blocks hold → each layout's active instruction part → the rule slots → outputs written once,

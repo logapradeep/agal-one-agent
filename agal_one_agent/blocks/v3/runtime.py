@@ -33,11 +33,11 @@ import os
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from .. import expr as E
 from ..clock import Clock, SystemClock
-from ..io import IOAdapter, PortRef, SimulatedIO, physical_port
+from ..io import IOAdapter, PortRef, SimulatedIO, physical_port, same_output_line
 from ..runtime import CompileError, EventSink, _coerce, _signature
 from ..sun import sun_event_local
 from . import program as P
@@ -218,6 +218,12 @@ class RuntimeV3:
         self._events_now: list[tuple[str, dict]] = []
         self._alert_last: dict[tuple[str, str], float] = {}
         self._persist_failing = False
+        # The outputs reported per card (variables.outputs, functions.yaml 1.11.2) and "report every card at the
+        # next pass" (after a load).
+        self._outputs_reported: dict[str, dict] = {}
+        self._report_all = True
+        # Called after every pass of this runtime's own loop (a ProgramHost holding a switch of language).
+        self.after_pass: Optional[Callable[[], None]] = None
         if listen:
             self.io.set_change_listener(self._on_input_change)
 
@@ -270,6 +276,7 @@ class RuntimeV3:
             self._cold = False
             self._applied_pending = True
             self._persist_due = True
+            self._report_all = True
             self._commit_offs()
         logger.info("program v%d (language 3) compiled%s: %d cards, %d rule slots, %d instruction parts",
                     prog.version, " (took over from the running program)" if warm else "", len(prog.cards),
@@ -749,6 +756,14 @@ class RuntimeV3:
                 self.step()
             except Exception as e:  # noqa: BLE001
                 logger.error("runtime pass failed: %s", e, exc_info=True)
+            hook = self.after_pass
+            if hook is not None and self._running:
+                try:
+                    hook()
+                except Exception as e:  # noqa: BLE001
+                    logger.error("after the pass: %s", e, exc_info=True)
+            if not self._running:
+                break
             self._wake.wait(self.tick_seconds)
             self._wake.clear()
 
@@ -838,6 +853,7 @@ class RuntimeV3:
             self._vetoes(now)
             # 5. the outputs
             self._flush(now, wall)
+            self._report_outputs()
             self._announce(before, now, wall)
             for t, pl, src in self._pass_events:
                 self.sink.event(t, pl, source=src)
@@ -2206,6 +2222,203 @@ class RuntimeV3:
                     out.append(f"{name} ({o.source_key})")
             out.extend(f"the run of schedule {r.sid} on {r.layout}" for r in st.runs.values() if r.state == "running")
             return out
+
+    # ------------------------------------------- what the cloud is told of the cards (v1.15.1)
+
+    def card_outputs(self) -> dict[str, dict]:
+        """Each card's outputs as the node drives them (functions.yaml 1.11.2 `variables.outputs`): a motor's guarded
+        output and every plain output by sourceKey, at the level last written; a valve by its logical ``valve.open``
+        (a continuous one from its coil, a latching one from its recorded position). An output never written, and a
+        valve whose position is not known, is left out."""
+        p = self.prog
+        out: dict[str, dict] = {}
+        if p is None:
+            return out
+        for key in p.output_order:
+            o = p.outputs[key]
+            if o.kind == "valve":
+                drv = o.valve
+                if drv is None:
+                    continue
+                if drv.latching:
+                    if drv.fault or drv.position not in ("open", "closed"):
+                        continue
+                    val = drv.position == "open"
+                else:
+                    if drv.coil_written is None:
+                        continue
+                    val = drv.coil_written == drv.coil_level(True)
+                out.setdefault(o.asset_id, {})[P.VALVE_OPEN] = bool(val)
+                continue
+            if o.written is None:
+                continue
+            out.setdefault(o.asset_id, {})[o.source_key] = o.written
+        return out
+
+    def _report_outputs(self) -> None:
+        """After the pass's writes: every card whose outputs changed (every card after a load) is reported — a v3
+        program has no variables, and the apps read a card's state from this (state.power)."""
+        report = getattr(self.sink, "outputs", None)
+        if report is None:
+            return
+        for aid, levels in self.card_outputs().items():
+            if not self._report_all and self._outputs_reported.get(aid) == levels:
+                continue
+            self._outputs_reported[aid] = dict(levels)
+            try:
+                report(aid, dict(levels))
+            except Exception as e:  # noqa: BLE001 — telling the cloud never stops a pass
+                logger.debug("outputs report %s: %s", aid, e)
+        self._report_all = False
+
+    # ---------------------------------------- changing language (contracts v1.15.1)
+
+    def driven_levels(self) -> dict[tuple[str, str], dict]:
+        """(assetId, sourceKey) → {"value", "port"} of every output line this program has written — a continuous
+        valve by its coil — what a program of the other language takes over at that level (programs/README.md
+        §7.5a). A latching valve's coils are not: the language-1 program drives no latching valve."""
+        with self._lock:
+            p = self.prog
+            out: dict[tuple[str, str], dict] = {}
+            if p is None:
+                return out
+            for key in p.output_order:
+                o = p.outputs[key]
+                if o.kind == "valve":
+                    drv = o.valve
+                    if drv is not None and not drv.latching and drv.coil_written is not None:
+                        out[(o.asset_id, drv.open_key)] = {"value": bool(drv.coil_written), "port": drv.open_port}
+                    continue
+                if o.port is not None and o.written is not None:
+                    out[key] = {"value": o.written, "port": o.port}
+            return out
+
+    def output_lines(self) -> set:
+        """The physical lines this program drives as outputs (its cards' output ports, valve coils included)."""
+        with self._lock:
+            p = self.prog
+            if p is None:
+                return set()
+            return {physical_port(ref.transport) for aid in p.card_order for ref in p.cards[aid].ports.values()
+                    if P.is_output_port(ref.transport)}
+
+    def schedule_days(self) -> dict[str, str]:
+        """schedule id → "ran" | "missed" on the node's date today (by schedule id, whatever the layout)."""
+        with self._lock:
+            p = self.prog
+            if p is None:
+                return {}
+            today = self.st.date or self.clock.now(p.tz).date().isoformat()
+            out: dict[str, str] = {}
+            for key, ss in self.st.sched.items():
+                sid = key.rpartition("/")[2]
+                if ss.get("lastRunDate") == today:
+                    out[sid] = "ran"
+                elif ss.get("missedDate") == today:
+                    out.setdefault(sid, "missed")
+            return out
+
+    def busy_reason(self) -> Optional[str]:
+        """Why this program cannot hand over to the other language at the end of this pass, or None — a node changes
+        language only between runs (programs/README.md §7.5a)."""
+        with self._lock:
+            st = self.st
+            if self.prog is None:
+                return None
+            if st.runs:
+                r = sorted(st.runs.values(), key=lambda x: x.key)[0]
+                return f"the run of schedule {r.sid} on {r.layout} is {'in progress' if r.state == 'running' else 'interrupted'}"
+            if st.orphans:
+                return "the end of a run is still due"
+            if st.releases or st.now_releases:
+                return "an output is kept to the end of the run that set it"
+            if st.paused:
+                return "automation is paused"
+            if st.power_wait is not None:
+                return "it waits for the power to come back"
+            if self._pending_commands:
+                return "a command waits for the next pass"
+            return None
+
+    def plain_output_on_line(self, label, line) -> Optional[tuple[str, str]]:
+        """(assetId, sourceKey) of the plain output on this chip line — a port test pulses it through the program,
+        as on language 1. A motor's line (its guard supervises it) and a valve's coils are never handed out."""
+        if label is None or line is None:
+            return None
+        with self._lock:
+            p = self.prog
+            if p is None:
+                return None
+            for key in p.output_order:
+                o = p.outputs[key]
+                if o.kind != "plain" or o.port is None:
+                    continue
+                t = o.port.transport
+                if t.get("chip") == label and t.get("line") is not None and int(t["line"]) == int(line):
+                    return key
+            return None
+
+    def take_over_language(self, bundle: dict, carried: dict[tuple[str, str], dict], days: dict[str, str]) -> None:
+        """Load a language-3 bundle in place of the language-1 program that ran (the migration; programs/README.md
+        §7.5a): cold — the built-ins from the node's persisted v3 state, the start recorded as not clean — but NOT a
+        boot, with no run carried (the switch happens between runs), and every output the two programs share — the
+        same card and port on the same line driven the same way; a continuous valve's ``valve.open`` from its v1
+        coil — at the level the old program left: nothing is written for it at the first pass. A schedule id that ran
+        (or was missed) today on the old program has done so here."""
+        self.compile(bundle)
+        with self._lock:
+            p, st = self.prog, self.st
+            now, wall = self.clock.monotonic(), self.clock.now(p.tz)
+            st.runs.clear()
+            st.orphans, st.releases, st.now_releases = [], [], []
+            st.power_wait, st.resume_at, st.resuming = None, None, None
+            kept = 0
+            by_line = {physical_port(c["port"].transport): c for c in carried.values()}
+            for key in p.output_order:
+                o = p.outputs[key]
+                if o.kind == "valve":
+                    drv = o.valve
+                    if drv is not None and drv.latching:
+                        # Never both coils at once: a coil on a line the old program left driven is not known off — it is
+                        # written off with the first pass's switch-offs, before any pulse (as in a swap, §7.5).
+                        for k, port in drv.coils():
+                            c = by_line.get(physical_port(port.transport))
+                            if c is not None:
+                                drv.coil_state[k] = False if c["value"] is False or c["value"] == 0 else True
+                        continue
+                    if drv is None:
+                        continue
+                    c = carried.get((o.asset_id, drv.open_key))
+                    if c is None or not same_output_line(c["port"].transport, drv.open_port.transport):
+                        continue
+                    coil = bool(c["value"])
+                    drv.coil_written = coil
+                    o.level, o.changed_at = coil == drv.coil_level(True), now
+                    kept += 1
+                    continue
+                if o.port is None:
+                    continue
+                c = carried.get(key)
+                if c is None or not same_output_line(c["port"].transport, o.port.transport):
+                    continue
+                v = _coerce(o.type, c["value"])
+                o.level, o.written, o.changed_at = v, v, now
+                if o.guard is not None and is_on(v):
+                    o.guard.started(now)  # a motor carried on: its inrush window starts at the switch (§7.11)
+                kept += 1
+            today = st.date or wall.date().isoformat()
+            for part in p.parts:
+                for sid, sd in part.schedules.items():
+                    d = days.get(sid)
+                    if d == "ran":
+                        st.sched[f"{part.layout}/{sid}"] = {"lastRunDate": today, "lastRunStart": _start_spec(sd)}
+                    elif d == "missed":
+                        st.sched.setdefault(f"{part.layout}/{sid}", {})["missedDate"] = today
+            self._booted = True  # not a boot: no `boot` event, no restart resume
+            self._persist_due = True
+            self._report_all = True
+        logger.info("program v%d (language 3) took over from the language-1 program: %d outputs kept at their level",
+                    p.version, kept)
 
     def level(self, asset_id: str, key: str):
         with self._lock:

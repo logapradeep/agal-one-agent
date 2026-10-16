@@ -140,10 +140,12 @@ class HttpReporter:
         return self._post({"type": "port_health", "payload": {
             "nodeUid": self.node_uid, "ports": ports, "devices": devices or []}})
 
-    def report_variables(self, asset_id: str, values: dict) -> bool:
-        return self._post({"type": "variables", "payload": {
-            "nodeUid": self.node_uid, "assetId": asset_id, "values": values,
-            "ts": int(time.time() * 1000)}})
+    def report_variables(self, asset_id: str, values: dict, outputs: Optional[dict] = None) -> bool:
+        payload = {"nodeUid": self.node_uid, "assetId": asset_id, "values": values, "ts": int(time.time() * 1000)}
+        if outputs:
+            # Contracts v1.15.1 (functions.yaml 1.11.2): a v3 program's card outputs, {sourceKey: level}.
+            payload["outputs"] = outputs
+        return self._post({"type": "variables", "payload": payload})
 
     def report_alert(self, text: str, severity: str, rule_id: Optional[str] = None,
                      asset_id: Optional[str] = None) -> bool:

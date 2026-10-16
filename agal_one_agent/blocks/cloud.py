@@ -46,6 +46,8 @@ class _VariableUploader:
         self._tokens = float(self.BURST)
         self._tokens_at = time.monotonic()
         self._pending: dict[str, dict] = {}
+        # Contracts v1.15.1: a v3 program's card outputs (variables.outputs), coalesced like the values.
+        self._pending_outputs: dict[str, dict] = {}
         self._last_sent: dict[str, float] = {}
         self._lock = threading.Lock()
         self._wake = threading.Event()
@@ -56,11 +58,15 @@ class _VariableUploader:
         self.posted = 0
         self.failed = 0
 
-    def submit(self, asset_id: str, values: dict) -> None:
+    def submit(self, asset_id: str, values: dict, outputs: Optional[dict] = None) -> None:
         with self._lock:
             merged = dict(self._pending.pop(asset_id, {}))
             merged.update(values)
             self._pending[asset_id] = merged
+            if outputs:
+                outs = dict(self._pending_outputs.get(asset_id, {}))
+                outs.update(outputs)
+                self._pending_outputs[asset_id] = outs
             self._idle.clear()
             if self._thread is None:
                 self._thread = threading.Thread(target=self._loop, name="variables-upload", daemon=True)
@@ -99,6 +105,16 @@ class _VariableUploader:
                 self._idle.set()
             return None, None, wait
 
+    def _requeue(self, aid: str, values: dict, outputs: Optional[dict], first: bool) -> None:
+        """Put a snapshot back (newer values, if any, win over it), at the front when `first`. Lock held."""
+        merged = dict(values)
+        merged.update(self._pending.pop(aid, {}))
+        self._pending = {aid: merged, **self._pending} if first else {**self._pending, aid: merged}
+        if outputs:
+            outs = dict(outputs)
+            outs.update(self._pending_outputs.get(aid, {}))
+            self._pending_outputs[aid] = outs
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             self._wake.wait(timeout=self.settle)
@@ -111,17 +127,20 @@ class _VariableUploader:
                         time.sleep(wait)
                         continue
                     break
+                with self._lock:
+                    outputs = self._pending_outputs.pop(aid, None)
                 token_wait = self._take_token()
                 if token_wait > 0:
                     with self._lock:  # put it back, wait for the budget
-                        merged = dict(values)
-                        merged.update(self._pending.pop(aid, {}))
-                        self._pending = {aid: merged, **self._pending}
+                        self._requeue(aid, values, outputs, first=True)
                     time.sleep(min(token_wait, 30.0))
                     continue
                 ok = False
                 try:
-                    ok = bool(self.http.report_variables(aid, values))
+                    # A v3 program's card outputs ride as `outputs` (functions.yaml 1.11.2); a v1 snapshot is posted
+                    # exactly as before.
+                    ok = bool(self.http.report_variables(aid, values, outputs=outputs) if outputs
+                              else self.http.report_variables(aid, values))
                 except Exception as e:  # noqa: BLE001
                     logger.debug("variables http: %s", e)
                 self._last_sent[aid] = time.monotonic()
@@ -132,10 +151,7 @@ class _VariableUploader:
                     rate_limited = getattr(self.http, "last_status", None) == 429
                     with self._lock:
                         # newer values (if any) win over the failed snapshot
-                        merged = dict(values)
-                        merged.update(self._pending.pop(aid, {}))
-                        self._pending[aid] = merged
-                        self._pending = {aid: self._pending.pop(aid), **self._pending}
+                        self._requeue(aid, values, outputs, first=True)
                         self._idle.clear()
                     if rate_limited:
                         logger.warning("ingress rate-limited (429): card snapshots paused for %.0f s", self.RATE_LIMITED_BACKOFF)
@@ -170,6 +186,17 @@ class CloudSink(EventSink):
             self.http.report_variables(asset_id, values)
         except Exception as e:  # noqa: BLE001
             logger.debug("variables http: %s", e)
+
+    def outputs(self, asset_id: str, levels: dict[str, Any]) -> None:
+        """A v3 program's card outputs (contracts v1.15.1, functions.yaml 1.11.2 `variables.outputs`): over HTTPS
+        through the same budgeted queue as a v1 card snapshot (no MQTT copy: nothing reads it)."""
+        if self.uploader is not None:
+            self.uploader.submit(asset_id, {}, outputs=levels)
+            return
+        try:
+            self.http.report_variables(asset_id, {}, outputs=levels)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("outputs http: %s", e)
 
     def flush(self, timeout: float = 5.0) -> bool:
         return self.uploader.flush(timeout) if self.uploader is not None else True

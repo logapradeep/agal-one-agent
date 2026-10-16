@@ -77,6 +77,15 @@ def physical_port(transport: dict) -> tuple:
     return port_identity(t)
 
 
+def same_output_line(a: dict, b: dict) -> bool:
+    """Two output transports drive the same line the same way: one physical port, the same ``activeLow`` and the
+    same kind (a level and a PWM duty are not one level). A program of the other language takes an output over at
+    its level only on such a line (contracts v1.15.1, programs/README.md §7.5a)."""
+    a, b = a or {}, b or {}
+    return (physical_port(a) == physical_port(b) and bool(a.get("activeLow")) == bool(b.get("activeLow"))
+            and str(a.get("kind", "gpio")) == str(b.get("kind", "gpio")))
+
+
 def describe_port(transport: dict) -> str:
     """A port in words, for a refusal: ``line 17 of pinctrl-bcm2835``, ``GPIO 17``, ``i2c bus 1 …``."""
     p = physical_port(transport)

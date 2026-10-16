@@ -438,8 +438,9 @@ def main():
 
     # Command handler
     def _runtime_port(label, line):
-        """(assetId, sourceKey) of the v1 program variable that drives this chip line, if any (a port
-        test pulses it through the runtime). A v3 program never hands a line to a port test."""
+        """(assetId, sourceKey) of the program output that drives this chip line, if any (a port test
+        pulses it through the runtime): a v1 program variable; on a v3 program a plain output only — a
+        motor's line and a valve's coils are never handed to a test (contracts v1.15.1)."""
         if runtime is None or not runtime.loaded:
             return None
         return runtime.port_for_line(label, line)

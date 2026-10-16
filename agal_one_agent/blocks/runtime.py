@@ -28,7 +28,7 @@ from typing import Any, Callable, Optional
 
 from . import expr as E
 from .clock import Clock, SystemClock
-from .io import IOAdapter, PortRef, SimulatedIO, describe_port, physical_port
+from .io import IOAdapter, PortRef, SimulatedIO, describe_port, physical_port, same_output_line
 from .sun import sun_event_local
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,9 @@ class EventSink:
     def log(self, text: str, asset_id: Optional[str] = None) -> None: ...
     def reading(self, asset_id: str, source_key: str, value: Any, kind_uri: Optional[str], unit: Optional[str]) -> None: ...
     def program_ack(self, version: int, status: str, reason: Optional[str] = None) -> None: ...
+    # Contracts v1.15.1 (functions.yaml 1.11.2 `variables.outputs`): a language-3 program has no variables to
+    # report, so it reports each card's outputs. A language-1 program never calls this.
+    def outputs(self, asset_id: str, levels: dict[str, Any]) -> None: ...
 
 
 class RecordingSink(EventSink):
@@ -70,6 +73,7 @@ class RecordingSink(EventSink):
         self.readings: list[dict] = []
         self.acks: list[dict] = []
         self.sources: list[str] = []  # the event source of each entry of `events` (program, node)
+        self.outputs_log: list[tuple[str, dict]] = []
 
     def variables(self, asset_id, values):
         self.variables_log.append((asset_id, dict(values)))
@@ -89,6 +93,9 @@ class RecordingSink(EventSink):
 
     def program_ack(self, version, status, reason=None):
         self.acks.append({"version": version, "status": status, "reason": reason})
+
+    def outputs(self, asset_id, levels):
+        self.outputs_log.append((asset_id, dict(levels)))
 
 
 # ============================================================ compiled model
@@ -257,6 +264,9 @@ class BlockRuntime:
         # run when the schedule would have ended, through the mapping they were written against.
         self._orphan_ends: list[dict] = []
         self._pending_resumes: list[tuple[str, float]] = []
+        # Called after every pass of this runtime's own loop (a ProgramHost holding a switch of language waits
+        # for the end of a pass with no run in progress — contracts v1.15.1, programs/README.md §7.5a). None: nothing.
+        self.after_pass: Optional[Callable[[], None]] = None
         if listen:
             self.io.set_change_listener(self._on_input_change)
 
@@ -875,6 +885,14 @@ class BlockRuntime:
                 self.step()
             except Exception as e:  # noqa: BLE001
                 logger.error("runtime pass failed: %s", e, exc_info=True)
+            hook = self.after_pass
+            if hook is not None and self._running:
+                try:
+                    hook()
+                except Exception as e:  # noqa: BLE001
+                    logger.error("after the pass: %s", e, exc_info=True)
+            if not self._running:
+                break
             self._wake.wait(self.tick_seconds)
             self._wake.clear()
 
@@ -1698,6 +1716,94 @@ class BlockRuntime:
                     s.active_end_wall = None
                     s.active_started_at = None
         self._persist_due = True
+
+    # ---------------------------------------- changing language (contracts v1.15.1)
+
+    def driven_levels(self) -> dict[tuple[str, str], dict]:
+        """(assetId, sourceKey) → {"value", "port"} of every output this program has written: what a program of the
+        other language takes over, at that level, when the node changes language (programs/README.md §7.5a)."""
+        with self._lock:
+            out: dict[tuple[str, str], dict] = {}
+            for aid in self.aab_order:
+                for v in self.aabs[aid].vars.values():
+                    if v.port is None or v.port.transport.get("direction") != "out":
+                        continue
+                    key = (aid, v.port.source_key)
+                    if key in self._last_written:
+                        out[key] = {"value": self._last_written[key], "port": v.port}
+            return out
+
+    def output_lines(self) -> set:
+        """The physical lines this program drives as outputs."""
+        with self._lock:
+            return {physical_port(v.port.transport) for b in self.aabs.values() for v in b.vars.values()
+                    if v.port is not None and v.port.transport.get("direction") == "out"}
+
+    def schedule_days(self) -> dict[str, str]:
+        """schedule id → "ran" | "missed" on the node's date today: a program of the other language does not run (or
+        report missed) the same schedule id again today."""
+        with self._lock:
+            today = self.clock.now(self.tz).date().isoformat()
+            out: dict[str, str] = {}
+            for s in (self.nab.schedules if self.nab else []):
+                if s.last_run_date == today:
+                    out[s.id] = "ran"
+                elif s.missed_date == today:
+                    out[s.id] = "missed"
+            return out
+
+    def busy_reason(self) -> Optional[str]:
+        """Why this program cannot hand over to the other language at the end of this pass, or None. A node changes
+        language only between runs (programs/README.md §7.5a)."""
+        with self._lock:
+            if self.nab is None:
+                return None
+            if self._active_runs:
+                return f"the run of plot {sorted(self._active_runs)[0]} is in progress"
+            for s in self.nab.schedules:
+                if s.active_end_mono is not None:
+                    return f"schedule {s.id} is running"
+            if self._orphan_ends or self._pending_resumes:
+                return "the end of a run is still due"
+            if self._pending_releases:
+                return "an output a reload let go of is not switched off yet"
+            if self._pending_commands:
+                return "a command waits for the next pass"
+            return None
+
+    def take_over_language(self, bundle: dict, carried: dict[tuple[str, str], dict], days: dict[str, str]) -> None:
+        """Load a language-1 bundle in place of the language-3 program that ran (a rollback; programs/README.md
+        §7.5a): cold, as after a restart, but NOT a boot, and every output the two programs share — the same card and
+        port, on the same line driven the same way — keeps the level the old program left: nothing is written for
+        it at the first pass. A schedule id that ran (or was missed) today on the old program has done so here."""
+        self.compile(bundle)
+        with self._lock:
+            now = self.clock.monotonic()
+            today = self.clock.now(self.tz).date().isoformat()
+            kept = 0
+            for aid in self.aab_order:
+                blk = self.aabs[aid]
+                for v in blk.vars.values():
+                    if v.port is None or v.port.transport.get("direction") != "out":
+                        continue
+                    c = carried.get((aid, v.port.source_key))
+                    if c is None or not same_output_line(c["port"].transport, v.port.transport):
+                        continue
+                    val = _coerce(v.type, c["value"])
+                    v.value, v.last_change = val, now
+                    self._last_written[(aid, v.port.source_key)] = val
+                    blk.dirty.add(v.name)
+                    kept += 1
+            for s in (self.nab.schedules if self.nab else []):
+                d = days.get(s.id)
+                if d == "ran":
+                    s.last_run_date = today
+                elif d == "missed":
+                    s.missed_date = today
+            self._booted = True  # not a boot: the `on boot` rules are for a restart
+            self._persist_due = True
+        logger.info("program v%d (language 1) took over from the language-3 program: %d outputs kept at their level",
+                    self.version, kept)
 
     # ------------------------------------------------------------ inspection
 
