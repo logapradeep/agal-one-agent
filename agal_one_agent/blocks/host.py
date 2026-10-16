@@ -323,7 +323,13 @@ class ProgramHost:
         lock, so it comes after the let-go of what it does not drive and after the store."""
         lang = bundle_language(bundle)
         target = self.v3 if lang == 3 else self.v1
-        old.stop(safe_state=False)  # every output stays as the old program left it; joins its threads (3 s each)
+        if old is self.v3:
+            # Every output stays as the old program left it; joins its threads (3 s each). Its clean-stop record is
+            # handed to the state file's writer without waiting for the fsync (README §4.8, the second 0.4.0 review):
+            # it is read only at a later v3 load, which waits for it — so the node is one fsync less with no runtime.
+            old.stop(safe_state=False, wait_record=False)
+        else:
+            old.stop(safe_state=False)  # every output stays as the old program left it; joins its threads (3 s each)
         self._join_old(old)
         with self._lock:
             start = was_running and self._stops == stops  # a stop that came meanwhile: load, but start nothing

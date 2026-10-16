@@ -16,6 +16,7 @@ import math
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -33,11 +34,21 @@ class Clock:
         return True
 
 
+PROBE_THREAD = "clock-probe"
+
+
 class SystemClock(Clock):
     """Real clocks. ``clock_ok`` is probed at most every ``probe_interval`` seconds — and on its
     first call (agent 0.3.4 review: the last probe started at 0.0 on the monotonic clock, which on
     Linux counts from boot, so for the first minute after boot it answered "trusted" unprobed —
-    the minute right after a power cut, when the clock is most likely wrong)."""
+    the minute right after a power cut, when the clock is most likely wrong).
+
+    Only the first probe runs on the caller's thread — main.py makes that call at start-up, before
+    the runtime or MQTT run. Every later one runs on a ``clock-probe`` thread of its own while the
+    callers get the last answer (the second agent 0.4.0 review, programs/README.md §4.8): a probe is
+    a ``timedatectl`` process and a D-Bus round trip (timeout 3 s), and the runtimes ask under their
+    lock on every pass — once a minute a pass, and the E-stop latch, the motor guards and every
+    command with it, waited for it."""
 
     def __init__(self, probe_interval: float = 60.0, assume_ok: Optional[bool] = None):
         self._probe_interval = probe_interval
@@ -46,6 +57,8 @@ class SystemClock(Clock):
         # probe interval ago, and nothing is trusted before a probe has said so.
         self._last_probe = -math.inf
         self._ok = False
+        self._probing = False
+        self._guard = threading.Lock()
 
     def monotonic(self) -> float:
         return time.monotonic()
@@ -60,11 +73,28 @@ class SystemClock(Clock):
         if self._assume_ok is not None:
             return self._assume_ok
         now = time.monotonic()
-        if now - self._last_probe < self._probe_interval:
+        with self._guard:
+            if self._probing or now - self._last_probe < self._probe_interval:
+                return self._ok
+            first = self._last_probe == -math.inf
+            self._last_probe = now
+            self._probing = not first
+        if first:
+            self._ok = _probe_clock()  # the first answer is a probe's, on this thread (start-up)
             return self._ok
-        self._last_probe = now
-        self._ok = _probe_clock()
+        try:
+            threading.Thread(target=self._probe, name=PROBE_THREAD, daemon=True).start()
+        except RuntimeError:  # no thread can be had: the last answer stands, asked again a probe interval later
+            with self._guard:
+                self._probing = False
         return self._ok
+
+    def _probe(self) -> None:
+        try:
+            self._ok = _probe_clock()
+        finally:
+            with self._guard:
+                self._probing = False
 
 
 def _probe_clock() -> bool:

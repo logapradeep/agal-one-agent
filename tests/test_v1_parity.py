@@ -194,6 +194,13 @@ def test_the_light_session_ran_every_command_type_and_the_gate(drives):
     assert ota == [["Light (device.power)"], []], ota
     writes = [r["level"] for r in recs if r["kind"] == "gpio" and r.get("op") == "write" and r["line"] == 17]
     assert True in writes and False in writes  # active low: the light switched on (LOW) and off (HIGH)
+    # The NAB's alert (the second 0.4.0 review: the alert path moved into the outbox had no 0.3.4 comparison): raised
+    # when the light first came on in each boot, posted over HTTPS and copied on the status topic — so the streams
+    # `https telemetryIngress alert` and `mqtt …/status alert` exist and are compared above.
+    alerts = [r["body"]["payload"] for r in recs if r["kind"] == "https" and (r.get("body") or {}).get("type") == "alert"]
+    assert [(a["text"], a["severity"], a.get("ruleId")) for a in alerts] == [("The light is on", "info", "light_on")] * 2, alerts
+    copies = [r for r in recs if r["kind"] == "mqtt" and isinstance(r.get("body"), dict) and r["body"].get("type") == "alert"]
+    assert len(copies) == 2, copies
 
 
 # ------------------------------------------------------------------ the wave-1 commands behind the gate

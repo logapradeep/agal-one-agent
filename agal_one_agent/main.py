@@ -170,6 +170,9 @@ def main():
     from .blocks.clock import SystemClock
     from .blocks.sync import DEFAULT_STATE_DIR
     agent_clock = SystemClock()
+    # Its first probe, here at start-up before MQTT connects: every later one runs on a thread of its own
+    # (blocks/clock.py; the second agent 0.4.0 review — a pass never waits on a clock probe, README §4.8).
+    agent_clock.clock_ok()
     command_gate = wire_command_gate(mqtt_client, http_reporter, token=config.node.auth_token,
                                      state_dir=config.blocks.state_dir or DEFAULT_STATE_DIR,
                                      offline=args.offline, clock_ok=agent_clock.clock_ok,
@@ -387,10 +390,12 @@ def main():
             logger.warning("blocks.simulated_io is ON — ports are simulated; this must never run on a farm node")
         else:
             block_io = build_hardware_io(config, sensors_by_key(config), lines=line_io, analog=analog_io)
+        host_clock = SystemClock()
+        host_clock.clock_ok()  # its first probe here, before the persisted program loads (blocks/clock.py)
         runtime = ProgramHost(
             block_io,
             cloud_sink,
-            clock=SystemClock(),
+            clock=host_clock,
             state_dir=state_dir,
             tick_seconds=config.blocks.tick_seconds,
             node_uid=config.node.uid,

@@ -56,6 +56,7 @@ PAUSE_MAX_SECONDS = 7 * 86400      # functions.yaml pauseAutomation `until`: at 
 LATCH_KEPT = ("refused: the E-stop is latched at the panel — a program without it is not taken while it is latched; "
               "it clears only at the panel")
 UNREADABLE = "__unreadable__"
+STATE_WRITER_THREAD = "v3-state-writer"
 
 
 def _iso(dt: Optional[datetime]) -> Optional[str]:
@@ -710,7 +711,10 @@ class RuntimeV3:
             self._sampler = threading.Thread(target=self._sample_loop, name="blocks-v3-sampler", daemon=True)
             self._sampler.start()
 
-    def stop(self, safe_state: bool = True) -> None:
+    def stop(self, safe_state: bool = True, wait_record: bool = True) -> None:
+        """``wait_record=False`` (the host's switch of language only): the clean-stop record is handed to the state
+        file's writer without waiting for it — it is read only at a later v3 load, which waits for every record
+        handed over before it (``_read_state``)."""
         # Contracts v1.15.2: only the threads this runtime started BEFORE this stop are joined — read with the flag,
         # under the lock — never one a start made meanwhile (a stop that joined that one waited out its timeout and
         # left two runtimes running).
@@ -724,7 +728,7 @@ class RuntimeV3:
         with self._lock:
             if safe_state:
                 self.apply_safe_state()
-            self._persist(clean=True)
+            self._persist(clean=True, wait=wait_record)
             self._cold = True
             self._booted = False
 
@@ -866,7 +870,12 @@ class RuntimeV3:
             self._pass_events = []
             st.resuming = None
             if self._persist_due or (st.runs and (self._last_persist is None or now - self._last_persist >= KEEPALIVE_PERSIST_SECONDS)):
-                self._persist()
+                # README §4.8 (the second 0.4.0 review): on the runtime's own thread the record is handed to the state
+                # file's writer and the pass goes on — no fsync under the lock, so the sampler, a command, the E-stop
+                # latch and the motor guards never wait for the SD card. Nothing this pass does next depends on the
+                # record being on disk; the acts that do (a latching pulse, a valve reset, a cold start, a clean stop)
+                # wait for theirs. step() from a test or the simulator waits, as before.
+                self._persist(wait=threading.current_thread() is not self._thread)
 
     # ----------------------------------------------------------------- inputs
 
@@ -2504,6 +2513,8 @@ class RuntimeV3:
         """The persisted state; None when there is none (a first start); ``{UNREADABLE: True}`` when it cannot
         be read — the node then starts as after an unclean stop, with the E-stop taken as latched."""
         p = self._state_path()
+        if p:
+            _StateWriter.flush_path(p)  # every record handed over before this read is on disk first
         if not p or not os.path.exists(p):
             return None
         try:
@@ -2516,9 +2527,14 @@ class RuntimeV3:
             logger.error("%s unreadable (%s): the node starts as after an unclean stop, the E-stop latched", p, e)
             return {UNREADABLE: True}
 
-    def _persist(self, clean: bool = False, prog: Optional[Program] = None, st: Optional[_State] = None) -> bool:
-        """Write the state (atomically: a temporary file, then a rename). True when it is on disk — the callers
-        that must not act on what they cannot record (a latching pulse, the start) check it."""
+    def _persist(self, clean: bool = False, prog: Optional[Program] = None, st: Optional[_State] = None,
+                 wait: bool = True) -> bool:
+        """Record the state (atomically: a temporary file, then a rename), through the state file's writer (README
+        §4.8): the record is built here, under the lock; the write, its fsync and the rename happen on the writer's
+        thread. ``wait=True`` (the default): returns once it is on disk — True when it is; the callers that must not
+        act on what they cannot record (a latching pulse, a valve reset, the start) check it. ``wait=False`` (the end
+        of a pass on the runtime's own thread, a switch's clean stop): hands it over and returns True; a failure is
+        logged by the writer, and the next record that must be on disk says so to its caller."""
         self._persist_due = False
         path = self._state_path()
         p, st = prog or self.prog, st or self.st
@@ -2536,25 +2552,119 @@ class RuntimeV3:
                "runs": {k: r.to_state() for k, r in st.runs.items()},
                "automation": dict(st.automation, manualOn=list(st.manual_on)) if st.paused else {"state": "running"}}
         try:
-            os.makedirs(self.state_dir, exist_ok=True)
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(doc, f, default=str)
-                f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except OSError:
-                    pass
-            os.replace(tmp, path)
+            text = json.dumps(doc, default=str)
         except Exception as e:  # noqa: BLE001
-            if not self._persist_failing:
-                logger.error("v3 state persist failed: %s — no latching valve is pulsed until it can be written", e)
-            self._persist_failing = True
+            self._persisted(e)
             return False
+        return _StateWriter.for_path(path).submit(text, self._persisted, wait)
+
+    def _persisted(self, error: Optional[Exception]) -> None:
+        """What became of a record, said once per change (on the writer's thread — never takes the runtime lock: a
+        caller holding it may be waiting for this very record)."""
+        if error is not None:
+            if not self._persist_failing:
+                logger.error("v3 state persist failed: %s — no latching valve is pulsed until it can be written", error)
+            self._persist_failing = True
+            return
         if self._persist_failing:
             logger.warning("v3 state written again")
         self._persist_failing = False
-        return True
+
+
+class _StateWriter:
+    """The one writer of a v3 state file (README §4.8, the second agent 0.4.0 review: a pass never waits on the disk).
+
+    One per file path, for the whole process — a runtime made again on the same state directory (a restart in the
+    tests, the host's two loads) shares it, so a record never lands after a newer one. A record handed over replaces
+    one not yet picked up (the newer holds its facts too); one thread writes them in turn — temporary file, fsync,
+    rename — and ends when there is nothing left. ``submit(wait=True)`` returns once a record at least as new is on
+    disk (True when one was written); :meth:`flush` waits for every record handed over before it (a read of the file).
+    """
+
+    _by_path: dict[str, "_StateWriter"] = {}
+    _registry = threading.Lock()
+
+    @classmethod
+    def for_path(cls, path: str) -> "_StateWriter":
+        with cls._registry:
+            w = cls._by_path.get(path)
+            if w is None:
+                w = cls._by_path[path] = cls(path)
+            return w
+
+    @classmethod
+    def flush_path(cls, path: str) -> None:
+        with cls._registry:
+            w = cls._by_path.get(path)
+        if w is not None:
+            w.flush()
+
+    def __init__(self, path: str):
+        self.path = path
+        self._cond = threading.Condition()
+        self._next: Optional[tuple[int, str, Callable[[Optional[Exception]], None]]] = None
+        self._made = 0     # the newest record handed over
+        self._landed = 0   # the newest record written or failed
+        self._good = 0     # the newest record written
+        self._busy = False
+
+    def submit(self, text: str, on_done: Callable[[Optional[Exception]], None], wait: bool) -> bool:
+        with self._cond:
+            self._made += 1
+            seq = self._made
+            self._next = (seq, text, on_done)
+            start, self._busy = not self._busy, True
+        if start:
+            try:
+                threading.Thread(target=self._run, name=STATE_WRITER_THREAD, daemon=True).start()
+            except RuntimeError:  # no thread can be had: written here, as before
+                self._run()
+        if not wait:
+            return True
+        with self._cond:
+            self._cond.wait_for(lambda: self._landed >= seq)
+            return self._good >= seq
+
+    def flush(self) -> None:
+        with self._cond:
+            seq = self._made
+            self._cond.wait_for(lambda: self._landed >= seq)
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                item, self._next = self._next, None
+                if item is None:
+                    self._busy = False
+                    return
+            seq, text, on_done = item
+            error: Optional[Exception] = None
+            try:
+                _write_atomically(self.path, text)
+            except Exception as e:  # noqa: BLE001
+                error = e
+            try:
+                on_done(error)
+            except Exception:  # noqa: BLE001 — never stops the writer
+                pass
+            with self._cond:
+                self._landed = seq
+                if error is None:
+                    self._good = seq
+                self._cond.notify_all()
+
+
+def _write_atomically(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    os.replace(tmp, path)
 
 
 class _Refused(Exception):

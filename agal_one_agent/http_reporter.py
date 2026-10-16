@@ -97,9 +97,11 @@ class HttpReporter:
             return None
 
     def report_program_ack(self, version: int, status: str, reason: Optional[str] = None,
-                           firmware_version: Optional[str] = None) -> bool:
+                           firmware_version: Optional[str] = None, timestamp: Optional[int] = None) -> bool:
+        """``timestamp`` (ms): when the node made the ack — its pass, handed to the outbox (blocks/cloud.py);
+        now when not given."""
         payload: dict = {"nodeUid": self.node_uid, "version": int(version), "status": status,
-                         "timestamp": int(time.time() * 1000)}
+                         "timestamp": int(timestamp) if timestamp is not None else int(time.time() * 1000)}
         if reason:
             payload["reason"] = reason[:500]
         if firmware_version:
@@ -148,9 +150,10 @@ class HttpReporter:
         return self._post({"type": "variables", "payload": payload})
 
     def report_alert(self, text: str, severity: str, rule_id: Optional[str] = None,
-                     asset_id: Optional[str] = None) -> bool:
+                     asset_id: Optional[str] = None, timestamp: Optional[int] = None) -> bool:
+        """``timestamp`` (ms): when the pass raised the alert (blocks/cloud.py's outbox); now when not given."""
         payload: dict = {"nodeUid": self.node_uid, "text": text[:200], "severity": severity,
-                         "timestamp": int(time.time() * 1000)}
+                         "timestamp": int(timestamp) if timestamp is not None else int(time.time() * 1000)}
         if rule_id:
             payload["ruleId"] = rule_id
         if asset_id:

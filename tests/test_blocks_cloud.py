@@ -30,7 +30,7 @@ class FakeMqtt:
         self.calls.append(("variables", asset_id, values))
         return self.connected
 
-    def publish_alert(self, text, severity, rule_id=None, asset_id=None):
+    def publish_alert(self, text, severity, rule_id=None, asset_id=None, timestamp=None):
         self.calls.append(("alert", text, severity, rule_id, asset_id))
         return self.connected
 
@@ -40,7 +40,7 @@ class FakeMqtt:
     def publish_telemetry(self, readings):
         self.calls.append(("telemetry", readings))
 
-    def publish_program_ack(self, version, status, reason=None, firmware_version=None):
+    def publish_program_ack(self, version, status, reason=None, firmware_version=None, timestamp=None):
         self.calls.append(("programAck", version, status, reason))
         return self.connected
 
@@ -54,11 +54,11 @@ class FakeHttp:
         self.calls.append(("variables", asset_id, values))
         return True
 
-    def report_alert(self, text, severity, rule_id=None, asset_id=None):
+    def report_alert(self, text, severity, rule_id=None, asset_id=None, timestamp=None):
         self.calls.append(("alert", text, severity))
         return True
 
-    def report_program_ack(self, version, status, reason=None, firmware_version=None):
+    def report_program_ack(self, version, status, reason=None, firmware_version=None, timestamp=None):
         self.calls.append(("programAck", version, status, reason))
         return True
 

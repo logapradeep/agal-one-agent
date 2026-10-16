@@ -163,15 +163,18 @@ class _GatedHttp:
     def __init__(self):
         self.gate = threading.Event()
         self.calls: list[tuple] = []
+        self.stamps: list = []
 
-    def report_program_ack(self, version, status, reason=None, firmware_version=None):
+    def report_program_ack(self, version, status, reason=None, firmware_version=None, timestamp=None):
         self.gate.wait(10)
         self.calls.append(("programAck", version, status, reason, firmware_version))
+        self.stamps.append(timestamp)
         return True
 
-    def report_alert(self, text, severity, rule_id=None, asset_id=None):
+    def report_alert(self, text, severity, rule_id=None, asset_id=None, timestamp=None):
         self.gate.wait(10)
         self.calls.append(("alert", text, severity))
+        self.stamps.append(timestamp)
         return True
 
     def report_variables(self, asset_id, values, **kw):
@@ -181,12 +184,15 @@ class _GatedHttp:
 class _Mqtt:
     def __init__(self):
         self.calls: list[tuple] = []
+        self.stamps: list = []
 
-    def publish_program_ack(self, version, status, reason=None, firmware_version=None):
+    def publish_program_ack(self, version, status, reason=None, firmware_version=None, timestamp=None):
         self.calls.append(("programAck", version, status))
+        self.stamps.append(timestamp)
 
-    def publish_alert(self, text, severity, rule_id=None, asset_id=None):
+    def publish_alert(self, text, severity, rule_id=None, asset_id=None, timestamp=None):
         self.calls.append(("alert", text))
+        self.stamps.append(timestamp)
 
 
 def test_acks_and_alerts_leave_the_callers_thread_in_order():

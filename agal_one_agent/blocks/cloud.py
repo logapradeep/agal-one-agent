@@ -33,6 +33,10 @@ from .runtime import EventSink
 logger = logging.getLogger(__name__)
 
 
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
 class _Outbox:
     """The reports a pass hands over that have no queue of their own — a ``programAck`` and an ``alert``, each with
     its MQTT copy — sent by one worker thread, **in the order they were handed over**, each tried once, exactly as
@@ -309,19 +313,22 @@ class CloudSink(EventSink):
 
     def alert(self, text: str, severity: str, rule_id: Optional[str], asset_id: Optional[str] = None) -> None:
         logger.warning("ALERT [%s] %s (rule %s)", severity, text, rule_id)
+        # Its time is the pass's, stamped here at the hand-over — not when its post leaves the outbox behind others
+        # (the backend files the alert's event at payload.timestamp; the second 0.4.0 review, README §4.8).
+        ts = _now_ms()
         if self.outbox is not None:
-            self.outbox.submit("alert", lambda: self._send_alert(text, severity, rule_id, asset_id))
+            self.outbox.submit("alert", lambda: self._send_alert(text, severity, rule_id, asset_id, ts))
             return
-        self._send_alert(text, severity, rule_id, asset_id)
+        self._send_alert(text, severity, rule_id, asset_id, ts)
 
-    def _send_alert(self, text: str, severity: str, rule_id: Optional[str], asset_id: Optional[str]) -> None:
+    def _send_alert(self, text: str, severity: str, rule_id: Optional[str], asset_id: Optional[str], ts: int) -> None:
         """The alert as 0.3.4 sent it from the pass: the MQTT copy, then the HTTPS post (the one the backend reads)."""
         try:
-            self.mqtt.publish_alert(text, severity, rule_id, asset_id)
+            self.mqtt.publish_alert(text, severity, rule_id, asset_id, timestamp=ts)
         except Exception as e:  # noqa: BLE001
             logger.debug("alert mqtt: %s", e)
         try:
-            self.http.report_alert(text, severity, rule_id, asset_id)
+            self.http.report_alert(text, severity, rule_id, asset_id, timestamp=ts)
         except Exception as e:  # noqa: BLE001
             logger.debug("alert http: %s", e)
 
@@ -355,19 +362,20 @@ class CloudSink(EventSink):
         # The heartbeat's programStatus is the node's own state: it is known now, whenever the post goes out.
         self.last_ack = {"version": version, "status": status, "reason": reason}
         version = int(version)
+        ts = _now_ms()  # the pass's time (program.appliedAt on the backend), not the post's
         if self.outbox is not None:
-            self.outbox.submit("programAck", lambda: self._send_program_ack(version, status, reason))
+            self.outbox.submit("programAck", lambda: self._send_program_ack(version, status, reason, ts))
             return
-        self._send_program_ack(version, status, reason)
+        self._send_program_ack(version, status, reason, ts)
 
-    def _send_program_ack(self, version: int, status: str, reason: Optional[str]) -> None:
+    def _send_program_ack(self, version: int, status: str, reason: Optional[str], ts: int) -> None:
         """The ack as 0.3.4 sent it from the pass: the HTTPS post (the one the backend reads), then the MQTT copy."""
         try:
-            self.http.report_program_ack(version, status, reason, self.firmware_version)
+            self.http.report_program_ack(version, status, reason, self.firmware_version, timestamp=ts)
         except Exception as e:  # noqa: BLE001
             logger.debug("ack http: %s", e)
         try:
-            self.mqtt.publish_program_ack(version, status, reason, self.firmware_version)
+            self.mqtt.publish_program_ack(version, status, reason, self.firmware_version, timestamp=ts)
         except Exception as e:  # noqa: BLE001
             logger.debug("ack mqtt: %s", e)
 
@@ -377,9 +385,10 @@ class CloudSink(EventSink):
         the same ordered outbox as the runtime's acks, so the backend gets the node's acks in the order it made them
         (an ``applied`` still waiting in the outbox is never overtaken by a later ``rejected``)."""
         version = int(version)
+        ts = _now_ms()
 
         def send() -> None:
-            self.http.report_program_ack(version, status, reason=reason)
+            self.http.report_program_ack(version, status, reason=reason, timestamp=ts)
         if self.outbox is not None:
             self.outbox.submit("programAck", send)
             return

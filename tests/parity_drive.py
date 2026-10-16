@@ -312,7 +312,7 @@ def cid(n: int) -> str:
 
 # ---------------------------------------------------------------------------------------- scenarios
 
-def light_bundle(version: int, name: str = "Lighting circuit", wall_switch: bool = False) -> dict:
+def light_bundle(version: int, name: str = "Lighting circuit", wall_switch: bool = False, tell: bool = False) -> dict:
     """The language-1 bundle the backend's compileNodeProgram builds for the Light card (compile.ts): the
     contracts' default block (aab_lighting_circuit), the linked ports' transports (the port's own: DO1 active
     low), the empty NAB, the node's timezone.
@@ -321,7 +321,12 @@ def light_bundle(version: int, name: str = "Lighting circuit", wall_switch: bool
     variable's port is linked (validateAab), and the node refuses one that is not ("port … is not resolved
     for this node"), so with DO1 alone the block is the default one without the wall switch and the rule
     that reads it. ``wall_switch=True`` is the whole default block, with the wall switch linked to DI1
-    (line 26) — the rule and an input exercised too."""
+    (line 26) — the rule and an input exercised too.
+
+    ``tell=True`` (the v1-light session): the NAB also reads the Light's relay and raises an alert when it comes on
+    ("The light is on", the NAB's alert variable, its default 300 s cooldown) — so both agents' alert path (the MQTT
+    copy on the status topic and the HTTPS post the backend reads) is compared too; the second 0.4.0 review found
+    neither session raised one."""
     contracts = os.environ.get("AGAL_CONTRACTS_DIR") or os.path.join(ROOT, "..", "..", "contracts")
     with open(os.path.join(contracts, "programs", "defaults", "aab_lighting_circuit.json"), encoding="utf-8") as f:
         aab = json.load(f)
@@ -333,11 +338,19 @@ def light_bundle(version: int, name: str = "Lighting circuit", wall_switch: bool
     else:
         aab["variables"] = [v for v in aab["variables"] if v["name"] != "wall_switch"]
         aab["rules"] = [r for r in aab["rules"] if "wall_switch" not in json.dumps(r)]
+    nab: dict = {"variables": [], "schedules": [], "rules": []}
+    if tell:
+        nab = {"variables": [
+                   {"name": "light", "kind": "asset", "type": "bool", "asset": {"assetId": LIGHT, "variable": "relay", "access": "read"}},
+                   {"name": "alert", "kind": "alert", "type": "string", "alert": {"defaultSeverity": "info"}}],
+               "schedules": [],
+               "rules": [{"id": "light_on", "kind": "when", "title": "Tell me the light is on", "when": {"condition": "light"},
+                          "actions": [{"type": "alert", "text": "The light is on", "severity": "info"}]}]}
     return {
         "version": version,
         "compiledAt": "2026-10-16T10:00:00.000Z",
         "timezone": "Asia/Kolkata",
-        "nab": {"variables": [], "schedules": [], "rules": []},
+        "nab": nab,
         "assets": [{"assetId": LIGHT, "aab": aab, "ports": ports, "assetType": "lighting_circuit", "name": "Light"}],
     }
 
@@ -360,7 +373,7 @@ ACTOR = {"uid": "ownerUid000000000001", "displayName": "Owner", "via": "app"}
 
 def scenario_v1_light(workdir: str) -> None:
     config_path = write_config(workdir)
-    STATE["bundle"] = light_bundle(5)
+    STATE["bundle"] = light_bundle(5, tell=True)
     STATE["portsVersion"] = 1
 
     # ---- boot A: cold — the program arrives by getProgram
@@ -409,7 +422,7 @@ def scenario_v1_light(workdir: str) -> None:
     STATE["portsVersion"] = 2
     k = "sync_" + cid(next(n))
     step("syncPorts", signed({"type": "syncPorts", "commandId": k, "portsVersion": 2}), k, settle=1.5)
-    STATE["bundle"] = light_bundle(6, "Light")
+    STATE["bundle"] = light_bundle(6, "Light", tell=True)
     k = "sync_" + cid(next(n))
     step("syncProgram v6 (a reload)", signed({"type": "syncProgram", "commandId": k, "version": 6}), k, settle=1.0)
     must(wait_for(program_applied(6), 10), "program v6 acked")

@@ -188,6 +188,53 @@ v3 once, with the founder's yes, and can roll it back; the node's half:
     carried out by the new program; a stop during a switch; the full report after a rollback and after a start. All
     10 fail on 37577d1. The v1 comparison (this run): 289 + 55 records identical in every stream, no adjustment (each stream
     keeps its order; streams were already compared one by one).
+- **Nor on the disk, nor on a clock probe; a report keeps its pass's time (the second review, 2026-10-17; contracts
+  v1.15.2 as amended — programs/README.md §4.8, SYNC.md v1.15.2 item 13; same version, still not tagged).** A latency
+  review with a simulated slow SD card and a slow clock probe (scratch `review-latency/exp_slow_sd.py`: the real
+  ProgramHost and RuntimeV3 on their threads, a 1 s pass, no network at all) found:
+  - *An fsync under the runtime lock (v3).* `RuntimeV3._persist` wrote the state file and fsynced it on the caller's
+    thread, and every caller holds the runtime lock: the end of every pass that changed what the node must remember (a
+    `setPower`, a run's start or end, the E-stop pressed or cleared, a guard trip, learn or expiry, an output let go
+    of, pause / resume), every 60 s during a run, and the switch's clean stop. Now the record is built under the lock
+    and handed to `_StateWriter` — one per state file for the whole process, one thread that writes, fsyncs and
+    renames, the newest record replacing one not yet picked up, records landing in the order they were made. The end
+    of a pass on the runtime's own thread does not wait; every act whose next physical step depends on its record
+    still waits for it through the same writer (a latching pulse's mark and position, a valve reset, the cold start's
+    not-clean record, a clean stop), and so does `step()` from the tests and the simulator; reading the file
+    (`_read_state`) waits for every record handed over before it. The switch v3 → v1 hands its clean-stop record over
+    without waiting (it is read only at a later v3 load). A write that fails is logged once by the writer and said to
+    the next caller that waits (no latching pulse then, as before). v1's `_persist` (no fsync) is unchanged.
+    `exp_slow_sd.py` with a 1 s fsync, 36c366a → now: an E-stop pressed 20 ms after a `setPower`'s pass stopped the
+    pump after 0.972 s → 0.002 s; an over-current with a 1 s hold 1.974 s → 1.003 s; a command 20 ms after the
+    E-stop's pass answered after 0.989 s → 0.000 s; no runtime pass possible at a switch v3 → v1 1.007 s → 0.001 s.
+    **Left:** v1 → v3 still has one fsync with no runtime (1.007 s with a 1 s fsync): the cold start's not-clean
+    record must be on disk before the switch stores the v3 bundle — handed over without waiting, a crash before it
+    landed would boot v3 on an older record that vouches for positions the v1 program has changed since; written
+    earlier, when the held bundle is checked, every migration would load cold after an "unclean stop" (every latching
+    valve in FAULT). A migration is once per node (the founder's yes), a rollback rarer.
+  - *`timedatectl` under the runtime lock.* `SystemClock.clock_ok()` probed on the caller's thread once a minute
+    (`timedatectl` over D-Bus, timeout 3 s, on any board with no `/dev/rtc0` — a Pi 3B with no DS3231), and both
+    runtimes ask on every pass under the lock (v1 since 0.3.4; v3's `_today` / `_midnight`), as does NodeEvents with
+    no backend time yet. Now only the first probe runs on the caller's thread — `main.py` makes that call for both
+    of its clocks at start-up, before the persisted program loads and before MQTT connects, so the first answer is
+    still a probe's — and every later one on a `clock-probe` thread while the callers get the last answer (one probe
+    at a time). With a 1 s probe: an E-stop pressed 20 ms into it stopped the pump after 0.974 s → 0.002 s; a
+    command answered after 0.980 s → 0.000 s.
+  - *Reports stamped when posted.* `HttpReporter.report_program_ack` / `report_alert` (and the MQTT copies) stamped
+    `timestamp` inside the post, which since the outbox runs behind the posts ahead of it (10 s each against a stalled
+    ingress) — and the backend files the `automation_alert` event and `program.appliedAt` at that time. Now
+    `CloudSink.alert`, `program_ack` and `post_program_ack` stamp the hand-over and both legs carry it (an optional
+    `timestamp=` on the four calls; other callers unchanged). `exp_outbox_stamps.py` against an ingress answering
+    after 2 s: the second and third reports +2.018 s / +4.029 s → +0.000 s.
+  - *Parity coverage.* Neither parity session raised an alert, so the alert path moved into the outbox had no 0.3.4
+    comparison. The v1-light session's NAB now reads the Light's relay and raises "The light is on" (its default
+    300 s cooldown): 293 + 55 records identical in every stream, `https telemetryIngress alert` 2 and
+    `mqtt …/status alert` 2 among them, and the session test asserts both.
+  - Tests: `tests/test_pass_never_waits_on_disk.py` (7, all failing on 36c366a): with a 1 s fsync the E-stop, the
+    guard and a command keep their time and every fsync is on the writer's thread; records in order, the newest wins,
+    a read waits; a failed write is said to the waiting caller and logged once; the v3 → v1 switch does not wait for
+    its clean-stop record and a later v3 load reads it; only the first clock probe on the caller's thread; an E-stop
+    during a 1 s probe; a report stamped at its hand-over. Whole suite: 977.
 
 **The pass (§7.5):** inputs → the built-ins (power sense, E-stop latch, valve drivers, motor guards), then the
 commands and which blocks hold → each layout's active instruction part → the rule slots → outputs written once,
@@ -370,7 +417,7 @@ test file per built-in; and every event the runtime sends validated against `eve
 `AJV_PATH` is set). `main()` was driven offline with a persisted v3 `program.json`.
 
 After the merge with 0.3.4: 944 tests in the whole suite (`tests/test_v3_on_0_3_4.py`, 7, and
-`tests/test_v1_parity.py`, 4, are new), no hardware. After the review of 2026-10-17: 970.
+`tests/test_v1_parity.py`, 4, are new), no hardware. After the review of 2026-10-17: 970; after the second: 977.
 
 ## 0.3.4 (2026-10-16)
 

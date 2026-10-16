@@ -492,7 +492,7 @@ def test_program_sync_rejects_a_bundle_whose_take_over_failed_and_keeps_the_old_
         def fetch_program(self, current_version=None):
             return {"bundle": self.bundle}
 
-        def report_program_ack(self, version, status, reason=None, firmware_version=None):
+        def report_program_ack(self, version, status, reason=None, firmware_version=None, timestamp=None):
             self.acks.append((version, status, reason))
 
     b = Bench(_farm())
