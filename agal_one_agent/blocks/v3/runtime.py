@@ -710,9 +710,14 @@ class RuntimeV3:
             self._sampler.start()
 
     def stop(self, safe_state: bool = True) -> None:
-        self._running = False
+        # Contracts v1.15.2: only the threads this runtime started BEFORE this stop are joined — read with the flag,
+        # under the lock — never one a start made meanwhile (a stop that joined that one waited out its timeout and
+        # left two runtimes running).
+        with self._lock:
+            threads = (self._thread, self._sampler)
+            self._running = False
         self._wake.set()
-        for t in (self._thread, self._sampler):
+        for t in threads:
             if t is not None and t is not threading.current_thread():
                 t.join(timeout=3.0)
         with self._lock:

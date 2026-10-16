@@ -25,6 +25,16 @@ rollback (v3 → v1) — changes language BUMPLESSLY too (contracts v1.15.1, pro
   switched off and let go of, as at any reload (``output_released``);
 * it is not a boot (no ``boot`` event, no runs carried), and a schedule id that ran or was missed today keeps that.
 
+Contracts v1.15.2 (§7.5a; the review of 0.4.0 on the Pi's shape and on a synthetic farm):
+
+* **one runtime at a time** — while the host switches it counts as running (``_running``) and honours no
+  :meth:`start`, so main.py's once-a-second "a program that arrived after boot starts the runtime" check can no
+  longer start the OLD runtime in the middle of a switch (both languages then ran passes until the process exited);
+* **a latched E-stop at the switch itself** — the hold waits while the E-stop is latched (a latch that comes in the
+  pass that ends the hold included), and the switch checks it once more before it stops the v3 runtime;
+* **only what runs is stored** — the host calls :attr:`on_switched` with the bundle that runs after a switch; a held
+  bundle is never the stored program (blocks/sync.py).
+
 Both runtimes share one lock, so a switch command is checked and dispatched against whichever program runs.
 """
 
@@ -32,7 +42,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Optional
+from typing import Callable, Optional
 
 from .clock import Clock, SystemClock
 from .io import IOAdapter, PortRef, physical_port
@@ -42,6 +52,8 @@ from .v3.runtime import RuntimeV3
 logger = logging.getLogger(__name__)
 
 BLOCK_LANGUAGE = 3  # what this agent reports as capabilities.blockLanguage (enums.yaml BlockLanguage)
+# Why a held switch back to language 1 waits while the E-stop is latched (README §7.10, contracts v1.15.2).
+ESTOP_HOLD = "the E-stop is latched at the panel"
 
 
 def bundle_language(bundle: dict) -> int:
@@ -65,6 +77,12 @@ class ProgramHost:
         # A checked bundle of the other language, held until a pass ends with no run in progress (§7.5a).
         self._pending: Optional[dict] = None
         self._pending_why: Optional[str] = None
+        # True from the moment a switch of language begins until the new runtime runs (v1.15.2): the host then
+        # counts as running and starts nothing, whoever asks.
+        self._switching = False
+        # Called with the bundle that runs after a switch of language — ProgramSync stores it as the node's program
+        # then, never while it is only held (v1.15.2).
+        self.on_switched: Optional[Callable[[dict], None]] = None
         self.v1.after_pass = self._after_pass
         self.v3.after_pass = self._after_pass
         io.set_change_listener(self._on_input_change)
@@ -98,7 +116,9 @@ class ProgramHost:
 
     @property
     def _running(self) -> bool:  # main.py checks whether the runtime thread runs
-        return self.active is not None and self.active._running
+        # A switch of language in progress counts as running (v1.15.2): main.py's restart check must not start the
+        # old runtime while it hands over.
+        return self._switching or (self.active is not None and self.active._running)
 
     # ------------------------------------------------------------- compile
 
@@ -143,7 +163,7 @@ class ProgramHost:
             target._build(bundle)
         with self._lock:
             self._pending = bundle
-            why = old.busy_reason()
+            why = self._hold_reason()
             running = old._running
         if running or why:
             # A runtime thread runs passes: the switch is made at the end of one of them, from that thread (no pass
@@ -158,6 +178,20 @@ class ProgramHost:
             logger.warning("program v%s is block language %d: the node changes language between runs — it waits: %s",
                            bundle.get("version"), lang, why)
 
+    def _leaving_latched(self) -> bool:
+        """Does the held bundle leave language 3 while the E-stop is latched (README §7.10)? Under self._lock."""
+        pending, prog = self._pending, self.v3.prog
+        return (pending is not None and self.active is self.v3 and bundle_language(pending) != 3 and prog is not None
+                and prog.estop is not None and bool(prog.estop.latched))
+
+    def _hold_reason(self) -> Optional[str]:
+        """Why the held switch waits at the end of this pass, or None (§7.5a): a run in progress, or — leaving
+        language 3 — a latched E-stop (v1.15.2: a latch that came after the bundle was checked). Under self._lock."""
+        why = self.active.busy_reason() if self.active is not None else None
+        if why:
+            return why
+        return ESTOP_HOLD if self._leaving_latched() else None
+
     def _after_pass(self) -> None:
         """After a pass: make the held switch of language when no run is in progress (§7.5a)."""
         if self._pending is None:
@@ -166,7 +200,7 @@ class ProgramHost:
             pending = self._pending
             if pending is None or self.active is None:
                 return
-            why = self.active.busy_reason()
+            why = self._hold_reason()
         if why:
             self._note_wait(pending, bundle_language(pending), why)
             return
@@ -182,10 +216,26 @@ class ProgramHost:
 
     def _switch(self) -> None:
         """Change language now: the old runtime stops without its safe state, the new one takes every output it shares
-        over at its level (programs/README.md §7.5a)."""
-        bundle, self._pending, self._pending_why = self._pending, None, None
-        if bundle is None:
-            return
+        over at its level (programs/README.md §7.5a). From the first step to the new runtime's start the host counts
+        as running and starts nothing (v1.15.2)."""
+        with self._lock:
+            bundle = self._pending
+            if bundle is None:
+                return
+            if self._leaving_latched():
+                # README §7.10 (v1.15.2): checked once more here, under the lock, before the v3 runtime stops — the
+                # node does not leave language 3 while the E-stop is latched; the hold waits for the panel reset.
+                self._note_wait(bundle, bundle_language(bundle), ESTOP_HOLD)
+                return
+            self._pending, self._pending_why = None, None
+            self._switching = True
+        try:
+            self._switch_now(bundle)
+        finally:
+            with self._lock:
+                self._switching = False
+
+    def _switch_now(self, bundle: dict) -> None:
         lang = bundle_language(bundle)
         target = self.v3 if lang == 3 else self.v1
         old = self.active
@@ -224,15 +274,25 @@ class ProgramHost:
                 self.sink.event("output_released", {"assetId": key[0], "sourceKey": key[1], "level": "off"})
         logger.warning("program v%s: the node now runs block language %d (it took over without switching an output)",
                        bundle.get("version"), lang)
+        if self.on_switched is not None:
+            try:
+                self.on_switched(bundle)  # the node's stored program is now this one (blocks/sync.py)
+            except Exception as e:  # noqa: BLE001 — never fail a switch that is made
+                logger.error("storing program v%s after the switch failed: %s", bundle.get("version"), e)
         if was_running:
             target.start()
 
     # ------------------------------------------------------------- lifecycle
 
     def start(self) -> None:
-        self._started = True
-        if self.active is not None:
-            self.active.start()
+        # v1.15.2: under the lock, and never while a switch is in progress — the switch starts the runtime that takes
+        # over itself; starting the one read here could otherwise start the runtime the switch is stopping.
+        with self._lock:
+            if self._switching:
+                return
+            self._started = True
+            if self.active is not None:
+                self.active.start()
 
     def stop(self, safe_state: bool = True) -> None:
         self._started = False

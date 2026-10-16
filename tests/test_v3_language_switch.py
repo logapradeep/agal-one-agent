@@ -412,3 +412,168 @@ def test_a_latching_coil_on_a_line_the_v1_program_left_on_is_written_off_before_
     run(h, clock, 1)
     assert (V2, "valve.open_coil", False) in io.writes[before:]
     assert not io.pulses
+
+
+# --------------------------------------------------------------------------- contracts v1.15.2 (the 0.4.0 review)
+
+ESTOPC = "estopCard00000000001"
+
+
+def farm_v3_with_estop(version: int) -> dict:
+    """The farm's v3 bundle with an E-stop the node names (nc aux contact on line 5, the panel reset on line 19) and
+    no schedule: nothing but the latch can hold a switch."""
+    b = farm_v3(version)
+    b["instruction"][0]["program"]["schedules"] = []
+    b["assets"].append({"assetId": ESTOPC, "assetType": "emergency_stop", "name": "E-stop", "ports": {
+        "sensor.contact": {"kind": "gpio", "chip": CHIP, "line": 5, "direction": "in", "pull": "up"},
+        "sensor.reset": {"kind": "gpio", "chip": CHIP, "line": 19, "direction": "in", "pull": "up"}}})
+    b["safety"] = {"emergencyStop": {"input": {"assetId": ESTOPC, "sourceKey": "sensor.contact"},
+                                     "reset": {"assetId": ESTOPC, "sourceKey": "sensor.reset"},
+                                     "contact": "nc", "resetKind": "reset_input"}}
+    return b
+
+
+def test_mains_restart_check_never_starts_a_second_runtime_during_a_switch(tmp_path, monkeypatch):
+    """main.py's loop runs `if runtime.loaded and not runtime._running: runtime.start()` once a second. The switch runs
+    on the old runtime's thread; while it ran, the host looked stopped and that check started the OLD runtime again —
+    both languages then ran passes (v1.15.2 item 1(a)). Here the check runs every millisecond against switches made
+    slow on purpose (a hand-over of 50 ms: on the Pi the sampler join alone takes ~60 ms)."""
+    import threading
+    h, io, sink, clock = host_at(tmp_path, datetime(2026, 10, 16, 19, 0, tzinfo=TZ), tick_seconds=0.01)
+    for rt in (h.v1, h.v3):
+        real = rt.take_over_language
+
+        def slow(bundle, carried, days, _real=real):
+            time.sleep(0.05)
+            return _real(bundle, carried, days)
+        monkeypatch.setattr(rt, "take_over_language", slow)
+    h.compile(light_v1(6))
+    h.start()
+    started_by_check: list[int] = []
+    done = threading.Event()
+
+    def mains_check():
+        while not done.is_set():
+            if h.loaded and not h._running:
+                started_by_check.append(h.language)
+                h.start()
+            time.sleep(0.001)
+    t = threading.Thread(target=mains_check, name="mains-check", daemon=True)
+    t.start()
+    try:
+        for version, bundle, lang in ((7, light_v3(7), 3), (8, light_v1(8), 1), (9, light_v3(9), 3), (10, light_v1(10), 1)):
+            h.compile(bundle)
+            deadline = time.monotonic() + 5
+            while not [a for a in sink.acks if a["version"] == version] and time.monotonic() < deadline:
+                time.sleep(0.005)
+            time.sleep(0.1)  # a few more of the check's turns after the switch
+            assert h.language == lang and h.version == version
+            other = h.v1 if lang == 3 else h.v3
+            assert h.active._running and not other._running, f"two runtimes run after the switch to v{version}"
+            assert other._thread is None or not other._thread.is_alive(), f"the old runtime's thread lives on after v{version}"
+            assert other._sampler is None or not other._sampler.is_alive()
+        assert started_by_check == [], "main's check started a runtime during a switch"
+    finally:
+        done.set()
+        t.join(timeout=2)
+        h.stop(safe_state=False)
+
+
+def test_a_held_switch_is_not_stored_and_a_restart_during_the_hold_resumes_the_running_language(tmp_path):
+    """The migration arrives mid-run and is held. Before v1.15.2 ProgramSync stored it as program.json at once, and a
+    restart during the hold booted v3 cold: it watered the 06:00 run again from scratch (item 1(b)). Now program.json
+    stays the running v1 bundle: the restart boots v1, its own restart resume carries the run to its original end,
+    and the next pull hands the held bundle to it again — switched after the run, which v3 does not start again."""
+    from agal_one_agent.blocks.sync import ProgramStore, ProgramSync
+
+    class Http:
+        def __init__(self, bundle):
+            self.bundle = bundle
+
+        def fetch_program(self, current_version=None):
+            return {"version": self.bundle["version"], "bundle": copy.deepcopy(self.bundle)}
+
+        def report_program_ack(self, *a, **k):
+            return True
+
+    h, io, sink, clock = host_at(tmp_path, datetime(2026, 10, 16, 5, 59, 50, tzinfo=TZ))
+    store = ProgramStore(str(tmp_path))
+    sync = ProgramSync(h, store, Http(farm_v1(6)))
+    sync._pull()
+    assert store.load()["version"] == 6
+    run(h, clock, 20)  # 06:00:10 — the morning run is in progress on v1
+    assert io.output(VALVE, "device.power") is True
+    sync.http = Http(farm_v3(7))
+    sync._pull()  # the migrator's poke: held, and NOT stored
+    assert h.pending_version == 7 and h.language == 1
+    assert store.load()["version"] == 6 and store.load().get("language", 1) == 1
+    run(h, clock, 600)  # 06:10:10 — still held
+    h.stop(safe_state=True)  # the restart (a clean stop, as SIGTERM)
+
+    io2, sink2 = SimulatedIO(), RecordingSink()
+    h2 = ProgramHost(io2, sink2, clock=clock, state_dir=str(tmp_path), node_uid="ApBp4jEjkZHFggoga4uC")
+    sync2 = ProgramSync(h2, ProgramStore(str(tmp_path)), Http(farm_v3(7)))
+    assert sync2.load_persisted() and h2.language == 1 and h2.version == 6
+    assert [e["type"] for e in sink2.events] == ["run_resumed"]  # v1's own restart resume (R-21) carries the run
+    clock.advance(5)
+    sync2._pull()  # the boot pull: the v3 bundle again — held again, the resumed run is in progress
+    assert h2.language == 1 and h2.pending_version == 7
+    languages: set[int] = set()
+    while clock.now("Asia/Kolkata") < datetime(2026, 10, 16, 6, 29, 59, tzinfo=TZ):
+        h2.step()
+        languages.add(h2.language)
+        clock.advance(1.0)
+    assert languages == {1}, "the held v3 bundle ran before the resumed run's planned end"
+    assert ProgramStore(str(tmp_path)).load()["version"] == 6
+    for _ in range(60):  # 06:30 — the run's own end, then the switch
+        h2.step()
+        clock.advance(1.0)
+    assert h2.language == 3 and h2.version == 7, "the held switch was not made after the run"
+    assert ProgramStore(str(tmp_path)).load()["version"] == 7, "the switched bundle was not stored at the switch"
+    to(clock, datetime(2026, 10, 16, 6, 45, tzinfo=TZ))  # still inside the 06:00 start window
+    run(h2, clock, 30)
+    assert not [e for e in sink2.events if e["type"] == "schedule_started"], "the 06:00 run was started again from scratch"
+    assert not io2.output(VALVE, "device.power") and not io2.output(PUMP, "device.power")
+
+
+def test_an_estop_latched_in_the_pass_that_ends_the_hold_keeps_the_node_on_v3(tmp_path, monkeypatch):
+    """compile refuses to leave language 3 while the E-stop is latched, but the switch is made at the end of a pass:
+    a latch that came in the pass that ended the hold let the node switch to v1, which has no latch, and a remote
+    switch-on then ran the pump with no panel reset (item 1(c)). Now the hold waits for the panel reset."""
+    h, io, sink, clock = host_at(tmp_path, datetime(2026, 10, 16, 9, 0, tzinfo=TZ))
+    io.set_input(ESTOPC, "sensor.contact", True)  # nc contact closed: released
+    io.set_input(ESTOPC, "sensor.reset", False)
+    h.compile(farm_v1(6))
+    run(h, clock, 2)
+    h.compile(farm_v3_with_estop(7))
+    run(h, clock, 3)
+    assert h.language == 3 and not h.v3.prog.estop.latched
+    # The rollback's bundle arrives while the v3 runtime thread runs: checked, then held to the end of a pass
+    # (single-threaded here: the runtime "runs", and the v1 runtime's start is recorded instead of a thread).
+    h.v3._running, h._started = True, True
+    v1_started: list[bool] = []
+    monkeypatch.setattr(h.v1, "start", lambda: v1_started.append(True))
+    h.compile(farm_v1(8))
+    assert h.pending_version == 8 and h.language == 3
+    io.set_input(ESTOPC, "sensor.contact", False)  # the E-stop is pressed — in the pass that ends the hold
+    h.v3.step()
+    h._after_pass()
+    assert h.v3.prog.estop.latched and h.language == 3 and h.pending_version == 8 and not v1_started
+    # Twisted back with no panel reset: still on v3, still latched, and a remote switch-on of the pump is refused.
+    io.set_input(ESTOPC, "sensor.contact", True)
+    for _ in range(3):
+        clock.advance(1.0)
+        h.v3.step()
+        h._after_pass()
+    assert h.language == 3 and h.v3.prog.estop.latched
+    r = switch(h, PUMP, "device.power", 1)
+    assert r["accepted"] is False and "latched" in str(r.get("reason"))
+    # The panel reset clears the latch: then the switch is made, between runs.
+    io.set_input(ESTOPC, "sensor.reset", True)
+    for _ in range(3):
+        clock.advance(1.0)
+        h.v3.step()
+        h._after_pass()
+    assert not h.v3.prog.estop.latched
+    assert h.language == 1 and h.version == 8 and v1_started == [True]
+    assert io.output(PUMP, "device.power") is not True

@@ -112,12 +112,39 @@ v3 once, with the founder's yes, and can roll it back; the node's half:
   guard supervises it) and a valve's coils (its driver's) stay busy.
 - A line the v1 program left on that the v3 program uses as a latching valve's coil is not known off: written off
   with the first pass's switch-offs, before any pulse ("never both coils at once", as in a v3 swap).
-- Tests: `tests/test_v3_language_switch.py` (13) — the Pi's Light on across the migration and back with nothing
+- Tests: `tests/test_v3_language_switch.py` (13 then; 16 with the review below) — the Pi's Light on across the migration and back with nothing
   written, its off state reported, its port test; a pump running and a valve open carried across and back; the switch
   held through a v1 run and the schedule not run twice; a held switch replaced by a rollback; a line let go of; a
   latching coil written off before any pulse; a bad bundle keeping v1; a runtime thread switching after its pass; the
   outputs on the wire. Each was shown to fail without its part (the carry in either runtime, the wait, the
   no-safe-state stop, the coil).
+- **Review of the switch (contracts v1.15.2, SYNC.md v1.15.2 item 1; same version, still not tagged).** Three paths
+  where the switch broke its own promises, each found by running the real agent and fixed:
+  - *Two runtimes at once.* The switch runs on the old runtime's thread; between the old runtime's stop and the new
+    one's start the host looked stopped, and `main.py`'s once-a-second "a program that arrived after boot starts the
+    runtime" check started the OLD runtime again — whose `stop()` then joined the new thread and timed out. Both
+    languages then ran passes, in both directions, until the process exited (14 of 40 trials at real speed; on a
+    synthetic farm both wrote the valve and the pump lines). Now `ProgramHost._switching` is set under the lock from
+    the first step of a switch to the new runtime's start: `_running` is True meanwhile and `start()` (under the lock)
+    starts nothing; `BlockRuntime.stop` / `RuntimeV3.stop` read the threads to join with the flag, under the lock, so
+    they never join a thread a later start made.
+  - *A held bundle stored as the node's program.* `ProgramSync` saved a bundle of the other language as `program.json`
+    while the host only held it: a restart during the hold booted that language cold, mid-run — the migration
+    watered the run again from scratch, the rollback ran schedules the owner had paused. Now only the running bundle
+    is stored: a held one is not, and `ProgramHost.on_switched` stores what runs when the switch is made (read under
+    the store's new lock, so a newer pull is never overwritten); the next pull after a restart hands the held bundle
+    again.
+  - *The E-stop latch at the switch itself.* `compile` refused to leave language 3 while latched, but the switch is
+    made at the end of a pass and asked only `busy_reason()`: an E-stop pressed in the pass that ended the hold let
+    the node switch to v1 and drop the latch, and a remote switch-on ran the pump with no panel reset. Now the hold
+    waits while it is latched ("the E-stop is latched at the panel") and `_switch` checks it once more, under the
+    lock, before the v3 runtime stops.
+  - Tests (3 more in `tests/test_v3_language_switch.py`, each failing on the code before this change): main's check
+    every millisecond against four slowed switches leaves exactly one runtime; a restart during a held migration
+    boots v1, keeps `program.json` at v1 until the switch after the run, and v3 does not start the 06:00 run again;
+    an E-stop latched in the pass that ends the hold keeps the node on v3 until the panel reset. The review's own
+    harness (scratch `compat-w1`): `exp_switch_race.py` 0 of 40 trials with two runtimes (was 14), the held
+    restarts now boot the running language, `exp_estop_switch.py` keeps v3 and refuses the pump.
 
 **The pass (§7.5):** inputs → the built-ins (power sense, E-stop latch, valve drivers, motor guards), then the
 commands and which blocks hold → each layout's active instruction part → the rule slots → outputs written once,
