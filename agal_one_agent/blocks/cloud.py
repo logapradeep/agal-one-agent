@@ -2,6 +2,20 @@
 MQTT / HTTPS / the durable telemetry buffer, the hardware I/O factory, and the
 capabilities the heartbeat reports (ADR-017 §5; contracts v1.5.0 telemetryIngress
 ``programAck`` / ``variables`` / ``alert`` messages; iot-node.capabilities).
+
+**A pass never waits on the network** (agent 0.4.0 review; programs/README.md §4.8). Every sink call is made by a
+runtime pass, under the runtime lock — the lock the input sampler, every command and (bundle v3) the E-stop latch and
+the motor guards wait for. So no sink call does network I/O on the caller's thread:
+
+* ``variables`` / ``outputs`` → the budgeted ``_VariableUploader`` queue (as since 0.2.x);
+* ``event`` → ``AgalOneMqttClient.publish_event`` → ``node_events.NodeEvents`` (as since 0.3.4);
+* ``program_ack`` and ``alert`` → ``_Outbox`` (new): until this review both posted over HTTPS (``urlopen``, 10 s
+  timeout) on the runtime thread — the first pass after every program load, in released 0.3.4 too;
+* the MQTT copies are paho ``publish`` calls, which only queue the packet (paho 2.x with ``loop_start``: an in-memory
+  deque and one byte on a non-blocking socket pair; the network thread writes the socket);
+* ``reading`` → the SQLite telemetry buffer (a local file) and an MQTT ``publish``.
+
+``http_async=False`` (tests and the simulator only) posts on the caller's thread, as before.
 """
 
 from __future__ import annotations
@@ -11,11 +25,90 @@ import os
 import sys
 import threading
 import time
-from typing import Any, Optional
+from collections import deque
+from typing import Any, Callable, Optional
 
 from .runtime import EventSink
 
 logger = logging.getLogger(__name__)
+
+
+class _Outbox:
+    """The reports a pass hands over that have no queue of their own — a ``programAck`` and an ``alert``, each with
+    its MQTT copy — sent by one worker thread, **in the order they were handed over**, each tried once, exactly as
+    0.3.4 sent them on the runtime thread (a failed post is logged at debug level and not retried: a program's state
+    also rides every heartbeat — ``programVersion`` / ``programStatus`` — and an alert rule fires again after its
+    cooldown). Handing over never waits on the network.
+
+    Memory stays bounded: past ``CAP`` waiting reports the oldest alert leaves (logged), and only when every waiting
+    report is a ``programAck`` the oldest of them. On a clean stop what waits gets ``close``'s few seconds."""
+
+    CAP = 256
+
+    def __init__(self, name: str = "cloud-outbox"):
+        self.name = name
+        self._cond = threading.Condition()
+        self._queue: deque[tuple[str, Callable[[], None]]] = deque()
+        self._busy = False
+        self._closed = False
+        self._thread: Optional[threading.Thread] = None
+        self.sent = 0
+        self.dropped = 0
+
+    def submit(self, kind: str, send: Callable[[], None]) -> bool:
+        with self._cond:
+            if self._closed:
+                logger.warning("%s after stop: not reported", kind)
+                return False
+            if len(self._queue) >= self.CAP:
+                victim = next((i for i in self._queue if i[0] != "programAck"), None) or self._queue[0]
+                self._queue.remove(victim)
+                self.dropped += 1
+                logger.error("%s dropped: %d reports are waiting for the ingress", victim[0], len(self._queue) + 1)
+            self._queue.append((kind, send))
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, name=self.name, daemon=True)
+                self._thread.start()
+            self._cond.notify_all()
+        return True
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while not self._queue and not self._closed:
+                    self._cond.wait()
+                if self._closed:
+                    return  # close() said what was left
+                kind, send = self._queue.popleft()
+                self._busy = True
+            try:
+                send()
+            except Exception as e:  # noqa: BLE001 — a report that fails never stops the ones behind it
+                logger.debug("%s: %s", kind, e)
+            finally:
+                with self._cond:
+                    self._busy = False
+                    self.sent += 1
+                    self._cond.notify_all()
+
+    @property
+    def waiting(self) -> int:
+        with self._cond:
+            return len(self._queue) + (1 if self._busy else 0)
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        with self._cond:
+            return self._cond.wait_for(lambda: not self._queue and not self._busy, timeout)
+
+    def close(self, timeout: float = 3.0) -> bool:
+        done = self.flush(timeout)
+        with self._cond:
+            left = len(self._queue)
+            self._closed = True
+            self._cond.notify_all()
+        if not done:
+            logger.warning("stopping with %d program ack(s) / alert(s) not sent", left)
+        return done
 
 
 class _VariableUploader:
@@ -163,7 +256,8 @@ class _VariableUploader:
 class CloudSink(EventSink):
     """Runtime → cloud. MQTT is the fast path when connected; HTTPS is the durable
     twin for acks and alerts; readings ride the existing buffer + live channel.
-    Card variables go to the ingress on every change (see _VariableUploader)."""
+    Card variables go to the ingress on every change (see _VariableUploader).
+    Nothing here waits on the network on the caller's thread — a runtime pass (see the module docstring)."""
 
     def __init__(self, mqtt_client, http_reporter, telemetry_buffer=None, firmware_version: str = "",
                  http_async: bool = True, min_interval: float = 1.0):
@@ -173,6 +267,8 @@ class CloudSink(EventSink):
         self.firmware_version = firmware_version
         self.last_ack: Optional[dict] = None
         self.uploader: Optional[_VariableUploader] = _VariableUploader(http_reporter, min_interval=min_interval) if http_async else None
+        # programAck and alert, both legs, in order, off the runtime thread (agent 0.4.0 review).
+        self.outbox: Optional[_Outbox] = _Outbox() if http_async else None
 
     def variables(self, asset_id: str, values: dict[str, Any]) -> None:
         try:
@@ -199,14 +295,27 @@ class CloudSink(EventSink):
             logger.debug("outputs http: %s", e)
 
     def flush(self, timeout: float = 5.0) -> bool:
-        return self.uploader.flush(timeout) if self.uploader is not None else True
+        deadline = time.monotonic() + timeout
+        ok = self.outbox.flush(timeout) if self.outbox is not None else True
+        if self.uploader is not None:
+            ok = self.uploader.flush(max(0.0, deadline - time.monotonic())) and ok
+        return ok
 
     def close(self) -> None:
         if self.uploader is not None:
             self.uploader.stop()
+        if self.outbox is not None:
+            self.outbox.close(timeout=0.0)  # main.py flushed it first; a test's sink just stops
 
     def alert(self, text: str, severity: str, rule_id: Optional[str], asset_id: Optional[str] = None) -> None:
         logger.warning("ALERT [%s] %s (rule %s)", severity, text, rule_id)
+        if self.outbox is not None:
+            self.outbox.submit("alert", lambda: self._send_alert(text, severity, rule_id, asset_id))
+            return
+        self._send_alert(text, severity, rule_id, asset_id)
+
+    def _send_alert(self, text: str, severity: str, rule_id: Optional[str], asset_id: Optional[str]) -> None:
+        """The alert as 0.3.4 sent it from the pass: the MQTT copy, then the HTTPS post (the one the backend reads)."""
         try:
             self.mqtt.publish_alert(text, severity, rule_id, asset_id)
         except Exception as e:  # noqa: BLE001
@@ -243,7 +352,16 @@ class CloudSink(EventSink):
             logger.debug("datalog mqtt: %s", e)
 
     def program_ack(self, version: int, status: str, reason: Optional[str] = None) -> None:
+        # The heartbeat's programStatus is the node's own state: it is known now, whenever the post goes out.
         self.last_ack = {"version": version, "status": status, "reason": reason}
+        version = int(version)
+        if self.outbox is not None:
+            self.outbox.submit("programAck", lambda: self._send_program_ack(version, status, reason))
+            return
+        self._send_program_ack(version, status, reason)
+
+    def _send_program_ack(self, version: int, status: str, reason: Optional[str]) -> None:
+        """The ack as 0.3.4 sent it from the pass: the HTTPS post (the one the backend reads), then the MQTT copy."""
         try:
             self.http.report_program_ack(version, status, reason, self.firmware_version)
         except Exception as e:  # noqa: BLE001
@@ -252,6 +370,20 @@ class CloudSink(EventSink):
             self.mqtt.publish_program_ack(version, status, reason, self.firmware_version)
         except Exception as e:  # noqa: BLE001
             logger.debug("ack mqtt: %s", e)
+
+    def post_program_ack(self, version: int, status: str, reason: Optional[str] = None) -> None:
+        """ProgramSync's ``rejected`` (a pulled bundle that did not compile): the HTTPS post only, with no
+        firmwareVersion and without touching ``last_ack`` — exactly as 0.3.4's ``ProgramSync`` posts it — but through
+        the same ordered outbox as the runtime's acks, so the backend gets the node's acks in the order it made them
+        (an ``applied`` still waiting in the outbox is never overtaken by a later ``rejected``)."""
+        version = int(version)
+
+        def send() -> None:
+            self.http.report_program_ack(version, status, reason=reason)
+        if self.outbox is not None:
+            self.outbox.submit("programAck", send)
+            return
+        send()
 
 
 def build_hardware_io(config, sensor_by_key: Optional[dict] = None, lines=None, analog=None):

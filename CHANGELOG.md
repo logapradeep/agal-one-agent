@@ -145,6 +145,49 @@ v3 once, with the founder's yes, and can roll it back; the node's half:
     an E-stop latched in the pass that ends the hold keeps the node on v3 until the panel reset. The review's own
     harness (scratch `compat-w1`): `exp_switch_race.py` 0 of 40 trials with two runtimes (was 14), the held
     restarts now boot the running language, `exp_estop_switch.py` keeps v3 and refuses the pump.
+- **A pass never waits on the network; never two runtime threads (the review after v1.15.2, 2026-10-17; contracts
+  v1.15.2 as amended — programs/README.md §4.8 and §7.5a, SYNC.md v1.15.2 item 1 (d)–(f); same version, still not
+  tagged).** The end-to-end confirm run (the real `main()` against the functions emulator) found three more:
+  - *The network inside a pass.* The first pass after any program load or switch of language posted its
+    `programAck` over HTTPS (`HttpReporter.report_program_ack` → `urlopen`, 10 s timeout) on the runtime thread,
+    holding the runtime lock, and so did every pass that raised an alert (`report_alert`) — and the host's
+    "could not take over" ack. Released 0.3.4 does the same for a v1 program. Meanwhile the input sampler, every
+    command and, on v3, the E-stop latch and the motor guards waited. Now `CloudSink.program_ack` / `alert` hand
+    both legs (HTTPS, and the MQTT copy) to `blocks/cloud.py` `_Outbox`: one worker thread, in the order they were
+    handed over, each tried once and logged as 0.3.4 did (no retries added; `last_ack` — the heartbeat's
+    `programStatus` — is set at once). ProgramSync's `rejected` goes through the same outbox (`ack=`, HTTPS only, as
+    before), so a later `rejected` never overtakes an `applied` still waiting. Bounded: past 256 waiting, the oldest
+    alert leaves first. `CloudSink.flush` covers it; `http_async=False` (tests, the simulator) posts inline as before.
+    With the ingress stalled (accepting, never answering; scratch `compat-w1/exp_stalled_safety.py`), 37577d1 → now:
+    a `setPower` answered after 10.003 s → 0.000 s (v1 and v3); an E-stop pressed during an alert's pass stopped the
+    pump after 10.004 s → 0.003 s; an over-current with a 1 s hold after 11.013 s → 1.007 s.
+  - *Two runtime threads at once.* The switch ran on the old runtime's thread: it started the new runtime and then
+    waited for the lock while the new one's first pass posted its ack (25 ms – 4.7 s of overlap in all 6 runs). Now
+    the old runtime's thread only decides — under the lock, at the end of a pass with no run in progress — and runs
+    no pass after it (its flag is down); a `language-switch` thread joins the old runtime's pass loop and sampler
+    (bounded: `SWITCH_JOIN_S`, 10 s; past it the switch says so and goes on — a thread left over can begin no pass)
+    and only then takes over and starts the new runtime, in one hold of the lock with the let-go and the store, so
+    the host never reads as stopped. With no runtime thread running (a pull while stopped, the tests' `step()`) the
+    switch is made on the caller's thread. A command, a compile or a stop that arrives during the switch waits for it
+    (the lock let go of meanwhile, `SWITCH_WAIT_S`) and goes to the program that runs after it: before, a command
+    the old program accepted in that moment was queued on a runtime that ran no pass again — lost; a stop now stops
+    the runtime that took over (clean, with its state recorded). `exp_switch_race.py` (scratch, now with a 0.5 ms
+    probe and a check at every runtime start): 20 of 20 trials with both threads alive before (5 of 10 with a
+    stalled ingress, for seconds), 0 of 20 after — 0 of 20 stalled too.
+  - *The v1 program's cards after a rollback.* `BlockRuntime._var_last_reported` survived the v3 period, so the
+    first pass after a rollback skipped a card whose snapshot equalled the one sent before the migration — and the
+    backend had removed `state.variables` while v3 ran: absent until a value changed. Now a take-over of language and
+    every runtime start forget what was reported (`_forget_reported`: every card dirty, reported in full at the next
+    pass); the v3 runtime likewise reports every card's outputs after every start. A v1 node that never switches
+    reports exactly as before (the comparison with 0.3.4 above passes unchanged).
+  - Tests: `tests/test_pass_never_waits_on_network.py` (10) — the outbox's order and its bound; ProgramSync's
+    rejection behind a pass's ack; with the stalled ingress and the real HttpReporter, AgalOneMqttClient, NodeEvents
+    and CloudSink: a v1 `setPower` within one pass (1 s), a v3 `setPower`, an E-stop during an alert's pass within one
+    pass, an over-current within its 1 s hold + one pass; no runtime thread alive at any runtime's start across four
+    switches (and a 0.5 ms probe never seeing both), on the Pi's I/O path with its samplers; a command during a switch
+    carried out by the new program; a stop during a switch; the full report after a rollback and after a start. All
+    10 fail on 37577d1. The v1 comparison (this run): 289 + 55 records identical in every stream, no adjustment (each stream
+    keeps its order; streams were already compared one by one).
 
 **The pass (§7.5):** inputs → the built-ins (power sense, E-stop latch, valve drivers, motor guards), then the
 commands and which blocks hold → each layout's active instruction part → the rule slots → outputs written once,
@@ -272,7 +315,7 @@ two of a port's wiring facts never reached the hardware. Both are fixed here, ag
 - **`pull` is the line's bias** — a gap since 0.3.0 (1ef380a): `LineIO.read` took a `pull` and ignored it, and
   `HardwareIO` never passed one, so an E-stop input with no pull-up on the board floated. Now a GPIO input is
   requested with its entry's `pull` as python-periphery's `bias` — `up` → `pull_up`, `down` → `pull_down`, `none` →
-  `disable` (stated wiring: an external resistor, so the internal pull is switched off); an entry with no `pull` is
+  `disable` (stated wiring: an external resistor, so the internal pull is switched off — founder 2026-10-16); an entry with no `pull` is
   requested with no bias flag. That is the bias flag of the character device's line request (kernel 5.5+). A line is
   requested again when a reload changes its pull, and kept when a read asks for none. The legacy Broadcom-numbered
   path sets RPi.GPIO's `pull_up_down` the same way, and a port test that watches an input applies the port's pull.
@@ -327,7 +370,7 @@ test file per built-in; and every event the runtime sends validated against `eve
 `AJV_PATH` is set). `main()` was driven offline with a persisted v3 `program.json`.
 
 After the merge with 0.3.4: 944 tests in the whole suite (`tests/test_v3_on_0_3_4.py`, 7, and
-`tests/test_v1_parity.py`, 4, are new), no hardware.
+`tests/test_v1_parity.py`, 4, are new), no hardware. After the review of 2026-10-17: 970.
 
 ## 0.3.4 (2026-10-16)
 

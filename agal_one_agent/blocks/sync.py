@@ -62,12 +62,16 @@ class ProgramStore:
 class ProgramSync:
     """Glue between the cloud (http_reporter) and the runtime."""
 
-    def __init__(self, runtime, store: ProgramStore, http_reporter, sink_ack=None):
+    def __init__(self, runtime, store: ProgramStore, http_reporter, sink_ack=None, ack=None):
         # runtime: a ProgramHost (the agent) or a BlockRuntime (tests, the simulator)
         self.runtime = runtime
         self.store = store
         self.http = http_reporter
         self._sink_ack = sink_ack
+        # How a rejection is posted: ack(version, "rejected", reason). main.py passes CloudSink.post_program_ack — the
+        # same HTTPS post as 0.3.4's, through the outbox that carries the runtime's acks, so the node's acks reach the
+        # backend in the order it made them (agent 0.4.0 review). Default: posted here, on the pull thread, as before.
+        self._ack = ack
         self._lock = threading.Lock()
         if hasattr(runtime, "on_switched"):
             # v1.15.2: a bundle of the other language is stored when the host switches to it, not when it is held.
@@ -131,6 +135,9 @@ class ProgramSync:
                 if not isinstance(e, CompileError):
                     logger.error("program v%d: compile failed unexpectedly", version, exc_info=True)
                 logger.error("program v%d rejected: %s", version, e)
-                self.http.report_program_ack(version, "rejected", reason=str(e))
+                if self._ack is not None:
+                    self._ack(version, "rejected", str(e))
+                else:
+                    self.http.report_program_ack(version, "rejected", reason=str(e))
                 if self._sink_ack:
                     self._sink_ack(version, "rejected", str(e))

@@ -395,7 +395,8 @@ def main():
             tick_seconds=config.blocks.tick_seconds,
             node_uid=config.node.uid,
         )
-        program_sync = ProgramSync(runtime, ProgramStore(state_dir), http_reporter)
+        # A rejection goes through the sink's ordered outbox, behind any ack a pass handed over (agent 0.4.0 review).
+        program_sync = ProgramSync(runtime, ProgramStore(state_dir), http_reporter, ack=cloud_sink.post_program_ack)
         link_guard.use_runtime(runtime)
         if program_sync.load_persisted():
             logger.info("Automation program v%d loaded from %s", runtime.version, state_dir)

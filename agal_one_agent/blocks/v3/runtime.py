@@ -703,6 +703,7 @@ class RuntimeV3:
             if self._running:
                 return
             self._running = True
+            self._report_all = True  # every start reports every card's outputs at its first pass (0.4.0 review)
         self._thread = threading.Thread(target=self._loop, name="blocks-v3-runtime", daemon=True)
         self._thread.start()
         if not isinstance(self.io, SimulatedIO):

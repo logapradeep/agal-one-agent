@@ -833,6 +833,9 @@ class BlockRuntime:
             if self._running:
                 return
             self._running = True
+            # The first pass of every start reports every card in full (0.4.0 review): what the cloud holds may not be
+            # what this runtime last sent — another runtime ran in between (a switch of language, or one undone).
+            self._forget_reported()
         self._thread = threading.Thread(target=self._loop, name="blocks-runtime", daemon=True)
         self._thread.start()
         if self._needs_sampler():
@@ -1578,6 +1581,18 @@ class BlockRuntime:
         expr = v.d.get("expression") if isinstance(v.d, dict) else None
         return isinstance(expr, str) and "since(" in expr
 
+    def _forget_reported(self) -> None:
+        """Every card's next report is a full one, sent at the next pass: nothing counts as reported already. Under
+        the lock. While a language-3 program ran, the cloud removed the cards' ``state.variables`` (v3 reports
+        ``outputs`` instead — functions.yaml 1.11.2), so a v1 program that takes over again must not skip a snapshot
+        because it equals the one it sent before the migration (it did: state.variables stayed absent until a value
+        changed)."""
+        self._var_last_reported.clear()
+        self._var_last_sent_at.clear()
+        self._var_report_next.clear()
+        for blk in self.aabs.values():
+            blk.dirty.update(blk.vars.keys())
+
     def _report_variables(self, now: float) -> None:
         for aid in self.aab_order:
             blk = self.aabs[aid]
@@ -1807,6 +1822,9 @@ class BlockRuntime:
                     s.missed_date = today
             self._booted = True  # not a boot: the `on boot` rules are for a restart
             self._persist_due = True
+            # The cloud holds the v3 program's outputs, not this program's variables: the first pass reports every
+            # card in full, whatever it reported before the migration (0.4.0 review).
+            self._forget_reported()
         logger.info("program v%d (language 1) took over from the language-3 program: %d outputs kept at their level",
                     self.version, kept)
 
