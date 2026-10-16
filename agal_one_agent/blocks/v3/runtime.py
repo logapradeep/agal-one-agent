@@ -2174,6 +2174,39 @@ class RuntimeV3:
 
     # ---------------------------------------------------------------- status
 
+    def outputs_on(self) -> list[str]:
+        """What the program has ON now, named for a person — an OTA update waits while this is not empty
+        (agent 0.3.4's busy-wait, ota_updater): a restart switches every output off and closes every valve (a
+        latching valve known open gets its close pulse at the boot pass), and interrupts every run. So: every
+        motor or plain output at an on level (wanted or last written), every valve that is open — a continuous
+        one whose ``valve.open`` is on, a latching one recorded open — or has a pulse in progress or a coil not
+        known off, and every schedule run that is running (a run interrupted by a power cut has its outputs off
+        and resumes from the state directory after a restart)."""
+        with self._lock:
+            p, st = self.prog, self.st
+            if p is None:
+                return []
+            out: list[str] = []
+            for key in p.output_order:
+                o = p.outputs[key]
+                name = o.card.name or o.asset_id
+                if o.kind == "valve" and o.valve is not None:
+                    drv = o.valve
+                    if drv.latching:
+                        if drv.position == "open":
+                            out.append(f"{name} (valve open)")
+                        elif drv.pulse_mark or not drv.coils_known_off():
+                            out.append(f"{name} (a valve coil not known off)")
+                    else:
+                        coil_open = drv.coil_written is not None and drv.coil_written != drv.coil_level(False)
+                        if is_on(o.level) or coil_open:
+                            out.append(f"{name} (valve open)")
+                    continue
+                if is_on(o.level) or (o.written is not None and is_on(o.written)):
+                    out.append(f"{name} ({o.source_key})")
+            out.extend(f"the run of schedule {r.sid} on {r.layout}" for r in st.runs.values() if r.state == "running")
+            return out
+
     def level(self, asset_id: str, key: str):
         with self._lock:
             out = self.prog.outputs.get((asset_id, key)) if self.prog else None

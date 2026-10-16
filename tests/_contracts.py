@@ -12,3 +12,7 @@ CONTRACTS = os.path.normpath(os.path.expanduser(
     os.environ.get("AGAL_CONTRACTS_DIR") or os.path.join(_HERE, "..", "..", "..", "contracts")))
 DEFAULTS = os.path.join(CONTRACTS, "programs", "defaults")
 EXPRESSION_VECTORS = os.path.join(CONTRACTS, "programs", "test-vectors", "expressions.json")
+COMMAND_SIGNING_VECTORS = os.path.join(CONTRACTS, "nodes", "vectors", "command-signing.json")
+#: contracts v1.14.2 join safety (nodes/README.md §10): the served script's guard, the version rules.
+JOIN_VECTORS = os.path.join(CONTRACTS, "nodes", "vectors", "join.json")
+IOT_NODE_SCHEMA = os.path.join(CONTRACTS, "schemas", "iot-node.schema.json")

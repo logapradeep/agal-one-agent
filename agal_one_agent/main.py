@@ -17,6 +17,9 @@ from .telemetry_uploader import TelemetryUploader
 from .live_cadence import LiveCadenceController
 from .heartbeat import HeartbeatPublisher
 from .http_reporter import HttpReporter
+from .command_acks import wire_command_acks
+from .command_signing import wire_command_gate
+from .node_events import wire_node_events
 from . import boot_reconciler
 from .sentry_setup import init_sentry
 from .sensors import (
@@ -31,6 +34,60 @@ logger = logging.getLogger("agal_one_agent")
 
 # How long boot reconciliation waits for the answer to the hardware report (see _boot_wait).
 BOOT_WAIT_FOR_PORT_TABLE_S = 30.0
+
+
+def handle_firmware_update(command: dict, mqtt_client, node_uid: str, outputs_on=None) -> None:
+    """A managed OTA update (health-gated rollback). Receipt ack only — the real outcome is
+    reported asynchronously via firmware_update_* events (started on install, then succeeded
+    once the new version clears probation, or rolled_back by the verify-timer). Its acks stay on
+    MQTT (``ingress=False``): the command is a /nodeCommands doc, which the ingress's commandAck
+    does not track, so a post would only cost the backend a lookup of a doc that is not there.
+
+    The command may carry the release archive to install — ``source`` (its URL) and ``sha256``
+    (agent 0.3.4): then no git is needed on the board. ``outputs_on`` names what the node has ON;
+    the update waits while it names anything (ota_updater.perform_update). Blocking: run it
+    through start_firmware_update, never on the MQTT loop."""
+    from .ota_updater import perform_update
+    command_id = command.get("commandId", "")
+    version = command.get("version", "")
+    rollout_id = command.get("rolloutId", "")
+    source = command.get("source") if isinstance(command.get("source"), str) else None
+    sha256 = command.get("sha256") if isinstance(command.get("sha256"), str) else None
+    mqtt_client.publish_command_ack(command_id, "executing", ingress=False)
+    try:
+        msg = perform_update(version, command_id=command_id,
+                             rollout_id=rollout_id, node_uid=node_uid,
+                             source=source, sha256=sha256, outputs_on=outputs_on)
+        logger.info("OTA: %s", msg)
+    except Exception as e:  # noqa: BLE001
+        logger.error("OTA: perform_update failed: %s", e)
+        mqtt_client.publish_command_ack(command_id, "failed", error=str(e), ingress=False)
+
+
+def start_firmware_update(command: dict, mqtt_client, node_uid: str, outputs_on=None) -> threading.Thread:
+    """handle_firmware_update on its own thread: a download, an install and a wait for the pump to
+    stop take minutes, and the MQTT loop must go on meanwhile — the command that switches the
+    pump off arrives through it."""
+    t = threading.Thread(target=handle_firmware_update, args=(command, mqtt_client, node_uid),
+                         kwargs={"outputs_on": outputs_on}, name="ota-update", daemon=True)
+    t.start()
+    return t
+
+
+def outputs_on_for(runtime) -> list:
+    """What the node has ON now — the program's outputs and runs (a language-1 program's plot runs, a
+    language-3 program's schedule runs, its open valves and pulses), and the legacy GPIO / PWM outputs —
+    for an OTA update to wait on. ``runtime`` is the ProgramHost (agent 0.4.0) or a BlockRuntime."""
+    from .handlers import gpio_handler, pwm_handler
+    on = []
+    loaded = getattr(runtime, "loaded", None) if runtime is not None else False
+    if loaded is None:  # a bare BlockRuntime of agent 0.3.x
+        loaded = getattr(runtime, "nab", None) is not None
+    if loaded:
+        on.extend(runtime.outputs_on())
+    on.extend(gpio_handler.outputs_on())
+    on.extend(pwm_handler.outputs_on())
+    return on
 
 
 def main():
@@ -87,8 +144,45 @@ def main():
     # base_url comes from the backend-generated config (telemetry.ingress_url,
     # v0.1.6 config-driven region); HttpReporter falls back to its module
     # default when that's empty.
+    # The backend's time, from the Date of every HTTPS answer (server_time.py; contracts v1.14.2
+    # review, command-signing.md §5.4): the command gate checks a command's age against it, so a
+    # board whose clock is wrong after a power cut neither carries out a captured old command nor
+    # refuses a fresh one.
+    from .server_time import ServerTime
+    server_time = ServerTime()
     http_reporter = HttpReporter(config.node.uid, auth_token=config.node.auth_token,
-                                 base_url=config.telemetry.ingress_url)
+                                 base_url=config.telemetry.ingress_url, server_time=server_time)
+
+    # Command acks: the backend reads them only from telemetryIngress over HTTPS (nothing
+    # consumes the MQTT status topic), so every publish_command_ack — from every call site — is
+    # also queued here and posted from the ack worker, in order, never blocking the command or
+    # the MQTT loop (command_acks.py has what is posted and why). tests/test_command_acks.py
+    # checks that main() makes this call.
+    command_acks = wire_command_acks(mqtt_client, http_reporter, offline=args.offline)
+
+    # Every message on the command topic is checked before anything carries it out (contracts
+    # v1.14.2, command_signing.py): signed for THIS node with its auth_token, never seen before,
+    # not stale on the backend's time. One broker login is shared by every board, so the topic name
+    # alone separates nothing. A refused message is logged and, when it is a bad_signature or stale
+    # for a tracked id, answered through the ack queue above; the replay set lives in the state
+    # directory. A node without a token carries out nothing. tests/test_command_signing.py checks
+    # that main() makes this call.
+    from .blocks.clock import SystemClock
+    from .blocks.sync import DEFAULT_STATE_DIR
+    agent_clock = SystemClock()
+    command_gate = wire_command_gate(mqtt_client, http_reporter, token=config.node.auth_token,
+                                     state_dir=config.blocks.state_dir or DEFAULT_STATE_DIR,
+                                     offline=args.offline, clock_ok=agent_clock.clock_ok,
+                                     server_time=server_time)
+
+    # Node events (protection trips, the block runtime's, buffer_overflow) reach the backend only
+    # over HTTPS too: every publish_event is also queued here and posted as a sensor_event with
+    # the node's token, in order, retried (node_events.py). tests/test_node_events.py checks it.
+    node_events = wire_node_events(mqtt_client, http_reporter, offline=args.offline,
+                                   clock_ok=agent_clock.clock_ok, server_time=server_time)
+    if command_gate is not None and command_gate.protected:
+        logger.info("Commands on %s are checked: signed for this node (hs256-v1), not replayed, not stale",
+                    config.mqtt.commands_topic)
 
     # ---- Node linking (ADR-024): one GPIO path for every Linux board, and the
     # report of what this board is and has. Nothing here names a board.
@@ -359,20 +453,8 @@ def main():
 
         # OTA firmware update (managed, with health-gated rollback)
         if cmd_type == "firmwareUpdate":
-            from .ota_updater import perform_update
-            version = command.get("version", "")
-            rollout_id = command.get("rolloutId", "")
-            # Receipt ack only — the real outcome is reported asynchronously via
-            # firmware_update_* events (started on install, then succeeded once
-            # the new version clears probation, or rolled_back by the verify-timer).
-            mqtt_client.publish_command_ack(command_id, "executing")
-            try:
-                msg = perform_update(version, command_id=command_id,
-                                     rollout_id=rollout_id, node_uid=config.node.uid)
-                logger.info("OTA: %s", msg)
-            except Exception as e:  # noqa: BLE001
-                logger.error("OTA: perform_update failed: %s", e)
-                mqtt_client.publish_command_ack(command_id, "failed", error=str(e))
+            start_firmware_update(command, mqtt_client, config.node.uid,
+                                  outputs_on=lambda: outputs_on_for(runtime))
             return
 
         # Adaptive live cadence (ADR-013 §9-D3): the backend forwards a
@@ -488,9 +570,16 @@ def main():
             program_sync.pull(expected_version=command.get("version"))
             return
 
-        # resetValve / pauseAutomation / resumeAutomation: bundle v3 (contracts v1.15.0). A language-1
-        # program refuses them as unknown; runPlot / stopPlot / setVariable are refused by a v3 program.
-        if cmd_type in ("runPlot", "stopPlot", "setVariable", "resetValve", "pauseAutomation", "resumeAutomation"):
+        # runPlot / stopPlot / setVariable: a program's own commands (a v3 program refuses them).
+        # resetValve / pauseAutomation / resumeAutomation: bundle v3 (contracts v1.15.0) — handed to the
+        # runtime only while a language-3 program runs. On a node that runs a language-1 program, or none,
+        # they take the path agent 0.3.4 gave them (the legacy executor below, which refuses them), so a
+        # 0.4.0 agent that is not migrated answers every command exactly as 0.3.4 does
+        # (tests/test_v1_parity.py). Either way the signed-command gate has checked them first: every
+        # message on the command topic reaches on_command only through mqtt_client._on_message's gate.
+        v3_command = cmd_type in ("resetValve", "pauseAutomation", "resumeAutomation") and \
+            runtime is not None and runtime.loaded and runtime.language == 3
+        if cmd_type in ("runPlot", "stopPlot", "setVariable") or v3_command:
             if runtime is None or not runtime.loaded:
                 mqtt_client.publish_command_ack(command_id, "failed", error="no automation program loaded")
                 return
@@ -541,8 +630,10 @@ def main():
         from .blocks.cloud import heartbeat_extra
         return heartbeat_extra(runtime, config, cloud_sink)
 
+    # Every status carries the version of the code that is running, resolved once at start
+    # (contracts v1.14.2 join safety; tests/test_join_safety.py).
     heartbeat = HeartbeatPublisher(config, mqtt_client, http_reporter=http_reporter,
-                                   extra_provider=_heartbeat_extra)
+                                   extra_provider=_heartbeat_extra, agent_version=__version__)
 
     # Graceful shutdown
     running = True
@@ -557,6 +648,15 @@ def main():
 
     # Start
     legacy_started = False
+    probation = None
+    from . import ota_updater
+    in_probation = False
+    if not args.offline:
+        # Before MQTT connects, so no firmwareUpdate command can have started yet: an update this
+        # agent was waiting on or downloading when it stopped installed nothing (reported failed),
+        # and an update in probation counts its rollback deadline from this boot (once per update).
+        ota_updater.settle_interrupted(node_uid=config.node.uid)
+        in_probation = ota_updater.begin_probation(__version__)
     try:
         if args.offline:
             logger.warning("OFFLINE: not connecting to MQTT or the ingress; running the persisted program only")
@@ -621,30 +721,21 @@ def main():
             if program_sync is not None:
                 program_sync.pull()
 
-        # OTA probation: if we just booted after an OTA install, confirm health
-        # once we've stayed connected for the probation window. If we crash or
-        # never connect before then, the independent verify-timer rolls us back.
-        from . import ota_updater
-        if not args.offline and ota_updater.read_state().get("phase") == "pending_verify":
-            logger.info(
-                "OTA: booted in probation (target=%s); self-confirming in %ds if still healthy",
-                ota_updater.read_state().get("target"), ota_updater.PROBATION_WINDOW_S,
-            )
-
-            def _confirm_if_healthy():
-                if mqtt_client.is_connected:
-                    ota_updater.confirm_update(node_uid=config.node.uid)
-                else:
-                    logger.warning("OTA: not connected at probation check; leaving to verify-timer")
-
-            _probation = threading.Timer(ota_updater.PROBATION_WINDOW_S, _confirm_if_healthy)
-            _probation.daemon = True
-            _probation.start()
+        # OTA probation: if we just booted after an OTA install, this process confirms itself at
+        # the first healthy check (connected, main loop alive) from PROBATION_WINDOW_S on; the main
+        # loop's tick() writes the heartbeat the verify-timer reads. If we crash, hang or never
+        # connect, the independent verify-timer rolls us back.
+        if in_probation and ota_updater.read_state().get("phase") == "pending_verify":
+            probation = ota_updater.Probation(
+                config.node.uid, __version__, lambda: mqtt_client.is_connected,
+                outputs_on=lambda: outputs_on_for(runtime)).start()
 
         logger.info("Agent running. Press Ctrl+C to stop.")
 
         while running:
             time.sleep(1)
+            if probation is not None:
+                probation.tick()
             # A program that arrives after boot starts the runtime and retires the
             # legacy protection thread (single writer per output).
             if runtime is not None and runtime.loaded and not runtime._running:
@@ -659,6 +750,8 @@ def main():
         pass
     finally:
         logger.info("Stopping services...")
+        if probation is not None:
+            probation.stop()
         if runtime is not None:
             try:
                 runtime.stop(safe_state=True)
@@ -667,6 +760,10 @@ def main():
         if cloud_sink is not None:
             cloud_sink.flush(timeout=3.0)
             cloud_sink.close()
+        if command_acks is not None:
+            command_acks.close(timeout=3.0)  # one more try for each ack still waiting
+        if node_events is not None:
+            node_events.close(timeout=3.0)  # after runtime.stop: its output_released events go too
         telemetry.stop()
         # Final drain attempt so a clean shutdown doesn't strand buffered rows.
         try:

@@ -98,6 +98,11 @@ Or use the dashboard UI: Releases → click the older one → Make it the latest
 
 ## Deprecation: `ota_updater.py` + systemd install path
 
+> **2026-10-15 (agent 0.3.4):** not dead yet. Boards joined with the app's join command (ADR-012 token
+> join, backend `enroll.ts`) run the agent under systemd, and `ota_updater.py` is how they update: from
+> 0.3.4 it installs the release archive the update command names (sha256-checked, no git), keeps the
+> running version for an offline rollback, and installs its own verify-timer. See CHANGELOG 0.3.4.
+
 Once balena is the deployment target:
 
 - [`agal_one_agent/ota_updater.py`](agal_one_agent/ota_updater.py) becomes dead code. The `perform_update` function isn't called from anywhere in the balena container path. Remove when no devices remain on the legacy systemd path.

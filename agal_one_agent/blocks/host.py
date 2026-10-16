@@ -7,7 +7,7 @@ language-1 NAB bundle — including this one until its migration. So the host ho
 the bundle it is given:
 
 * a language-1 bundle (``language`` absent or 1) runs on :class:`~.runtime.BlockRuntime`, exactly as agent
-  0.3.3 runs it;
+  0.3.4 — the release this one is built on — runs it (tests/test_v1_parity.py compares the two whole agents);
 * a language-3 bundle runs on :class:`~.v3.runtime.RuntimeV3`;
 * language 2 was superseded before it was built: it is rejected.
 
@@ -198,6 +198,14 @@ class ProgramHost:
         return None
 
     # ---------------------------------------------------------------- status
+
+    def outputs_on(self) -> list[str]:
+        """What the running program has ON now, named for a person — a restart switches these off, so an OTA
+        update waits while this is not empty (main.outputs_on_for, ota_updater). A language-1 program answers
+        exactly as agent 0.3.4 does."""
+        if self.active is None or not self.active.loaded:
+            return []
+        return self.active.outputs_on()
 
     def status_extra(self) -> dict:
         return self.v3.status_extra() if self.active is self.v3 else {}

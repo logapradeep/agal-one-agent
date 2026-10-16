@@ -30,23 +30,31 @@ class HttpReporter:
     """
 
     def __init__(self, node_uid: str, auth_token: str = "",
-                 base_url: str = ""):
+                 base_url: str = "", server_time=None):
         self.node_uid = node_uid
         self.auth_token = auth_token
+        # The backend's time from the Date of every HTTPS answer (server_time.ServerTime; contracts
+        # v1.14.2 review, command-signing.md §5.4): the command gate checks a command's age against it.
+        self.server_time = server_time
         # Prefer the backend-supplied URL (config.telemetry.ingress_url); fall
         # back to the module default when the config omits it (older configs or
         # a bare manual install).
         self.base_url = base_url or TELEMETRY_INGRESS_URL
         self.last_status: Optional[int] = None  # HTTP status of the last POST (429 → callers back off)
 
-    def report_status(self, online: bool, uptime: int, firmware_version: str = "0.1.0",
+    def report_status(self, online: bool, uptime: int, firmware_version: Optional[str] = None,
                       extra: Optional[dict] = None) -> None:
+        """POST a status. ``firmware_version``: the version of the code that is running (the
+        heartbeat passes ``agal_one_agent.__version__``); without one the status carries no
+        ``firmwareVersion`` at all — never a placeholder (contracts v1.14.2 join safety: this
+        default was "0.1.0", and the backend stored it from every clean stop)."""
         payload = {
             "nodeUid": self.node_uid,
             "online": online,
             "uptime": uptime,
-            "firmwareVersion": firmware_version,
         }
+        if firmware_version:
+            payload["firmwareVersion"] = firmware_version
         from .net_info import get_primary_mac
         mac = get_primary_mac()
         if mac:
@@ -75,10 +83,15 @@ class HttpReporter:
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=20) as resp:
+                self._note_time(resp, req)
                 if resp.status != 200:
                     logger.warning("getProgram failed: %d", resp.status)
                     return None
                 return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            self._note_time(e, req)
+            logger.warning("getProgram error: %s", e)
+            return None
         except Exception as e:  # noqa: BLE001
             logger.warning("getProgram error: %s", e)
             return None
@@ -105,8 +118,10 @@ class HttpReporter:
                 headers=self._headers(), method="POST",
             )
             with urllib.request.urlopen(req, timeout=20) as resp:
+                self._note_time(resp, req)
                 return json.loads(resp.read().decode("utf-8")) if resp.status == 200 else None
         except urllib.error.HTTPError as e:
+            self._note_time(e, req)
             if e.code == 409:
                 logger.error("reportHardware: this board is already linked to another node — unlink it there first")
             else:
@@ -169,7 +184,13 @@ class HttpReporter:
         return self._post({"type": "telemetry_batch", "payload": payload})
 
     def report_command_ack(self, command_id: str, status: str,
-                           applied_value=None, error: str = None) -> None:
+                           applied_value=None, error: str = None, reason: str = None) -> Optional[int]:
+        """POST a command ack — the only way the backend learns what became of a command
+        (nothing consumes the MQTT status topic). Called from ``command_acks.CommandAcks``'s
+        worker, never on a command's own thread. Returns the HTTP status (200 = recorded), or
+        None when the ingress was not reached, so the caller can tell a retry from a refusal.
+        ``reason`` (only with failed; contracts v1.14.2 CommandAckPayload.reason): the node
+        refused a message carrying this id — unsigned | bad_signature | replayed | stale."""
         payload = {
             "nodeUid": self.node_uid,
             "commandId": command_id,
@@ -179,8 +200,30 @@ class HttpReporter:
             payload["appliedValue"] = applied_value
         if error:
             payload["error"] = error
+        if reason and status == "failed":
+            payload["reason"] = reason
 
-        self._post({"type": "commandAck", "payload": payload})
+        return self._post_status({"type": "commandAck", "payload": payload})
+
+    def report_sensor_event(self, event: dict, *, event_id: str, timestamp: int,
+                            timestamp_uncertain: bool = False) -> Optional[int]:
+        """POST one node event — ``{type: "sensor_event", payload: SensorEventPayload}``
+        (functions.yaml 1.10.2, contracts v1.14.2): ``{nodeUid, event, timestamp, eventId,
+        timestampUncertain?}``, with the node's Bearer token (the ingress takes a sensor_event only
+        with it). ``nodeUid`` is the node's own uid (config.yaml node.uid) — never the broker
+        username, which on a node with the shared device login is not this node. ``eventId`` is
+        the same on every retry: the backend files /events/{nodeUid}_{eventId} once. Called from
+        ``node_events.NodeEvents``'s worker. The HTTP status, or None when the ingress was not
+        reached."""
+        payload: dict = {
+            "nodeUid": self.node_uid,
+            "event": event,
+            "timestamp": int(timestamp),
+            "eventId": event_id,
+        }
+        if timestamp_uncertain:
+            payload["timestampUncertain"] = True
+        return self._post_status({"type": "sensor_event", "payload": payload})
 
     def report_firmware_event(self, phase: str, from_version: str = None,
                               to_version: str = None, command_id: str = None,
@@ -230,15 +273,29 @@ class HttpReporter:
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=15) as resp:
+                self._note_time(resp, req)
                 if resp.status == 200:
                     data = json.loads(resp.read().decode("utf-8"))
                     return data.get("commands", [])
                 else:
                     logger.warning("fetch_boot_state failed: %d", resp.status)
                     return []
+        except urllib.error.HTTPError as e:
+            self._note_time(e, req)
+            logger.warning("fetch_boot_state error: %s", e)
+            return []
         except Exception as e:
             logger.warning("fetch_boot_state error: %s", e)
             return []
+
+    def _note_time(self, resp, req) -> None:
+        """Hand the answer's Date to the server-time reference (an https:// answer only)."""
+        if self.server_time is None:
+            return
+        try:
+            self.server_time.observe(getattr(resp, "headers", None), getattr(req, "full_url", ""))
+        except Exception as e:  # noqa: BLE001 — the time reference never fails a report
+            logger.debug("server time not noted: %s", e)
 
     def _headers(self) -> dict:
         """Request headers, including the node auth header when a token is configured."""
@@ -251,6 +308,11 @@ class HttpReporter:
         """POST an envelope to the ingress. Returns True iff the server replied
         200 — the durable batch path relies on this to prune only on confirmed
         delivery; the fire-and-forget callers ignore the return value."""
+        return self._post_status(data) == 200
+
+    def _post_status(self, data: dict) -> Optional[int]:
+        """POST an envelope to the ingress: the HTTP status of the answer, or None
+        when the ingress was not reached (also kept in ``last_status``)."""
         try:
             body = json.dumps(data).encode("utf-8")
             req = urllib.request.Request(
@@ -260,17 +322,20 @@ class HttpReporter:
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
+                self._note_time(resp, req)
                 self.last_status = resp.status
                 if resp.status != 200:
                     logger.warning("HTTP report failed: %d", resp.status)
-                    return False
-                return True
+                return resp.status
         except urllib.error.HTTPError as e:
+            self._note_time(e, req)
             self.last_status = e.code
             logger.warning("HTTP report error: %s", e)
+            return e.code
         except urllib.error.URLError as e:
             self.last_status = None
             logger.warning("HTTP report error: %s", e)
         except Exception as e:
+            self.last_status = None
             logger.warning("HTTP report unexpected error: %s", e)
-        return False
+        return None

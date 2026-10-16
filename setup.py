@@ -6,7 +6,8 @@ setup(
     # NOTE: the fleet provisioner still pins v0.1.6 until the backend side of
     # ADR-017 (rebuild phase P2) lands; 0.1.7/0.1.8 were never tagged.
     # 0.4.0 (unreleased, not tagged): bundle v3 — layout rules, the instruction, the built-ins (ADR-029,
-    # contracts v1.15.0) beside the language-1 runtime; reports capabilities.blockLanguage = 3.
+    # contracts v1.15.0) beside the language-1 runtime; reports capabilities.blockLanguage = 3. Built on
+    # 0.3.4 (released 2026-10-16: signed commands, archive OTA, events over HTTPS, join safety).
     version="0.4.0",
     packages=find_packages(),
     install_requires=[
