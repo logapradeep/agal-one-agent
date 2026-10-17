@@ -1,6 +1,6 @@
 # Changelog — agal-one-agent
 
-## 0.4.0 (unreleased — not tagged)
+## 0.4.0 (2026-10-17)
 
 **Bundle v3 — layout rules, the instruction, the built-ins (ADR-029, contracts v1.15.0, programs/README.md §7).**
 A minor version on top of **0.3.4** (released 2026-10-16, tag `v0.3.4` — merged in on 2026-10-16, see "Built on
