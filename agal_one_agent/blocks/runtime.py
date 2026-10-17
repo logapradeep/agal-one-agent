@@ -1815,6 +1815,12 @@ class BlockRuntime:
                         continue
                     c = carried.get((aid, v.port.source_key))
                     if c is None or not same_output_line(c["port"].transport, v.port.transport):
+                        # 0.4.1 (contracts v1.15.3, README §7.5a): an output the language-3 program did not hand over at its
+                        # level is WRITTEN by the first pass — the line requested as an output again. The last write this
+                        # runtime remembers is from before the migration (the Pump house: False since 12:42, while agent
+                        # 0.4.0's v3 program had let go of line 17 and read it as an input — the relay stayed energised
+                        # after the rollback, and outputs_on() said nothing was on).
+                        self._last_written.pop((aid, v.port.source_key), None)
                         continue
                     val = _coerce(v.type, c["value"])
                     v.value, v.last_change = val, now

@@ -39,10 +39,8 @@ LIGHT, PUMP, VALVE, EXTRA = "lightCard00000000001", "pumpCard000000000001", "val
 
 
 def port(line: int, active_low: bool = False) -> dict:
-    t = {"kind": "gpio", "chip": CHIP, "line": line, "direction": "out"}
-    if active_low:
-        t["activeLow"] = True
-    return t
+    # 0.4.1 (contracts v1.15.3): an output entry states its active level, whatever it is.
+    return {"kind": "gpio", "chip": CHIP, "line": line, "direction": "out", "activeLow": bool(active_low)}
 
 
 def _default_aab(name: str) -> dict:
@@ -69,8 +67,10 @@ def light_v1(version: int) -> dict:
 
 
 def light_v3(version: int) -> dict:
-    """What the backend's migrator compiles for the Pi (compileLayouts): every accepted card with its ports from the
-    port table — the Light, device.power on DO1, active low — no rule, no instruction, no safety."""
+    """The shape the backend's migrator compiles for the Pi since contracts v1.15.3 (compileLayouts, every entry complete):
+    every accepted card with its ports — the Light, device.power on DO1, direction out, active low — no rule, no
+    instruction, no safety. (Hand-written; the bundle the deployed 0.4.0-era compile REALLY served at 12:42:32Z, with no
+    direction, is replayed from the contracts vector in tests/test_v3_port_direction.py.)"""
     return {"language": 3, "version": version, "compiledAt": "2026-10-16T10:05:00Z", "timezone": "Asia/Kolkata",
             "assets": [{"assetId": LIGHT, "assetType": "lighting_circuit", "name": "Light",
                         "ports": {"device.power": port(17, True)}}],
@@ -291,18 +291,45 @@ def test_a_bundle_of_the_running_language_replaces_a_held_switch(tmp_path):
     assert h.language == 1
 
 
-def test_a_line_the_new_program_does_not_drive_is_switched_off_and_let_go_of(tmp_path):
+def test_a_switch_to_v3_that_would_let_go_of_a_driven_line_is_refused_and_touches_nothing(tmp_path):
+    """0.4.1 (contracts v1.15.3, README §7.5a (b)): the v1 program drives the Fan on line 23 and the v3 bundle does not —
+    the switch is refused in the node's words, before anything stops: nothing written or let go of, v1 runs on."""
     h, io, sink, clock = host_at(tmp_path, datetime(2026, 10, 16, 9, 0, tzinfo=TZ))
     h.compile(farm_v1(6, extra=True))
     run(h, clock, 2)
     assert switch(h, EXTRA, "device.power", 1)["accepted"] and switch(h, LIGHT, "device.power", 1)["accepted"]
     run(h, clock, 2)
     before = len(io.writes)
-    h.compile(farm_v3(7))  # the Fan is not in the v3 bundle (the node does not accept it any more)
-    assert io.writes[before:] == [(EXTRA, "device.power", False)]
-    assert [r[:2] for r in io.released] == [(EXTRA, "device.power")]
+    with pytest.raises(CompileError, match=r"device\.power of card extraCard00000000001 \(line 23 of pinctrl-bcm2835\) is driven by the "
+                                           r"running program and the language-3 program does not drive it"):
+        h.compile(farm_v3(7))  # the Fan is not in the v3 bundle (the node does not accept it any more)
+    run(h, clock, 3)
+    assert h.language == 1 and h.version == 6 and h.pending_version is None
+    assert io.writes[before:] == [] and io.released == []
+    assert io.output(EXTRA, "device.power") is True and io.output(LIGHT, "device.power") is True
+
+
+def test_back_on_v1_a_line_the_v1_program_does_not_drive_is_switched_off_and_kept_driven(tmp_path):
+    """0.4.1 (README §7.5a): a rollback whose v1 program does not drive a line the v3 program drove (a card with no v1
+    program) switches it off and KEEPS it driven at off — never let go of to its pull (output_released, level off)."""
+    h, io, sink, clock = host_at(tmp_path, datetime(2026, 10, 16, 9, 0, tzinfo=TZ))
+    h.compile(farm_v1(6))
+    run(h, clock, 2)
+    v3 = farm_v3(7)
+    v3["assets"].append({"assetId": EXTRA, "assetType": "lighting_circuit", "name": "Fan", "ports": {"device.power": port(23)}})
+    h.compile(v3)
+    run(h, clock, 2)
+    assert h.language == 3
+    assert switch(h, EXTRA, "device.power", 1)["accepted"]
+    run(h, clock, 2)
+    assert io.output(EXTRA, "device.power") is True
+    before = len(io.writes)
+    h.compile(farm_v1(8))
+    run(h, clock, 2)
+    assert h.language == 1
+    assert (EXTRA, "device.power", False) in io.writes[before:]
+    assert io.released == []
     assert {"type": "output_released", "assetId": EXTRA, "sourceKey": "device.power", "level": "off"} in sink.events
-    assert io.output(LIGHT, "device.power") is True
 
 
 def test_a_bundle_that_does_not_compile_keeps_the_running_program_and_its_outputs(tmp_path):
@@ -401,7 +428,8 @@ def test_a_latching_coil_on_a_line_the_v1_program_left_on_is_written_off_before_
     h, io, sink, clock = host_at(tmp_path, datetime(2026, 10, 16, 9, 0, tzinfo=TZ))
     v1 = light_v1(6)
     v1["assets"].append({"assetId": EXTRA, "aab": plain_relay_aab("Fan", "relay"), "assetType": "lighting_circuit", "name": "Fan",
-                         "ports": {"device.power": {"kind": "gpio", "chip": coil["chip"], "line": coil["line"], "direction": "out"}}})
+                         "ports": {"device.power": {"kind": "gpio", "chip": coil["chip"], "line": coil["line"], "direction": "out",
+                                                             "activeLow": bool(coil.get("activeLow"))}}})
     h.compile(v1)
     run(h, clock, 2)
     assert switch(h, EXTRA, "device.power", 1)["accepted"]

@@ -289,7 +289,7 @@ def _gpio_in(line: int) -> dict:
 
 
 def _gpio_out(line: int) -> dict:
-    return {"kind": "gpio", "chip": CHIP, "line": line, "direction": "out"}
+    return {"kind": "gpio", "chip": CHIP, "line": line, "direction": "out", "activeLow": False}
 
 
 def safety_bundle(version: int = 7) -> dict:
@@ -304,7 +304,7 @@ def safety_bundle(version: int = 7) -> dict:
              "ports": {"sensor.contact": _gpio_in(5), "sensor.reset": _gpio_in(19)}},
             {"assetId": PUMP, "assetType": "motor_controller", "name": "Borewell pump", "safeState": "off",
              "ports": {"device.power": _gpio_out(17),
-                       "sensor.current": {"kind": "i2c", "busId": 1, "addr": 72, "channel": 0, "driver": "ads1115",
+                       "sensor.current": {"kind": "i2c", "busId": 1, "addr": 72, "channel": 0, "driver": "ads1115", "direction": "in",
                                           "measure": {"mode": "ac_rms", "windowMs": 100}, "transform": {"scale": 30, "offset": 0},
                                           "unit": "A"}},
              "guard": {"output": "device.power", "current": ["sensor.current"], "ratedCurrentA": 7.5, "phaseType": "single_phase",

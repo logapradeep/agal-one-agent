@@ -195,7 +195,8 @@ def test_a_motor_is_never_compiled_without_its_guard():
 
 def test_a_block_cannot_write_around_the_guard():
     bundle = pumphouse()
-    card(bundle, PUMP)["ports"]["device.star"] = {"kind": "gpio", "chip": "pinctrl-bcm2835", "line": 24, "direction": "out"}
+    card(bundle, PUMP)["ports"]["device.star"] = {"kind": "gpio", "chip": "pinctrl-bcm2835", "line": 24, "direction": "out",
+                                                   "activeLow": False}
     v = rule(bundle, 1)["program"]["variables"][0]
     v["asset"]["sourceKey"] = "device.star"
     with pytest.raises(CompileError, match="not the output its guard supervises"):
@@ -232,11 +233,11 @@ def three_phase(bundle: dict, phase_sense: bool = True, currents: int = 3, volta
         g["phaseSense"] = ["sensor.phase_r", "sensor.phase_y", "sensor.phase_b"]
     if currents == 3:
         for ch, ph in ((1, "y"), (2, "b")):
-            c["ports"][f"sensor.current_{ph}"] = {"kind": "i2c", "busId": 1, "addr": 72, "channel": ch, "driver": "ads1115",
+            c["ports"][f"sensor.current_{ph}"] = {"kind": "i2c", "busId": 1, "addr": 72, "channel": ch, "driver": "ads1115", "direction": "in",
                                                   "measure": {"mode": "ac_rms", "windowMs": 100}, "unit": "A"}
         g["current"] = ["sensor.current", "sensor.current_y", "sensor.current_b"]
     if voltage:
-        c["ports"]["sensor.voltage"] = {"kind": "i2c", "busId": 1, "addr": 72, "channel": 3, "driver": "ads1115", "unit": "V"}
+        c["ports"]["sensor.voltage"] = {"kind": "i2c", "busId": 1, "addr": 72, "channel": 3, "driver": "ads1115", "direction": "in", "unit": "V"}
         g["voltage"] = "sensor.voltage"
         g["settings"]["voltage"] = {"minV": 190, "maxV": 265, "holdSeconds": 5}
     return bundle

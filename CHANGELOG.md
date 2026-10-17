@@ -1,5 +1,58 @@
 # Changelog — agal-one-agent
 
+## 0.4.1 (2026-10-17, not tagged)
+
+**Every port entry of a v3 bundle is complete, and the node refuses one that is not (contracts v1.15.3,
+programs/README.md §7.2 and §7.5a; SYNC.md v1.15.3).** A patch on 0.4.0 (released 2026-10-17, tag `v0.4.0`,
+`7078607`). Not tagged; releasing it — a tag and `/config/agent` 0.4.1 — is the founder's, and comes after the backend
+deploy (SYNC.md v1.15.3, the rollout order).
+
+**What happened (2026-10-17, the Pump house).** At 12:42:32Z the migrator served the Pi a v3 bundle whose only entry,
+the Light's DO1, stated no direction: `{kind gpio, chip pinctrl-bcm2835, line 17, activeLow true}` (the port table
+states none for a `do` row; the backend's v3 compile copied the transport alone). 0.4.0 took an entry with no
+`direction` as an INPUT (`v3/program.py is_output_port`): at the switch it wrote line 17 off and closed its output
+request (`host.py _switch_now`, "let go of"), then its sampler requested the line as an input with no bias — the line
+fell to GPIO 17's pull-down and the active-low relay ENERGISED (on a pump the motor would have started) — and every
+`setPower` was refused "is an input on this node". The rollback at 12:49:30Z (v4) did not re-drive the line either:
+the v1 runtime remembered `False` from before 12:42 and wrote nothing until the next on → off.
+
+- **An incomplete entry is refused** (`blocks/v3/program.py entry_refusal`, in `build`): no `direction`, one that is
+  neither `in` nor `out`, an output that states no `activeLow`, a PWM port said to be an input. The bundle is rejected
+  — `programAck rejected` with the node's words naming the card and the port ("refused: device.power of card
+  P9tZJr59FfqFy05d6qNy (line 17 of pinctrl-bcm2835) states no direction — …; the running program stays") — before
+  anything stops: no line is requested, written or closed.
+- **A switch of language that would change a line is refused** (`blocks/host.py switch_refusal`, checked in
+  `compile` with the other checks, before the hold): to language 3, a line the v1 program drives that the v3 program
+  would not drive (let go of) or would read; any line that would change direction; a line both drive at another
+  active level (inverted). The rollback (to language 1) is refused for a direction change or an inversion; a line the
+  v1 program does not drive (a card with no v1 program) is written off and **kept driven at off** — never let go of to
+  its pull (`output_released`, level off).
+- **A reload of language 3** (`blocks/v3/runtime.py _take_over`) refuses a line the running program drives that the
+  new one would read, or one it reads that the new one would drive (0.4.0 wrote it off and freed it as the take-over
+  committed); an output the new program drops is written off and its line kept driven (`_flush` no longer releases);
+  the same line driven the same way (`same_output_line`) is carried with nothing written, also when the new entry only
+  states what the old one left out.
+- **An output port is never opened as an input** (`blocks/io.py HardwareIO.read_input`): a read of a port whose entry
+  says `out` returns no value and is said once in the log — it would close the line's output request.
+- **Back on v1, an output the v3 program did not hand over is driven by the first pass** (`blocks/runtime.py
+  take_over_language`): its last remembered write is dropped, so the line is requested as an output again at its
+  level. The language-1 runtime is otherwise 0.3.4's, unchanged: `tests/test_v1_parity.py` (v1-light, v1-switch,
+  v3-gate) passes against the tag `v0.3.4` as before.
+- Tests: NEW `tests/test_v3_port_direction.py` (13) — the EXACT prod shapes from the contracts vector
+  (`programs/vectors/port-direction.json` `prod`) through the real `ProgramHost`, `HardwareIO` and `LineIO` with a
+  BCM2835 line model (a closed output request falls back to an input; GPIO 17 pulled down; an active-low relay): the
+  bundle served at 12:42:32Z is refused and line 17 untouched (no request, write or close) while v1 keeps driving it;
+  a complete bundle switches with the Light's level unchanged, then on = LOW, off = HIGH on v3; the rollback keeps the
+  level; an output not handed over is driven again by v1's first pass; every incomplete entry refused in words; an
+  output port never read. Against 0.4.0 (`7078607`) 10 of the 13 fail — "DID NOT RAISE CompileError" for the 12:42
+  bundle. Changed for the new behaviour: `test_v3_corners.py` (a driven line that would become an input is refused; a
+  dropped output is kept driven, then its line may be read; a moved output whose old line would become an input is
+  refused), `test_v3_language_switch.py` (a switch to v3 that would let go of a driven line is refused; back on v1 an
+  undriven line is kept driven off), `test_v3_runtime.py` (a card that leaves the bundle: its line kept driven; the
+  default farm's Broadcom-numbered GPIO 17 is not the pump house's line 17 — that switch is refused), and every
+  hand-written v3 entry states its active level (and an AI entry its direction), as the contract now requires. Whole
+  suite: 1012 passed.
+
 ## 0.4.0 (2026-10-17)
 
 **Bundle v3 — layout rules, the instruction, the built-ins (ADR-029, contracts v1.15.0, programs/README.md §7).**

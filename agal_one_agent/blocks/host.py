@@ -61,8 +61,9 @@ import time
 from typing import Callable, Optional
 
 from .clock import Clock, SystemClock
-from .io import IOAdapter, PortRef, physical_port
+from .io import IOAdapter, PortRef, describe_port, physical_port
 from .runtime import BlockRuntime, CompileError, EventSink
+from .v3 import program as P3
 from .v3.runtime import RuntimeV3
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,62 @@ SWITCH_JOIN_S = 10.0
 SWITCH_WAIT_S = SWITCH_JOIN_S + 5.0
 SWITCH_THREAD = "language-switch"
 SWITCHING_REFUSAL = "refused: the node is changing its block language — send it again in a moment"
+
+
+def v1_lines(aabs: dict) -> dict:
+    """physical line → (role "out" | "in", activeLow, assetId, sourceKey, transport) of a language-1 program's AABs (its
+    node variables: the variable's direction, its activeLow over the port's — blocks/runtime.py)."""
+    out: dict = {}
+    for aid in sorted(aabs):
+        for v in aabs[aid].vars.values():
+            port = getattr(v, "port", None)
+            if port is None:
+                continue
+            t = port.transport
+            out[physical_port(t)] = ("out" if t.get("direction") == "out" else "in", bool(t.get("activeLow")), aid, port.source_key, t)
+    return out
+
+
+def v3_lines(prog) -> dict:
+    """The same for a language-3 program (its cards' port entries; a valve's coil is an output)."""
+    out: dict = {}
+    if prog is None:
+        return out
+    for aid in prog.card_order:
+        for sk, ref in prog.cards[aid].ports.items():
+            t = ref.transport
+            out[physical_port(t)] = ("out" if P3.is_output_port(t) else "in", bool(t.get("activeLow")), aid, sk, t)
+    return out
+
+
+def switch_refusal(old: dict, new: dict, to_language: int) -> Optional[str]:
+    """Why the node refuses a switch of language that would change a line (contracts v1.15.3, programs/README.md §7.5a), in
+    its own words naming the card and the port — or None. Refused: a line the running program drives that the new one
+    reads (it would be let go of, to its pull: an active-low relay energises on a pulled-down line — the Pump house,
+    2026-10-17) or, switching to language 3, does not drive at all; a line the running program reads that the new one
+    drives; a line both drive at another active level (inverted). Nothing is touched: the running program stays."""
+    for line in sorted(old, key=str):
+        role, low, aid, sk, t = old[line]
+        n = new.get(line)
+        where = f"{sk} of card {aid} ({describe_port(t)})"
+        if role == "out":
+            if n is None:
+                if to_language == 3:
+                    return (f"refused: {where} is driven by the running program and the language-3 program does not drive it — "
+                            "the node does not let go of a driven line at a switch of language; the running program stays")
+                continue
+            if n[0] == "in":
+                return (f"refused: {where} is driven by the running program and the language-{to_language} program would read it "
+                        f"as an input ({n[3]} of card {n[2]}) — the node never lets go of a driven line to its pull; the running "
+                        "program stays")
+            if n[1] != low:
+                return (f"refused: {where} is driven {'active low' if low else 'active high'} by the running program and "
+                        f"{'active low' if n[1] else 'active high'} by the language-{to_language} program — it would be "
+                        "inverted; the running program stays")
+        elif n is not None and n[0] == "out":
+            return (f"refused: {where} is read by the running program and the language-{to_language} program would drive it "
+                    f"({n[3]} of card {n[2]}) — the line would change direction; the running program stays")
+    return None
 
 
 def bundle_language(bundle: dict) -> int:
@@ -196,13 +253,22 @@ class ProgramHost:
                 raise CompileError("refused: the E-stop is latched at the panel — the node does not leave block "
                                    "language 3 while it is latched; it clears only at the panel")
             if target is self.v3:
-                from .v3 import program as P3
                 prog3 = P3.build(bundle, self.io)  # raises CompileError: the running v1 program stays
                 refusal = self.v3.latch_refusal(prog3)  # a latch the v3 runtime persisted before (a switch back and forth)
                 if refusal:
                     raise CompileError(refusal)
+                # 0.4.1 (contracts v1.15.3): a v1 line the v3 program would let go of, read, drive or invert is refused here,
+                # before anything stops — no line is touched and the v1 program runs on.
+                refusal = switch_refusal(v1_lines(self.v1.aabs) if self.v1.loaded else {}, v3_lines(prog3), 3)
+                if refusal:
+                    raise CompileError(refusal)
             else:
-                target._build(bundle)
+                aabs = target._build(bundle)[0]
+                # 0.4.1: the switch back (a rollback) is refused for a line that would change direction or be inverted; a
+                # line the v1 program does not drive is switched off and kept driven at off (never let go of to a pull).
+                refusal = switch_refusal(v3_lines(self.v3.prog) if self.v3.loaded else {}, v1_lines(aabs), 1)
+                if refusal:
+                    raise CompileError(refusal)
             self._pending = bundle
             why = self._hold_reason()
             running = old._running
@@ -351,7 +417,9 @@ class ProgramHost:
             self.active = target
             if start:
                 target.start()  # its threads start now; its first pass waits for this lock
-            # What the new program does not drive is let go of, switched off — as at any reload (README §4.8).
+            # What the new program does not drive is switched off and KEPT DRIVEN at off (0.4.1, contracts v1.15.3 —
+            # README §7.5a): never let go of to its pull, where an active-low relay board energises. The switch to
+            # language 3 never gets here with one (switch_refusal refused it); a rollback can (a card with no v1 program).
             now_lines = target.output_lines()
             for key, c in sorted(carried.items()):
                 port = c["port"]
@@ -359,11 +427,10 @@ class ProgramHost:
                     continue
                 try:
                     self.io.write_output(port, False if not isinstance(c["value"], float) else 0.0)
-                    self.io.release_output(port)
                 except Exception as e:  # noqa: BLE001
-                    logger.error("letting go of %s of card %s failed: %s", key[1], key[0], e)
+                    logger.error("switching off %s of card %s failed: %s", key[1], key[0], e)
                     continue
-                logger.info("output %s.%s is not in the language-%d program: switched off and let go of", key[0], key[1], lang)
+                logger.info("output %s.%s is not in the language-%d program: switched off and kept driven at off", key[0], key[1], lang)
                 self.sink.event("output_released", {"assetId": key[0], "sourceKey": key[1], "level": "off"})
             logger.warning("program v%s: the node now runs block language %d (it took over without switching an output)",
                            bundle.get("version"), lang)

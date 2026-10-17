@@ -25,7 +25,8 @@ EIGHT = datetime(2026, 10, 15, 8, 0, tzinfo=TZ)  # no run in progress
 
 def with_lamp(bundle: dict) -> dict:
     bundle["assets"].append({"assetId": LAMP, "assetType": "lighting_circuit", "name": "Yard light",
-                             "ports": {"device.power": {"kind": "gpio", "chip": "pinctrl-bcm2835", "line": 24, "direction": "out"}}})
+                             "ports": {"device.power": {"kind": "gpio", "chip": "pinctrl-bcm2835", "line": 24, "direction": "out",
+                                                        "activeLow": False}}})
     return bundle
 
 
@@ -170,7 +171,8 @@ def test_no_run_in_progress_releases_now_and_an_off_output_is_simply_let_go_of()
     assert b2.writes_since(m) == [] and [e["assetId"] for e in b2.events_since(m, "output_released")] == [PUMP]
 
 
-def test_a_card_that_leaves_the_bundle_is_switched_off_and_its_line_freed():
+def test_a_card_that_leaves_the_bundle_is_switched_off_and_its_line_kept_driven():
+    """0.4.1 (contracts v1.15.3, README §7.5a): switched off and kept driven at off — never let go of to its pull."""
     b = Bench(with_lamp(pumphouse()), start=EIGHT)
     b.step()
     assert b.rt.apply_command({"type": "setPower", "assetId": LAMP, "sourceKey": "device.power", "value": 1})["accepted"]
@@ -180,7 +182,7 @@ def test_a_card_that_leaves_the_bundle_is_switched_off_and_its_line_freed():
     b.rt.compile(nxt(b.rt.bundle, lambda x: x.update(assets=[a for a in x["assets"] if a["assetId"] != LAMP])))
     b.run(1)
     assert b.writes_since(m) == [{"assetId": LAMP, "sourceKey": "device.power", "value": False}]
-    assert (LAMP, "device.power") in [(a, k) for a, k, _ in b.io.released]
+    assert b.io.released == []
     assert [e["assetId"] for e in b.events_since(m, "output_released")] == [LAMP]
 
 
@@ -366,6 +368,14 @@ def test_the_migration_switches_language_a_bad_v3_bundle_keeps_v1_running(tmp_pa
     with pytest.raises(CompileError):
         h.compile(bad)
     assert h.language == 1 and h.version == 1
+    # 0.4.1 (contracts v1.15.3): the default farm drives GPIO 17 by its Broadcom number, which the pump house's bundle
+    # (lines of pinctrl-bcm2835) does not drive — a switch that would let go of a driven line is refused.
+    with pytest.raises(CompileError, match=r"pump-1 \(GPIO 17\) is driven by the running program and the language-3 program does not drive it"):
+        h.compile(pumphouse(5))
+    assert h.language == 1 and h.version == 1
+    # A v1 program that drives nothing (its cards unlinked first) hands over.
+    h.compile({"version": 2, "compiledAt": "2026-10-15T05:00:00Z", "timezone": "Asia/Kolkata", "nab": {"variables": [], "schedules": [], "rules": []},
+               "assets": []})
     h.compile(pumphouse(5))
     assert h.language == 3 and h.version == 5 and not h.v1._running
 

@@ -246,6 +246,15 @@ class HardwareIO(IOAdapter):
         return False
 
     def read_input(self, port: PortRef) -> Any:
+        if port.transport.get("direction") == "out":
+            # 0.4.1 (contracts v1.15.3, README §7.5a): an output port is never opened as an input — a read here would
+            # close the line's output request and request it as an input, letting go of what the program drives.
+            key = (port.asset_id, port.source_key, "output read")
+            if key not in self._bias_warned:
+                self._bias_warned.add(key)
+                logger.error("%s of card %s (%s) is an output: it is not read as an input", port.source_key, port.asset_id,
+                             describe_port(port.transport))
+            return None
         sensor = self._sensors.get(port.source_key)
         if sensor is not None:
             try:

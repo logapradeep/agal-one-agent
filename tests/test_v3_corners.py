@@ -31,7 +31,8 @@ ACTOR = {"uid": "u_owner01", "via": "app"}
 
 
 def line(n: int, direction: str) -> dict:
-    return {"kind": "gpio", "chip": "pinctrl-bcm2835", "line": n, "direction": direction}
+    # 0.4.1 (contracts v1.15.3): every GPIO entry states its active level.
+    return {"kind": "gpio", "chip": "pinctrl-bcm2835", "line": n, "direction": direction, "activeLow": False}
 
 
 def with_lamp(bundle: dict, n: int = 24) -> dict:
@@ -296,7 +297,7 @@ def test_a_continuous_valve_made_latching_on_its_line_while_open_has_its_coil_wr
 @pytest.mark.parametrize("aid", [MAINS, UPS])
 def test_an_analog_input_is_refused_as_a_power_or_supply_sense(aid):
     bundle = pumphouse()
-    card(bundle, aid)["ports"]["sensor.power"] = {"kind": "i2c", "busId": 1, "addr": 72, "channel": 2, "driver": "ads1115",
+    card(bundle, aid)["ports"]["sensor.power"] = {"kind": "i2c", "busId": 1, "addr": 72, "channel": 2, "driver": "ads1115", "direction": "in",
                                                   "measure": {"mode": "ac_rms", "windowMs": 100}, "unit": "V"}
     with pytest.raises(CompileError, match="analog input"):
         Bench(bundle)
@@ -358,26 +359,55 @@ def test_a_run_removed_during_a_power_cut_runs_its_end_actions_when_the_power_is
 
 # ================================================ a line taken by an input or a coil
 
-def test_a_removed_output_whose_line_becomes_an_input_is_switched_off_before_it_is_read():
+def test_a_driven_line_that_would_become_an_input_is_refused_and_untouched():
+    """0.4.1 (contracts v1.15.3, README §7.5a): a reload that would read as an input a line the running program drives
+    is refused in the node's words — nothing is written or let go of, the lamp stays on, the program stays. (0.4.0 wrote
+    it off and freed it: on an active-low relay, freed to a pulled-down line, that is ON.)"""
     b = Bench(with_lamp(pumphouse()), start=EIGHT)
     b.step()
     assert b.rt.apply_command({"type": "setPower", "assetId": LAMP, "sourceKey": "device.power", "value": 1})["accepted"]
     b.run(1)
     assert b.physical(LAMP, "device.power") is True
+    version = b.rt.version
 
     def door(x):
         x["assets"] = [a for a in x["assets"] if a["assetId"] != LAMP]
         x["assets"].append({"assetId": DOOR, "assetType": "sensor", "name": "Door", "ports": {"sensor.contact": line(24, "in")}})
     m = b.mark()
-    b.rt.compile(nxt(b.rt.bundle, door))
-    # Written off and let go of as the take-over is committed: before any pass (or the sampler) reads line 24.
-    assert b.writes_since(m) == [{"assetId": LAMP, "sourceKey": "device.power", "value": False}]
-    assert (LAMP, "device.power") in [(a, k) for a, k, _ in b.io.released]
+    with pytest.raises(CompileError, match=r"device\.power of card asset_lamp0001 \(line 24 of pinctrl-bcm2835\) is driven by the "
+                                           r"running program and this program would read it as an input"):
+        b.rt.compile(nxt(b.rt.bundle, door))
+    b.run(2)
+    assert b.writes_since(m) == [] and b.io.released == [] and b.physical(LAMP, "device.power") is True
+    assert b.rt.version == version
+
+
+def test_a_removed_output_is_switched_off_and_kept_driven_then_its_line_may_be_read():
+    """0.4.1: an output a reload drops is written off and its line KEPT DRIVEN at off (never let go of to its pull,
+    output_released); a later program may then read that line — the running program no longer drives it."""
+    b = Bench(with_lamp(pumphouse()), start=EIGHT)
+    b.step()
+    assert b.rt.apply_command({"type": "setPower", "assetId": LAMP, "sourceKey": "device.power", "value": 1})["accepted"]
     b.run(1)
+
+    def gone(x):
+        x["assets"] = [a for a in x["assets"] if a["assetId"] != LAMP]
+    m = b.mark()
+    b.rt.compile(nxt(b.rt.bundle, gone))
+    b.run(1)
+    assert b.writes_since(m) == [{"assetId": LAMP, "sourceKey": "device.power", "value": False}]
+    assert b.io.released == []
     assert [(e["assetId"], e["level"]) for e in b.events_since(m, "output_released")] == [(LAMP, "off")]
 
+    def door(x):
+        x["assets"].append({"assetId": DOOR, "assetType": "sensor", "name": "Door", "ports": {"sensor.contact": line(24, "in")}})
+    b.rt.compile(nxt(b.rt.bundle, door))
+    b.io.set_input(DOOR, "sensor.contact", True)
+    b.run(1)
+    assert b.rt.prog.cards[DOOR].ports["sensor.contact"].transport["direction"] == "in"
 
-def test_a_moved_output_whose_old_line_becomes_an_input_is_switched_off_there():
+
+def test_a_moved_output_whose_old_line_would_become_an_input_is_refused():
     b = Bench(with_lamp(pumphouse()), start=EIGHT)
     b.step()
     assert b.rt.apply_command({"type": "setPower", "assetId": LAMP, "sourceKey": "device.power", "value": 1})["accepted"]
@@ -387,12 +417,10 @@ def test_a_moved_output_whose_old_line_becomes_an_input_is_switched_off_there():
         card(x, LAMP)["ports"]["device.power"] = line(25, "out")
         x["assets"].append({"assetId": DOOR, "assetType": "sensor", "name": "Door", "ports": {"sensor.contact": line(24, "in")}})
     m = b.mark()
-    b.rt.compile(nxt(b.rt.bundle, move))
+    with pytest.raises(CompileError, match="would read it as an input"):
+        b.rt.compile(nxt(b.rt.bundle, move))
     b.run(1)
-    w = b.writes_since(m)
-    assert w[0] == {"assetId": LAMP, "sourceKey": "device.power", "value": False}  # line 24, at the commit
-    assert w[1:] == [{"assetId": LAMP, "sourceKey": "device.power", "value": True}]  # line 25, at the switch pass
-    assert b.io.released[-1][2]["line"] == 24
+    assert b.writes_since(m) == [] and b.io.released == [] and b.physical(LAMP, "device.power") is True
 
 
 def test_an_output_whose_line_is_reused_by_another_output_is_set_by_that_outputs_first_write():
@@ -417,7 +445,7 @@ def test_a_plain_output_that_becomes_a_guarded_motor_while_on_is_judged_from_the
     bundle = pumphouse()
     bundle["assets"].append({"assetId": M2, "assetType": "relay", "name": "Pump 2", "ports": {
         "device.power": line(24, "out"),
-        "sensor.current": {"kind": "i2c", "busId": 1, "addr": 72, "channel": 1, "driver": "ads1115",
+        "sensor.current": {"kind": "i2c", "busId": 1, "addr": 72, "channel": 1, "driver": "ads1115", "direction": "in",
                            "measure": {"mode": "ac_rms", "windowMs": 100}, "transform": {"scale": 30, "offset": 0}, "unit": "A"}}})
     b = Bench(bundle, start=EIGHT)
     b.io.set_input(M2, "sensor.current", 5.0)

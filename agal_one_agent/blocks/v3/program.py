@@ -10,6 +10,8 @@ What the node refuses (the bundle is rejected and the previous program keeps run
 (README §7.4) is the first line; these are the ones a node can see for itself:
 
 * a malformed bundle, a port this node does not have, a name that resolves to nothing;
+* (0.4.1, contracts v1.15.3) a port entry that states no direction, or one that is neither ``in`` nor ``out``, or an
+  output that states no ``activeLow`` (:func:`entry_refusal`) — never read as an input by default;
 * a motor card without its guard (a motor is never compiled without one);
 * one physical line claimed by two cards, or two ports of one card, one of which drives it (RBAC-01);
 * a block that writes around a built-in: a valve's coil port, or a motor port other than the one its
@@ -83,6 +85,31 @@ class Card:
 
 def is_output_port(t: dict) -> bool:
     return (t or {}).get("direction") == "out" or (t or {}).get("kind") == "pwm"
+
+
+def entry_refusal(aid: str, sk: str, t: dict) -> Optional[str]:
+    """Why a port entry is not complete (contracts v1.15.3, programs/README.md §7.2 *Every port entry is complete*;
+    automation-block.schema.json CompiledTransport), in the node's own words naming the card and the port — or None.
+    Every entry states its direction, ``in`` or ``out`` (a PWM port is an output by its kind), and an output its active
+    level. An entry with no direction is never taken as an input: agent 0.4.0 did, for the Pump house's DO1 on
+    2026-10-17 — it let go of the Light's active-low relay (the line fell to its pull and the relay energised) and
+    refused every switch."""
+    where = f"{sk} of card {aid} ({describe_port(t)})"
+    d = t.get("direction")
+    kind = str(t.get("kind", "gpio"))
+    if kind == "pwm":
+        if d not in (None, "out"):
+            return f"refused: {where} is a PWM port, which is an output — the bundle says direction {d!r}"
+        return None
+    if d is None:
+        return (f"refused: {where} states no direction — the node is never left to guess whether it drives a port or "
+                "reads it (a program compiled before contracts v1.15.3); the running program stays")
+    if d not in ("in", "out"):
+        return f"refused: {where} states direction {d!r}, which is neither in nor out; the running program stays"
+    if d == "out" and not isinstance(t.get("activeLow"), bool):
+        return (f"refused: {where} is an output that states no active level (activeLow) — the node does not guess "
+                "whether on is HIGH or LOW; the running program stays")
+    return None
 
 
 def is_digital_input(t: dict) -> bool:
@@ -306,6 +333,9 @@ def _build(bundle: dict, io: IOAdapter) -> Program:
         for sk, t in (a.get("ports") or {}).items():
             if not isinstance(t, dict):
                 raise CompileError(f"{aid}.{sk}: the port has no transport")
+            why = entry_refusal(aid, sk, t)
+            if why:
+                raise CompileError(why)
             ref = _port_ref(aid, sk, t, card.asset_type, safety_keys)
             if not io.has_port(ref):
                 raise CompileError(f"{aid}: this node has no port for '{sk}' ({describe_port(t)})")

@@ -8,7 +8,9 @@ setup(
     # 0.4.0 (unreleased, not tagged): bundle v3 — layout rules, the instruction, the built-ins (ADR-029,
     # contracts v1.15.0) beside the language-1 runtime; reports capabilities.blockLanguage = 3. Built on
     # 0.3.4 (released 2026-10-16: signed commands, archive OTA, events over HTTPS, join safety).
-    version="0.4.0",
+    # 0.4.1 (unreleased, not tagged): every port entry of a v3 bundle is complete (contracts v1.15.3) — the node refuses an
+    # entry with no direction or active level, and a switch that would let go of, read, drive or invert a line.
+    version="0.4.1",
     packages=find_packages(),
     install_requires=[
         "paho-mqtt>=2.0.0",

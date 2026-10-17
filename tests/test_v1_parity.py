@@ -139,7 +139,7 @@ def _first_difference(a: list, b: list) -> str:
 
 def _assert_same(old: dict, new: dict) -> dict:
     assert old["version"] == "0.3.4", old["version"]
-    assert new["version"] == "0.4.0", new["version"]  # the tree's own version (the driver ignores installed metadata)
+    assert new["version"] == "0.4.1", new["version"]  # the tree's own version (the driver ignores installed metadata)
     _block_language_taken_out(old["records"], None)
     _block_language_taken_out(new["records"], 3)
     so, sn = _streams(old), _streams(new)
@@ -225,7 +225,7 @@ def test_the_wave_1_commands_reach_a_v3_program_only_through_the_signed_command_
     node) go through the 0.3.4 event queue with an eventId; every status names 0.4.0 and blockLanguage 3."""
     data = drives["0.4.0 v3-gate"]
     recs = data["records"]
-    assert data["version"] == "0.4.0"
+    assert data["version"] == "0.4.1"
     https = [r for r in recs if r["kind"] == "https"]
 
     # The cold start of the pump house: Valve 2 (latching) cannot be vouched for — FAULT, posted as a node event.
@@ -265,7 +265,7 @@ def test_the_wave_1_commands_reach_a_v3_program_only_through_the_signed_command_
     assert all(r["body"]["payload"].get("eventId") for r in https if (r.get("body") or {}).get("type") == "sensor_event")
 
     statuses = [r["body"]["payload"] for r in https if (r.get("body") or {}).get("type") == "status"]
-    assert statuses and all(s["firmwareVersion"] == "0.4.0" for s in statuses)  # the clean stop's offline one too
+    assert statuses and all(s["firmwareVersion"] == "0.4.1" for s in statuses)  # the clean stop's offline one too
     online = [s for s in statuses if s.get("online")]
     assert online and all(s["capabilities"]["blockLanguage"] == 3 for s in online)
     # After the restart the program is loaded before MQTT: its first status carries the built-ins.

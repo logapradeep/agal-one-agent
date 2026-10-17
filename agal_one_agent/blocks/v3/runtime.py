@@ -499,16 +499,21 @@ class RuntimeV3:
             if o is None:
                 continue
             out.level, out.changed_at, out.last_writer = o.level, o.changed_at, o.last_writer
-            if out.port is not None and o.port is not None and out.port.transport == o.port.transport:
+            if out.port is not None and o.port is not None and (out.port.transport == o.port.transport or (
+                    str(out.port.transport.get("kind", "gpio")) == "gpio" and same_output_line(o.port.transport, out.port.transport))):
+                # 0.4.1: the same line driven the same way — a recompile that only states what was left out before (an
+                # explicit activeLow false) writes nothing (bumpless).
                 out.written = o.written
         for key in old.outputs:
             if key not in new.outputs:
                 st.release_events.append(key)
         # Every line the old program drove, by what uses it now (§7.5: the swap switches nothing by itself, and
-        # what it lets go of is let go of switched off):
-        # * nothing — written off and freed at the switch pass;
+        # what it lets go of is switched off — 0.4.1: and kept driven at off, never let go of to its pull):
+        # * nothing — written off at the switch pass, its request kept (an active-low relay on an undriven, pulled-down
+        #   line energises — the Pump house, 2026-10-17);
         # * the same output, or the same valve coil — carried, nothing written;
-        # * an input — written off and freed as the take-over is committed, before anything reads it;
+        # * an input — REFUSED (0.4.1, contracts v1.15.3, README §7.5a): the node never turns a line it drives into one it
+        #   reads; the running program stays and no line is touched;
         # * a latching coil — the driver writes it off before any pulse ("never both coils at once");
         # * another output or a continuous coil — its first write at the switch pass sets the line.
         now_roles = self._line_roles(new)
@@ -519,10 +524,20 @@ class RuntimeV3:
             elif use == role:
                 continue
             elif use[0] == "in":
-                if level is not False:
-                    st.commit_offs.append((port, is_motor))
+                raise CompileError(f"refused: {port.source_key} of card {port.asset_id} ({describe_port(port.transport)}) is driven by "
+                                   "the running program and this program would read it as an input — the node never lets go of a "
+                                   "driven line to its pull; the running program stays")
             elif use[0] == "coil" and use[2] != "continuous":
                 new.valves[use[1]].coil_state[use[2]] = level
+        # …and a line the old program READS that the new one would drive: the line would change direction (0.4.1).
+        old_roles = self._line_roles(old)
+        for line, role in old_roles.items():
+            use = now_roles.get(line)
+            if role[0] == "in" and use is not None and use[0] != "in":
+                ref = next((r for aid in old.card_order for r in old.cards[aid].ports.values() if physical_port(r.transport) == line), None)
+                named = f"{ref.source_key} of card {ref.asset_id} ({describe_port(ref.transport)})" if ref is not None else str(line)
+                raise CompileError(f"refused: {named} is read by the running program and this program would drive it — the line "
+                                   "would change direction; the running program stays")
         # A card that becomes a guarded motor while its output is on: the guard judges it from the switch (its
         # inrush window starts now) — it is always on (§7.11).
         for aid, g in new.guards.items():
@@ -1803,8 +1818,8 @@ class RuntimeV3:
             kind = w[0]
             try:
                 if kind == "release":
+                    # 0.4.1 (contracts v1.15.3): switched off and KEPT DRIVEN at off — never let go of to its pull.
                     self.io.write_output(w[1], False)
-                    self.io.release_output(w[1])
                 elif kind == "write":
                     out = w[1]
                     self.io.write_output(out.port, w[2])
