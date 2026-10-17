@@ -74,6 +74,26 @@ def start_firmware_update(command: dict, mqtt_client, node_uid: str, outputs_on=
     return t
 
 
+def answer_program_command(command: dict, runtime, mqtt_client) -> None:
+    """A command the running program answers: runPlot / stopPlot / setVariable, and — on a language-3 program —
+    resetValve / pauseAutomation / resumeAutomation. The runtime checks it now; a refusal is acked ``failed`` in its
+    words. An accepted command is applied at the start of the next pass and acked ``completed`` here, now — except a
+    ``resetValve``: its pass answers it (blocks/v3/runtime.py ``_cmd_reset``, through the sink into the same HTTPS
+    ack queue), ``completed`` only once the close pulse has run and the valve is out of FAULT (or, for a valve an
+    earlier reset already cleared, with no pulse) and ``failed`` in the node's words when that pass refuses it or
+    cannot carry it out. Nothing is acked for it on acceptance: the document stays ``sent`` for the pass (≤ 1 s), so
+    its one post is the final one (contracts v1.15.2 item 15, functions.yaml resetValve 1.11.3)."""
+    command_id = command.get("commandId", "")
+    if runtime is None or not runtime.loaded:
+        mqtt_client.publish_command_ack(command_id, "failed", error="no automation program loaded")
+        return
+    result = runtime.apply_command(command)
+    if not result.get("accepted"):
+        mqtt_client.publish_command_ack(command_id, "failed", error=result.get("reason"))
+    elif command.get("type") != "resetValve":
+        mqtt_client.publish_command_ack(command_id, "completed")
+
+
 def outputs_on_for(runtime) -> list:
     """What the node has ON now — the program's outputs and runs (a language-1 program's plot runs, a
     language-3 program's schedule runs, its open valves and pulses), and the legacy GPIO / PWM outputs —
@@ -587,14 +607,7 @@ def main():
         v3_command = cmd_type in ("resetValve", "pauseAutomation", "resumeAutomation") and \
             runtime is not None and runtime.loaded and runtime.language == 3
         if cmd_type in ("runPlot", "stopPlot", "setVariable") or v3_command:
-            if runtime is None or not runtime.loaded:
-                mqtt_client.publish_command_ack(command_id, "failed", error="no automation program loaded")
-                return
-            result = runtime.apply_command(command)
-            if result.get("accepted"):
-                mqtt_client.publish_command_ack(command_id, "completed")
-            else:
-                mqtt_client.publish_command_ack(command_id, "failed", error=result.get("reason"))
+            answer_program_command(command, runtime, mqtt_client)
             return
 
         # setPower / setPortValue: is the port linked to the card the command names (RBAC-01)?

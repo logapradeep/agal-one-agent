@@ -9,6 +9,8 @@ the motor guards wait for. So no sink call does network I/O on the caller's thre
 
 * ``variables`` / ``outputs`` → the budgeted ``_VariableUploader`` queue (as since 0.2.x);
 * ``event`` → ``AgalOneMqttClient.publish_event`` → ``node_events.NodeEvents`` (as since 0.3.4);
+* ``command_ack`` (a v3 ``resetValve``'s answer from its pass) → ``AgalOneMqttClient.publish_command_ack`` →
+  ``command_acks.CommandAcks``, the queue every command ack takes (contracts v1.15.2 item 15);
 * ``program_ack`` and ``alert`` → ``_Outbox`` (new): until this review both posted over HTTPS (``urlopen``, 10 s
   timeout) on the runtime thread — the first pass after every program load, in released 0.3.4 too;
 * the MQTT copies are paho ``publish`` calls, which only queue the packet (paho 2.x with ``loop_start``: an in-memory
@@ -338,6 +340,17 @@ class CloudSink(EventSink):
                                      "sourceKey": payload.get("assetId") or payload.get("plotId") or ""})
         except Exception as e:  # noqa: BLE001
             logger.debug("event mqtt: %s", e)
+
+    def command_ack(self, command_id: str, status: str, error: Optional[str] = None) -> None:
+        """The final ack of a command a pass carried out itself — a v3 ``resetValve``, ``completed`` after its close
+        pulse or ``failed`` in the node's words (contracts v1.15.2 item 15, functions.yaml resetValve 1.11.3).
+        Through the one call every ack takes, ``AgalOneMqttClient.publish_command_ack``: its HTTPS leg is the node's
+        ack queue (``command_acks.CommandAcks`` — a lock and a deque here; its own worker posts it, retried for
+        5 minutes), its MQTT copy a paho ``publish`` (queued). Never waits on the network."""
+        try:
+            self.mqtt.publish_command_ack(command_id, status, error=error)
+        except Exception as e:  # noqa: BLE001 — an ack that cannot be queued never fails the pass
+            logger.error("command ack %s %s not queued: %s", command_id, status, e)
 
     def log(self, text: str, asset_id: Optional[str] = None) -> None:
         logger.info("program%s: %s", f" [{asset_id}]" if asset_id else "", text)

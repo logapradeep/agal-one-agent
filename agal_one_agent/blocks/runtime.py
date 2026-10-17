@@ -60,6 +60,9 @@ class EventSink:
     # Contracts v1.15.1 (functions.yaml 1.11.2 `variables.outputs`): a language-3 program has no variables to
     # report, so it reports each card's outputs. A language-1 program never calls this.
     def outputs(self, asset_id: str, levels: dict[str, Any]) -> None: ...
+    # Contracts v1.15.2 item 15 (functions.yaml resetValve 1.11.3): a command a pass answers itself — a v3
+    # resetValve, completed after its close pulse or failed in the node's words. A language-1 program never calls it.
+    def command_ack(self, command_id: str, status: str, error: Optional[str] = None) -> None: ...
 
 
 class RecordingSink(EventSink):
@@ -74,6 +77,7 @@ class RecordingSink(EventSink):
         self.acks: list[dict] = []
         self.sources: list[str] = []  # the event source of each entry of `events` (program, node)
         self.outputs_log: list[tuple[str, dict]] = []
+        self.command_acks: list[dict] = []
 
     def variables(self, asset_id, values):
         self.variables_log.append((asset_id, dict(values)))
@@ -96,6 +100,9 @@ class RecordingSink(EventSink):
 
     def outputs(self, asset_id, levels):
         self.outputs_log.append((asset_id, dict(levels)))
+
+    def command_ack(self, command_id, status, error=None):
+        self.command_acks.append({"commandId": command_id, "status": status, "error": error})
 
 
 # ============================================================ compiled model

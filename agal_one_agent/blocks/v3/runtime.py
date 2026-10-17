@@ -37,7 +37,7 @@ from typing import Any, Callable, Optional
 
 from .. import expr as E
 from ..clock import Clock, SystemClock
-from ..io import IOAdapter, PortRef, SimulatedIO, physical_port, same_output_line
+from ..io import IOAdapter, PortRef, SimulatedIO, describe_port, physical_port, same_output_line
 from ..runtime import CompileError, EventSink, _coerce, _signature
 from ..sun import sun_event_local
 from . import program as P
@@ -57,6 +57,8 @@ LATCH_KEPT = ("refused: the E-stop is latched at the panel — a program without
               "it clears only at the panel")
 UNREADABLE = "__unreadable__"
 STATE_WRITER_THREAD = "v3-state-writer"
+# A reset accepted but never carried out: the runtime stopped before a pass ran it (contracts v1.15.2 item 15).
+RESET_STOPPED = "the node stopped before the reset ran: no close pulse sent"
 
 
 def _iso(dt: Optional[datetime]) -> Optional[str]:
@@ -211,6 +213,9 @@ class RuntimeV3:
         self._booted = False
         self._applied_pending = False
         self._pending_commands: list[dict] = []
+        # The answers of the commands a pass carried out itself — a resetValve's (contracts v1.15.2 item 15):
+        # (commandId, status, the node's words), handed to the sink when the pass ends.
+        self._pass_acks: list[tuple[str, str, Optional[str]]] = []
         self._persist_due = False
         self._last_persist: Optional[float] = None
         self._clean_stop_persisted = False
@@ -731,6 +736,12 @@ class RuntimeV3:
             self._persist(clean=True, wait=wait_record)
             self._cold = True
             self._booted = False
+            # A reset accepted but not carried out — no pass ran it — is answered, never left in flight (and never
+            # pulsed by a later start of this runtime).
+            for c in [c for c in self._pending_commands if c.get("type") == "resetValve"]:
+                self._answer(c, "failed", RESET_STOPPED)
+            self._pending_commands = [c for c in self._pending_commands if c.get("type") != "resetValve"]
+        self._send_acks()
 
     def apply_safe_state(self) -> None:
         """A clean stop: every motor and every other output whose safeState is off is switched off, each
@@ -797,6 +808,32 @@ class RuntimeV3:
     # --------------------------------------------------------------- the pass
 
     def step(self) -> None:
+        """One pass, then the answers of the commands it carried out (a resetValve's) — handed over even when the
+        pass fails half-way, so an accepted reset is never left without one."""
+        try:
+            self._step()
+        finally:
+            self._send_acks()
+
+    def _answer(self, c: dict, status: str, error: Optional[str] = None) -> None:
+        """Record a command's final answer for the end of the pass (a command with no commandId has no document)."""
+        cid = c.get("commandId")
+        if cid:
+            self._pass_acks.append((str(cid), status, None if error is None else str(error)[:500]))
+
+    def _send_acks(self) -> None:
+        """Hand the pass's command answers to the sink — after its events (the valve_reset of the same pass) — whose
+        ack queue posts them (blocks/cloud.py CloudSink.command_ack; command_acks.py). Nothing here waits on the
+        network (README §4.8); outside the runtime lock."""
+        with self._lock:
+            acks, self._pass_acks = self._pass_acks, []
+        for cid, status, error in acks:
+            try:
+                self.sink.command_ack(cid, status, error)
+            except Exception as e:  # noqa: BLE001 — an answer that cannot be handed over never fails the pass
+                logger.error("command %s: its %s ack could not be handed over: %s", cid, status, e)
+
+    def _step(self) -> None:
         with self._lock:
             p, st = self.prog, self.st
             if p is None:
@@ -1977,18 +2014,40 @@ class RuntimeV3:
             return {"accepted": True}
 
     def _refuse_reset(self, aid) -> Optional[str]:
+        """Why a reset of `aid` is refused now (when it arrives, and again at the pass that would carry it out), or
+        None. A latching valve that is not in FAULT is not refused: its reset is answered completed with no pulse at
+        the pass — a reset is idempotent (contracts v1.15.2 item 15). A latched E-stop is no refusal (README §7.10)."""
         p = self.prog
         drv = p.valves.get(aid) if aid else None
         if drv is None or not drv.latching:
             return f"refused: {aid} is not a latching valve of this node"
         if not drv.fault:
-            # Only a valve in FAULT is reset (the cloud refuses not_in_fault too): a close pulse on a healthy open
-            # valve would close it under a running block.
-            return f"refused: {drv.name} is not in fault"
+            return None
         v = self._input(drv.supply)
         if v is None or not bool(v):
-            return f"refused: the valve's supply ({drv.supply[1]} of card {drv.supply[0]}) is not present"
+            return f"refused: the valve's supply on {self._supply_words(drv)} is not present"
         return None
+
+    def _supply_port(self, drv) -> Optional[PortRef]:
+        card = self.prog.cards.get(drv.supply[0]) if drv.supply else None
+        return card.ports.get(drv.supply[1]) if card is not None else None
+
+    def _supply_words(self, drv) -> str:
+        """A latching valve's supply sense named by its PORT as the node knows it — its chip line (``line 13 of
+        pinctrl-bcm2835``; a bus input by its bus address: io.describe_port) — never a card id: a commandAck has no
+        structured field for the card, and the bundle carries no node port id (contracts v1.15.2 item 15)."""
+        port = self._supply_port(drv)
+        return describe_port(port.transport) if port is not None else "its sense input"
+
+    def _read_supply(self, drv):
+        """The supply sense read now (after a pulse), as the pulse path reads it; None when it cannot be read."""
+        port = self._supply_port(drv)
+        if port is None:
+            return None
+        try:
+            return self.io.read_input(port)
+        except Exception:  # noqa: BLE001
+            return None
 
     def _apply_commands(self, now: float, wall: datetime) -> None:
         cmds, self._pending_commands = self._pending_commands, []
@@ -1998,7 +2057,7 @@ class RuntimeV3:
                 if t in ("setPower", "setPortValue"):
                     self._cmd_switch(c, now)
                 elif t == "resetValve":
-                    self._cmd_reset(c, now, wall)
+                    self._answer(c, *self._cmd_reset(c, now, wall))
                 elif t == "pauseAutomation":
                     self._cmd_pause(c, now, wall)
                 elif t == "resumeAutomation":
@@ -2012,6 +2071,8 @@ class RuntimeV3:
                 logger.warning("command %s refused at the pass: %s", t, e)
             except Exception as e:  # noqa: BLE001
                 logger.error("command %s failed: %s", t, e, exc_info=True)
+                if t == "resetValve":
+                    self._answer(c, "failed", f"the reset could not be carried out: {e}")
 
     def _cmd_switch(self, c: dict, now: float) -> None:
         st = self.st
@@ -2038,14 +2099,24 @@ class RuntimeV3:
             st.manual_timers.pop(out.key, None)
         self._persist_due = True
 
-    def _cmd_reset(self, c: dict, now: float, wall: datetime) -> None:
+    def _cmd_reset(self, c: dict, now: float, wall: datetime) -> tuple[str, Optional[str]]:
+        """The reset, at the pass (README §7.9), and its answer (contracts v1.15.2 item 15; functions.yaml resetValve
+        1.11.3): ("completed", None) once the close pulse has run, the valve is recorded closed and its FAULT is
+        cleared — or, for a latching valve no longer in FAULT, with no pulse; ("failed", the node's words) when the
+        reset is refused at this pass or cannot be carried out. The ack goes out with the pass's reports."""
         aid = c.get("assetId")
         refusal = self._refuse_reset(aid)
         if refusal:
+            # Accepted when it arrived, refused now: the state changed in between (the supply dropped, a reload).
             logger.warning("resetValve %s refused at the pass: %s", aid, refusal)
-            return
+            return "failed", refusal
         p = self.prog
         drv = p.valves[aid]
+        if not drv.fault:
+            # Idempotent: an earlier reset cleared it (the cloud's mirror had not caught up, or two people pressed
+            # Reset). No pulse — a close pulse on a valve out of FAULT could close it under a running block.
+            logger.info("resetValve %s: %s is not in fault (already reset) — answered completed, no pulse sent", aid, drv.name)
+            return "completed", None
         out = p.outputs[(aid, P.VALVE_OPEN)]
         resumed = [b.ref() for b in p.blocks() if aid in b.uses_valves and b.key in self.st.held
                    and all(r == ("valve_fault", aid) for r in self.st.held[b.key])]
@@ -2054,18 +2125,27 @@ class RuntimeV3:
             drv.fault_detail = "the open coil could not be switched off: no reset pulse sent"
             self._persist()
             logger.warning("resetValve %s at the pass: the open coil could not be switched off — no pulse sent", aid)
-            return
+            return "failed", f"the open coil could not be switched off: no close pulse sent — {drv.name} stays in fault"
         drv.pulse_mark = "close"
         if not self._persist():
             drv.pulse_mark = None
             drv.fault_detail = "the reset could not be recorded in the state directory: no pulse sent"
             logger.warning("resetValve %s at the pass: the pulse cannot be recorded — no pulse sent, the valve stays in FAULT", aid)
-            return
-        if not self._send_pulse(drv, drv.close_key):
+            return "failed", (f"the reset could not be recorded in the state directory: no close pulse sent — "
+                              f"{drv.name} stays in fault")
+        sent = self._send_pulse(drv, drv.close_key)
+        # As after any pulse (_pulse): the supply must still be there, or the pulse cannot be vouched for.
+        supplied = sent and bool(self._read_supply(drv))
+        if not supplied:
             drv.pulse_mark = None
-            drv.fault, drv.fault_detail = "pulse_cut_short", "the reset's close pulse could not be sent"
+            drv.fault = "pulse_cut_short"
+            drv.fault_detail = ("the reset's close pulse could not be sent" if not sent
+                                else "the supply was not present after the reset's close pulse")
             self._persist()
-            raise RuntimeError(f"the reset's close pulse of valve {aid} could not be sent")
+            logger.error("resetValve %s at the pass: %s — the valve stays in FAULT", aid, drv.fault_detail)
+            return "failed", (f"the close pulse could not be sent — {drv.name} stays in fault" if not sent else
+                              f"the valve's supply on {self._supply_words(drv)} was not present after the close pulse — "
+                              f"{drv.name} stays in fault")
         drv.pulse_mark = None
         drv.cleared()
         self._set_level(out, False, None, now)
@@ -2076,6 +2156,7 @@ class RuntimeV3:
             valve["by"] = by
         self._emit("valve_reset", {"valve": valve, "assetId": aid}, NODE)
         logger.warning("valve %s reset: one close pulse sent, recorded closed", aid)
+        return "completed", None
 
     def _cmd_pause(self, c: dict, now: float, wall: datetime) -> None:
         st, p = self.st, self.prog

@@ -235,6 +235,55 @@ v3 once, with the founder's yes, and can roll it back; the node's half:
     a read waits; a failed write is said to the waiting caller and logged once; the v3 → v1 switch does not wait for
     its clean-stop record and a later v3 load reads it; only the first clock probe on the caller's thread; an E-stop
     during a 1 s probe; a report stamped at its hand-over. Whole suite: 977.
+- **A valve reset is answered by the pass that carries it out (contracts v1.15.2 item 15 — functions.yaml resetValve
+  1.11.3, programs/README.md §7.9 "The reset's answer"; same version, still not tagged).** `main.py` acked a
+  `resetValve` `completed` the moment the v3 runtime ACCEPTED it — before the close pulse of the next pass — and a
+  reset that pass refused (the supply dropped meanwhile, the open coil could not be switched off, the pulse could not
+  be recorded) was only logged; a close pulse that could not be sent raised into the pass's log. So the
+  /assetCommands document said completed while the valve stayed in FAULT (SYNC.md v1.15.2 12(e)). Now:
+  - *Nothing on arrival.* The `on_command` branch for the program's own commands is a function,
+    `main.answer_program_command`: a refusal on arrival is acked `failed` in the runtime's words and every other
+    accepted command `completed`, as before — but an accepted `resetValve` is left to its pass (no ack: the document
+    stays `sent` for that pass, ≤ 1 s, so its one post is the final one).
+  - *One final answer, from the pass.* `RuntimeV3._cmd_reset` returns its outcome; the pass records it and hands it
+    to the sink after its events (`step()` is now `_step()` and then `_send_acks()`, in a `finally`, outside the
+    runtime lock — an answer is handed over even when the pass fails later on). `completed` once the close pulse has
+    run, the valve is recorded closed and its FAULT is cleared (after that pass's `valve_reset`); `failed` in the
+    node's words when the pass refuses it (the supply not sensed present; not a latching valve of this node — a
+    reload) or cannot carry it out: "the open coil could not be switched off: no close pulse sent — <valve> stays in
+    fault"; "the reset could not be recorded in the state directory: no close pulse sent — …"; "the close pulse could
+    not be sent — …"; the supply not present after the close pulse (new, as after any pulse in `_pulse`: the valve
+    stays in FAULT, `pulse_cut_short` — before, the reset's pulse alone was taken without that check); "the reset
+    could not be carried out: <error>". A reset accepted but never run — the runtime stopped first — is answered
+    `failed` at `stop()` ("the node stopped before the reset ran: no close pulse sent", `RESET_STOPPED`) and dropped,
+    so a later start never pulses it.
+  - *Idempotent.* A reset of a latching valve that is not in FAULT is no longer refused ("refused: Valve 2 is not in
+    fault"): it is accepted and its pass answers `completed` with no pulse — two people pressing Reset together, or a
+    press while the card still shows the fault (the callable refuses `not_in_fault` from the cloud's mirror). The same
+    message twice is still refused `replayed` by the gate. A latched E-stop is still no refusal (§7.10).
+  - *Through the ack queue every ack takes.* `EventSink.command_ack` (new: a no-op by default, recorded by
+    `RecordingSink`); `CloudSink.command_ack` → `AgalOneMqttClient.publish_command_ack` → `command_acks.CommandAcks`
+    (its worker posts it, retried 5 minutes) and the paho copy (queued). A pass never waits on the network: with every
+    HTTPS post stalled, the reset's pass pulsed within the same wake, the E-stop latched at once, and the `completed`
+    was posted when the ingress answered.
+  - *The port, not the card.* The supply refusal said "(sensor.power of card asset_ups00001)"; it now names the port
+    as the node knows it — "refused: the valve's supply on line 13 of pinctrl-bcm2835 is not present"
+    (`io.describe_port`, as the one-port-one-card refusal). The bundle carries no node port id, so the node cannot say
+    "DI3" (SYNC.md v1.15.2 item 15(c)); a commandAck has no structured field for the card, so no card id is kept.
+    Not changed: the `valve_fault` detail ("the supply on <sourceKey> of card <assetId> dropped").
+  - Tests: `tests/test_v3_reset_ack.py` (15) — completed only by the pass that sends the close pulse, after its
+    `valve_reset`, nothing on arrival; completed through a latched E-stop; refused at the next pass (the supply
+    dropped after arrival) in the node's words, no pulse; the words name the port and no card id; refused at the pass
+    after a reload made the valve continuous; two resets in one pass and a third later: one close pulse, three
+    completed; failed for a close pulse not sent, the supply gone after the pulse, the open coil stuck on, a state
+    directory that cannot be written, an error in carrying it out; answered even when the pass fails after it;
+    failed at a stop with no pass, and never pulsed after; `main.answer_program_command` leaves an accepted reset to
+    its pass and answers every other command at once; with the real `AgalOneMqttClient`, `CommandAcks`,
+    `NodeEvents` and `CloudSink` and every post stalled, the runtime on its own thread at the 1 s tick pulses at once,
+    latches the E-stop at once, and posts the `completed` when the ingress answers. `tests/test_v3_valves.py`: the
+    not-in-fault reset is completed with no pulse, and the supply refusal's words. Whole suite: 992 (after 07:00
+    IST — see SYNC.md v1.15.2 item 15(e)). Parity: v1-light 293 records identical in 22 streams, v1-switch 55 in 16;
+    the v3-gate session's signed reset: close pulse, then `valve_reset`, then one `completed` commandAck.
 
 **The pass (§7.5):** inputs → the built-ins (power sense, E-stop latch, valve drivers, motor guards), then the
 commands and which blocks hold → each layout's active instruction part → the rule slots → outputs written once,
@@ -260,7 +309,8 @@ class in `assets[]` order. Every card the bundle carries is sampled; digital inp
   cut short (`pulse_cut_short`), a first start or a changed configuration (`position_unknown`). While in FAULT no
   pulse is sent and only the blocks that use the valve hold (write, stop or read its `valve.open` — reading its
   built-ins is not a use), their outputs off, motors first. `resetValve` is refused while the supply is not sensed
-  (and when the valve is not in fault); otherwise one close pulse, recorded closed, and the held blocks resume by
+  (and, until "A valve reset is answered by the pass" above, when the valve is not in fault — now answered completed
+  with no pulse); otherwise one close pulse, recorded closed, and the held blocks resume by
   their schedules' own clock (`watering_resumed` cause `valve_reset`, or `run_cut_short` + `watering_not_finished`
   `valve_fault` once their planned end has passed). No time is added.
 - **The E-stop** (`v3/safety.py`, §7.10). The aux contact (`nc` or `no`; an unreadable input reads as pressed)
@@ -312,7 +362,7 @@ after a program load when runs resume after a cut (found while testing: with a l
 "a valve is open" never went false and the pump never restarted — its test fails without the fix); a run resumed
 while its part holds (a latching valve in FAULT after an unclean boot) is announced when the hold clears, not
 before; after a restart every output starts off (a latching valve known open gets one close pulse); a valve reset
-when it is not in fault is refused.
+when it is not in fault is refused (since "A valve reset is answered by the pass" above: completed, no pulse).
 
 **Review fixes (same version, still not tagged).** A review of 0.4.0 found paths where a built-in could be lost or a
 line left driven; each is fixed, with a test in `tests/test_v3_corners.py` that fails without its fix:

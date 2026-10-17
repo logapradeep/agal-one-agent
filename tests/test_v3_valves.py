@@ -175,15 +175,20 @@ def test_a_rule_that_reacts_to_the_fault_keeps_running_and_acts():
     assert [a["text"] for a in b.sink.alerts] == ["Valve 2 is in fault"]
 
 
-def test_reset_is_refused_while_the_supply_is_not_sensed_and_when_not_in_fault():
+def test_reset_is_refused_while_the_supply_is_not_sensed_and_idempotent_when_not_in_fault():
     b = Bench(both_valves(pumphouse()))
     b.step()
-    r = b.rt.apply_command({"type": "resetValve", "assetId": V2})
-    assert r == {"accepted": False, "reason": "refused: Valve 2 is not in fault"}
+    # Not in fault: not refused — its pass answers completed and sends no pulse (contracts v1.15.2 item 15; the cloud
+    # refuses not_in_fault first, so this is a reset an earlier one already did).
+    m = b.mark()
+    assert b.rt.apply_command({"type": "resetValve", "assetId": V2, "commandId": "c0"}) == {"accepted": True}
+    b.run(1)
+    assert b.sink.command_acks == [{"commandId": "c0", "status": "completed", "error": None}]
+    assert pulses(b.writes_since(m)) == [] and b.events_since(m, "valve_reset") == []
     b.set(UPS, "sensor.power", False)
     b.run(1)
     r = b.rt.apply_command({"type": "resetValve", "assetId": V2})
-    assert r["accepted"] is False and "supply" in r["reason"] and "not present" in r["reason"]
+    assert r == {"accepted": False, "reason": "refused: the valve's supply on line 13 of pinctrl-bcm2835 is not present"}
     assert b.rt.apply_command({"type": "resetValve", "assetId": V1})["accepted"] is False  # not a latching valve
 
 
