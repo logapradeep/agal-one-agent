@@ -10,6 +10,10 @@ stayed in FAULT (SYNC.md v1.15.2 12(e)). Now the node answers once, from the pas
 * ``failed`` in the node's words when that pass refuses it or cannot carry it out: the supply not present, not a
   latching valve, the open coil not switched off, the reset not recorded, the close pulse not sent or the supply
   gone after it, an error in the pass, the node stopping before the pass;
+* one reset per valve per pass: a second reset of the same valve in the same pass takes the first's answer and sends
+  no pulse of its own (contracts v1.15.2 item 16);
+* a command that arrives once the runtime has stopped — main() stops it first and disconnects MQTT last — is refused
+  on arrival, in words, until the runtime is started again (item 16);
 * ``completed`` with NO pulse for a latching valve no longer in FAULT (idempotent);
 * the words name the supply's PORT as the node knows it, never a card id;
 * through the node's HTTPS ack queue (command_acks.CommandAcks): a pass never waits on the network, also while the
@@ -21,14 +25,18 @@ pinctrl-bcm2835 — the vectors' DI3) on a SimClock and a SimulatedIO.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
+from datetime import datetime
 
 import pytest
 
 import agal_one_agent.blocks.v3.runtime as R
 from agal_one_agent import main as agent_main
+from agal_one_agent.blocks.clock import SimClock
 from agal_one_agent.blocks.cloud import CloudSink
+from agal_one_agent.blocks.host import ProgramHost
 from agal_one_agent.blocks.io import SimulatedIO
 from agal_one_agent.blocks.runtime import RecordingSink
 from agal_one_agent.command_acks import wire_command_acks
@@ -37,7 +45,7 @@ from agal_one_agent.mqtt_client import AgalOneMqttClient
 from agal_one_agent.node_events import wire_node_events
 from test_v3_corners import _NoWrite, _StuckOff
 from test_v3_valves import both_valves, pulses
-from v3_bench import ESTOP, HEALTHY, PUMP, UPS, V1, V2, Bench, card, nxt, pumphouse
+from v3_bench import CLEAN, ESTOP, HEALTHY, PUMP, STATE_FILE, TZ, UPS, V1, V2, Bench, card, nxt, pumphouse
 
 ACTOR = {"uid": "u_owner01", "via": "app"}
 SUPPLY_GONE = "refused: the valve's supply on line 13 of pinctrl-bcm2835 is not present"
@@ -227,6 +235,66 @@ def test_a_reset_after_whose_pulse_the_supply_is_gone_is_answered_failed_and_sta
     assert b.events_since(m, "valve_reset") == []
 
 
+# ======================================================================== one reset per valve per pass
+
+GONE_AFTER = "the valve's supply on line 13 of pinctrl-bcm2835 was not present after the close pulse — Valve 2 stays in fault"
+
+
+def test_two_resets_in_one_pass_send_one_close_pulse_when_the_supply_is_read_absent_after_it():
+    """Contracts v1.15.2 item 16: two resets of Valve 2 reach one pass (two people press Reset, or the app and Agal
+    Assist) and the supply is read absent right after the first one's close pulse. The second takes the first's answer
+    — checked again it would read the supply as sampled at the start of the pass, which still says present, and pulse
+    again — so exactly one close pulse and two failed answers in the same words."""
+    b = bench(io=_SupplyGoesWithTheClose())
+    faulted(b)
+    m = b.mark()
+    assert b.rt.apply_command(reset("cA"))["accepted"] and b.rt.apply_command(reset("cB"))["accepted"]
+    b.step()
+    assert pulses(b.writes_since(m)).count(CLOSE) == 1
+    assert acks(b) == [("cA", "failed", GONE_AFTER), ("cB", "failed", GONE_AFTER)]
+    assert b.rt.prog.valves[V2].fault == "pulse_cut_short" and b.events_since(m, "valve_reset") == []
+    # The next pass samples the supply afresh: a reset now is refused on arrival, and nothing more is pulsed.
+    b.run(1)
+    assert b.rt.apply_command(reset("cC")) == {"accepted": False, "reason": SUPPLY_GONE}
+    assert pulses(b.writes_since(m)).count(CLOSE) == 1
+
+
+class _CloseFailsCounted(_CloseFails):
+    def __init__(self):
+        super().__init__()
+        self.close_tries = 0
+
+    def pulse(self, port, ms):
+        if (port.asset_id, port.source_key) == (V2, "valve.close_coil"):
+            self.close_tries += 1
+        super().pulse(port, ms)
+
+
+def test_a_second_reset_in_the_same_pass_does_not_retry_a_close_pulse_that_could_not_be_sent():
+    b = bench(io=_CloseFailsCounted())
+    faulted(b)
+    assert b.rt.apply_command(reset("cD"))["accepted"] and b.rt.apply_command(reset("cE"))["accepted"]
+    b.step()
+    words = "the close pulse could not be sent — Valve 2 stays in fault"
+    assert b.io.close_tries == 1
+    assert acks(b) == [("cD", "failed", words), ("cE", "failed", words)]
+
+
+def test_a_second_reset_in_the_same_pass_takes_the_first_ones_error(monkeypatch):
+    b = bench()
+    faulted(b)
+    calls = []
+
+    def broken(drv, key):
+        calls.append(key)
+        raise RuntimeError("the line request was lost")
+    monkeypatch.setattr(b.rt, "_send_pulse", broken)
+    assert b.rt.apply_command(reset("cF"))["accepted"] and b.rt.apply_command(reset("cG"))["accepted"]
+    b.step()
+    words = "the reset could not be carried out: the line request was lost"
+    assert len(calls) == 1 and acks(b) == [("cF", "failed", words), ("cG", "failed", words)]
+
+
 def test_a_reset_that_cannot_switch_the_open_coil_off_is_answered_failed():
     b = bench(io=_StuckOff((V2, "valve.open_coil"), 50))
     b.step()
@@ -290,6 +358,72 @@ def test_a_reset_no_pass_ran_is_answered_failed_when_the_runtime_stops():
     b.run(2)
     assert CLOSE not in pulses(b.writes_since(m)) and b.rt.prog.valves[V2].fault
     assert acks(b) == [("c12", "failed", R.RESET_STOPPED)]
+
+
+# ======================================================================== a command after the stop
+
+def test_a_command_that_arrives_after_the_runtime_stopped_is_refused_on_arrival_until_it_starts_again():
+    """Contracts v1.15.2 item 16: main() stops the runtime first and disconnects MQTT last, so for a few seconds
+    commands still arrive. Accepted, a reset got no answer at all (no pass runs it: the document stayed `sent` until
+    the cloud's timeout) and stayed pending for a later start to pulse; a setPower was acked completed and never
+    applied. Now each is refused on arrival, in words — also after a compile (a program pulled while the agent shuts
+    down) — until the runtime is started again."""
+    mqtt = _Mqtt()
+    b = bench()
+    faulted(b)
+    b.rt.stop(safe_state=True)
+    m = b.mark()
+    assert R.RESET_STOPPING == "refused: the node is stopping — no close pulse sent"
+    assert R.STOPPING == "refused: the node is stopping — no pass will carry it out"
+    assert b.rt.apply_command(reset("e1")) == {"accepted": False, "reason": R.RESET_STOPPING}
+    assert b.rt.apply_command({"type": "setPower", "assetId": PUMP, "value": 1, "commandId": "e2"}) == \
+        {"accepted": False, "reason": R.STOPPING}
+    agent_main.answer_program_command(reset("e3"), b.rt, mqtt)
+    agent_main.answer_program_command({"type": "pauseAutomation", "commandId": "e4", "actor": ACTOR}, b.rt, mqtt)
+    assert mqtt.acks == [("e3", "failed", R.RESET_STOPPING), ("e4", "failed", R.STOPPING)]
+    assert b.rt._pending_commands == []
+    b.rt.compile(b.bundle)  # a program pulled while the agent shuts down: still no pass will run
+    assert b.rt.apply_command(reset("e5")) == {"accepted": False, "reason": R.RESET_STOPPING}
+    b.run(2)  # stepped by hand anyway: nothing was left pending, so nothing is pulsed
+    assert CLOSE not in pulses(b.writes_since(m)) and b.rt.prog.valves[V2].fault
+    assert acks(b) == []
+    # Started again, the runtime accepts a reset and its pass carries it out, as ever.
+    b.rt.start()
+    try:
+        assert b.rt.apply_command(reset("e6")) == {"accepted": True}
+        deadline = time.monotonic() + 3.0
+        while not acks(b, "e6") and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert acks(b, "e6") == [("e6", "completed", None)]
+        assert pulses(b.writes_since(m)).count(CLOSE) == 1
+    finally:
+        b.rt.stop(safe_state=False)
+
+
+def test_the_host_main_holds_refuses_a_reset_once_it_has_stopped(tmp_path):
+    """The same through the ProgramHost that main() holds: host.stop() in main's finally, then a reset from MQTT."""
+    with open(tmp_path / STATE_FILE, "w") as f:
+        json.dump(CLEAN, f)
+    clock = SimClock(datetime(2026, 10, 15, 10, 0, 0, tzinfo=TZ))
+    io = SimulatedIO()
+    for (aid, sk), v in HEALTHY.items():
+        io.set_input(aid, sk, v)
+    h = ProgramHost(io, RecordingSink(), clock=clock, state_dir=str(tmp_path), node_uid="node_pumphouse")
+    h.compile(both_valves(pumphouse()))
+    h.step()
+    io.set_input(UPS, "sensor.power", False)
+    clock.advance(1.0)
+    h.step()
+    io.set_input(UPS, "sensor.power", True)
+    clock.advance(1.0)
+    h.step()
+    assert h.v3.prog.valves[V2].fault == "supply_lost"
+    h.stop(safe_state=True)
+    mqtt = _Mqtt()
+    n = len(io.log)
+    agent_main.answer_program_command(reset("h1"), h, mqtt)
+    assert mqtt.acks == [("h1", "failed", R.RESET_STOPPING)]
+    assert h.v3._pending_commands == [] and CLOSE not in pulses(io.log[n:])
 
 
 # ======================================================================== main.py: who answers

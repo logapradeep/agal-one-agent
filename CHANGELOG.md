@@ -256,7 +256,8 @@ v3 once, with the founder's yes, and can roll it back; the node's half:
     stays in FAULT, `pulse_cut_short` — before, the reset's pulse alone was taken without that check); "the reset
     could not be carried out: <error>". A reset accepted but never run — the runtime stopped first — is answered
     `failed` at `stop()` ("the node stopped before the reset ran: no close pulse sent", `RESET_STOPPED`) and dropped,
-    so a later start never pulses it.
+    so a later start never pulses it (and, since the review below, one that arrives after the stop is refused on
+    arrival).
   - *Idempotent.* A reset of a latching valve that is not in FAULT is no longer refused ("refused: Valve 2 is not in
     fault"): it is accepted and its pass answers `completed` with no pulse — two people pressing Reset together, or a
     press while the card still shows the fault (the callable refuses `not_in_fault` from the cloud's mirror). The same
@@ -284,6 +285,40 @@ v3 once, with the founder's yes, and can roll it back; the node's half:
     not-in-fault reset is completed with no pulse, and the supply refusal's words. Whole suite: 992 (after 07:00
     IST — see SYNC.md v1.15.2 item 15(e)). Parity: v1-light 293 records identical in 22 streams, v1-switch 55 in 16;
     the v3-gate session's signed reset: close pulse, then `valve_reset`, then one `completed` commandAck.
+- **The review of the reset's answer (contracts v1.15.2 item 16 — functions.yaml resetValve 1.11.3, programs/README.md
+  §4.4 and §7.9; same version, still not tagged).**
+  - *One reset per valve per pass.* Two resets of the same latching valve in one pass (two people pressing Reset, or
+    the app and Agal Assist), the supply read absent right after the first one's close pulse: the first was failed
+    `pulse_cut_short`, but the second was checked by `_refuse_reset` against the supply as SAMPLED at the start of the
+    pass — still present — and sent a second close pulse with no supply behind it (the review's scratch
+    `exp_reset_edges.py` X1: 2 close pulses, both failed). `RuntimeV3._apply_commands` now keeps each valve's answer
+    for the pass: a second reset of the same valve takes the first one's answer and sends no pulse of its own — also
+    after a close pulse that could not be sent, or a carrying out that raised (no retry in the same pass). The next
+    pass samples the supply afresh and a reset then is refused on arrival in the supply's words.
+  - *No command accepted once the runtime has stopped.* `main()`'s `finally` stops the runtime first, then flushes the
+    sink and closes the ack and event queues (3 s each), and disconnects MQTT last: for those seconds the paho thread
+    still handed commands to the v3 runtime, which accepted them (`stop()` left the program loaded). A reset was never
+    answered — the document `sent` until the backend's `checkCommandTimeouts`, where the contract promised the node's
+    words — and stayed pending for a later start of that runtime to pulse (X3); a `setPower` was acked `completed` by
+    `ports/links.handle_switch` and never applied. Now `stop()` marks the runtime stopped (`_stopped`, with
+    `_running`) and only `start()` clears it — a compile after the stop (a program pulled during the shutdown) runs no
+    pass either — and `apply_command` refuses every command on a stopped runtime in words: "refused: the node is
+    stopping — no close pulse sent" (`RESET_STOPPING`) for a reset, "refused: the node is stopping — no pass will
+    carry it out" (`STOPPING`) for every other; `answer_program_command` and `handle_switch` ack them `failed` while
+    the ack queue is still open. A switch of language starts the runtime it hands over to, so a migrated or rolled
+    back node is unaffected (scratch check: v1 → v3 → v1 → v3 on the runtime threads, then a `setPower` and a
+    `pauseAutomation` accepted; after `ProgramHost.stop()` both kinds refused). The language-1 runtime is 0.3.4's and
+    unchanged.
+  - Not changed (as the review found): a restart in the middle of a reset's close pulse leaves its document `sent`
+    until the backend's timeout (the restarted node puts the valve in FAULT `pulse_cut_short` and raises
+    `valve_fault`); commands other than a reset accepted before a stop and run by no pass are kept, as before.
+  - Tests: `tests/test_v3_reset_ack.py` (20, +5) — two resets in one pass with the supply gone after the first close
+    pulse: one close pulse, two failed answers in the same words, and the next reset refused on arrival; a second reset
+    does not retry a close pulse that could not be sent, nor a carrying out that raised; after `stop()` a reset, a
+    `setPower` and a `pauseAutomation` are refused on arrival (also through `main.answer_program_command`), nothing is
+    left pending, a compile does not end it, a start does (the reset then completed by its pass); through the
+    `ProgramHost` main() holds, a reset after `host.stop()` is acked failed. All five fail on 37bd989. Whole suite: 997.
+    Parity: v1-light 293 records identical in 22 streams, v1-switch 55 in 16 (4 passed).
 
 **The pass (§7.5):** inputs → the built-ins (power sense, E-stop latch, valve drivers, motor guards), then the
 commands and which blocks hold → each layout's active instruction part → the rule slots → outputs written once,

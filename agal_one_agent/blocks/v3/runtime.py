@@ -59,6 +59,10 @@ UNREADABLE = "__unreadable__"
 STATE_WRITER_THREAD = "v3-state-writer"
 # A reset accepted but never carried out: the runtime stopped before a pass ran it (contracts v1.15.2 item 15).
 RESET_STOPPED = "the node stopped before the reset ran: no close pulse sent"
+# A command that reaches a runtime that has stopped — the agent shutting down: its MQTT stays connected for a few
+# seconds after the runtime's stop — is refused on arrival: no pass will carry it out (contracts v1.15.2 item 16).
+STOPPING = "refused: the node is stopping — no pass will carry it out"
+RESET_STOPPING = "refused: the node is stopping — no close pulse sent"
 
 
 def _iso(dt: Optional[datetime]) -> Optional[str]:
@@ -208,6 +212,10 @@ class RuntimeV3:
         self._thread: Optional[threading.Thread] = None
         self._sampler: Optional[threading.Thread] = None
         self._running = False
+        # Stopped and not started since (contracts v1.15.2 item 16): no pass will run, so no command is accepted. Set
+        # by stop() together with _running, cleared only by start() — a compile after the stop (a program pulled
+        # while the agent shuts down) runs no pass either.
+        self._stopped = False
         self._wake = threading.Event()
         self._cold = True
         self._booted = False
@@ -709,6 +717,7 @@ class RuntimeV3:
             if self._running:
                 return
             self._running = True
+            self._stopped = False
             self._report_all = True  # every start reports every card's outputs at its first pass (0.4.0 review)
         self._thread = threading.Thread(target=self._loop, name="blocks-v3-runtime", daemon=True)
         self._thread.start()
@@ -726,6 +735,7 @@ class RuntimeV3:
         with self._lock:
             threads = (self._thread, self._sampler)
             self._running = False
+            self._stopped = True  # from here no command is accepted (apply_command): no pass would carry it out
         self._wake.set()
         for t in threads:
             if t is not None and t is not threading.current_thread():
@@ -737,7 +747,7 @@ class RuntimeV3:
             self._cold = True
             self._booted = False
             # A reset accepted but not carried out — no pass ran it — is answered, never left in flight (and never
-            # pulsed by a later start of this runtime).
+            # pulsed by a later start of this runtime; one that arrives after this stop is refused on arrival).
             for c in [c for c in self._pending_commands if c.get("type") == "resetValve"]:
                 self._answer(c, "failed", RESET_STOPPED)
             self._pending_commands = [c for c in self._pending_commands if c.get("type") != "resetValve"]
@@ -1979,6 +1989,12 @@ class RuntimeV3:
             p, st = self.prog, self.st
             if p is None:
                 return {"accepted": False, "reason": "no program loaded"}
+            if self._stopped:
+                # Contracts v1.15.2 item 16: the runtime has stopped — the agent shutting down, its MQTT still passing
+                # commands on for a few seconds — and no pass will carry a command out. Accepted, a reset would get no
+                # answer at all (the document `sent` until the cloud's timeout) and a setPower would be acked completed
+                # and never applied; refused, each is answered failed now, in words.
+                return {"accepted": False, "reason": RESET_STOPPING if t == "resetValve" else STOPPING}
             now = self.clock.monotonic()
             if t in ("setPower", "setPortValue"):
                 aid = command.get("assetId")
@@ -2051,13 +2067,25 @@ class RuntimeV3:
 
     def _apply_commands(self, now: float, wall: datetime) -> None:
         cmds, self._pending_commands = self._pending_commands, []
+        # One reset per valve per pass (contracts v1.15.2 item 16): a second reset of the same valve in the same pass
+        # — two people pressing Reset, the app and Agal Assist — takes the first one's answer and sends no pulse of its
+        # own. Checked again, it would read the supply as sampled at the start of the pass, not as read after the
+        # first one's close pulse, and could pulse again with the supply just read absent (or retry a pulse that
+        # could not be sent).
+        resets: dict[str, tuple[str, Optional[str]]] = {}
         for c in cmds:
             t = c.get("type")
             try:
                 if t in ("setPower", "setPortValue"):
                     self._cmd_switch(c, now)
                 elif t == "resetValve":
-                    self._answer(c, *self._cmd_reset(c, now, wall))
+                    aid = c.get("assetId")
+                    if aid in resets:
+                        logger.info("resetValve %s: a second reset of the valve in this pass — answered as the first "
+                                    "(%s), no pulse of its own", aid, resets[aid][0])
+                    else:
+                        resets[aid] = self._cmd_reset(c, now, wall)
+                    self._answer(c, *resets[aid])
                 elif t == "pauseAutomation":
                     self._cmd_pause(c, now, wall)
                 elif t == "resumeAutomation":
@@ -2072,7 +2100,8 @@ class RuntimeV3:
             except Exception as e:  # noqa: BLE001
                 logger.error("command %s failed: %s", t, e, exc_info=True)
                 if t == "resetValve":
-                    self._answer(c, "failed", f"the reset could not be carried out: {e}")
+                    resets[c.get("assetId")] = ("failed", f"the reset could not be carried out: {e}")
+                    self._answer(c, *resets[c.get("assetId")])
 
     def _cmd_switch(self, c: dict, now: float) -> None:
         st = self.st
