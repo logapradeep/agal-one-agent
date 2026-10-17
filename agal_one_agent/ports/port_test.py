@@ -50,6 +50,15 @@ def _read_analog(command: dict, transport: dict, analog, sleep: Callable[[float]
                       f"({how}, {_num(volts[-1])} V at the channel)"}
 
 
+def _held(lines, label: str, line: int) -> Optional[str]:
+    """How this agent holds the line now ("out", "in" or None) — a LineIO older than 0.4.1, or a fake, says nothing."""
+    fn = getattr(lines, "held_direction", None)
+    try:
+        return fn(label, line) if callable(fn) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def run_port_test(command: dict, lines: LineIO, busy: Optional[Callable[[str, int], bool]] = None,
                   sleep: Callable[[float], None] = time.sleep, analog=None) -> dict:
     """Returns {portId, result: passed|failed, detail?, value?}. Never raises."""
@@ -70,17 +79,22 @@ def run_port_test(command: dict, lines: LineIO, busy: Optional[Callable[[str, in
         active_low = bool(transport.get("activeLow") or command.get("activeLow"))
         if busy and busy(label, line):
             return {**out, "result": "failed", "detail": "the running program is driving this port — pause automation first"}
+        # 0.4.1 (contracts v1.15.4): a tested port is left exactly as it was found. A line this agent holds as an output —
+        # one a reload dropped is kept driven at off (programs/README.md §7.5a) — is written off and KEPT after the test:
+        # let go of, it would fall to its pull, and an active-low relay board energises on a pulled-down line.
+        held_out = _held(lines, label, line) == "out"
         if action == "pulse":
             seconds = max(1, min(MAX_PULSE_S, int(command.get("seconds") or 2)))
             try:
                 lines.write(label, line, True, active_low)
                 sleep(seconds)
             finally:
-                # Off, then let go of the line: a tested port is left exactly as it was found.
+                # Off, then let go of the line (unless it was held driven): a tested port is left exactly as it was found.
                 try:
                     lines.write(label, line, False, active_low)
                 finally:
-                    lines.release(label, line)
+                    if not held_out:
+                        lines.release(label, line)
             return {**out, "result": "passed", "detail": f"on for {seconds} s, then off"}
         if action == "read":
             seconds = max(1, min(MAX_READ_S, int(command.get("seconds") or 10)))
@@ -96,7 +110,10 @@ def run_port_test(command: dict, lines: LineIO, busy: Optional[Callable[[str, in
                 if now != last:
                     changes += 1
                     last = now
-            lines.release(label, line)
+            if held_out:
+                lines.write(label, line, False, active_low)  # held driven at off before the read: driven at off again
+            else:
+                lines.release(label, line)
             detail = f"{'on' if last else 'off'} after {seconds} s; changed {changes} time(s)"
             if no_bias is not None:
                 detail += f"; pull {pull} could not be applied ({no_bias}), so it was read with no bias"

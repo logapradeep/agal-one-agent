@@ -244,7 +244,9 @@ def _drop_port(bundle):
 
 
 @pytest.mark.parametrize("change", [_drop_card, _drop_port], ids=["card left the program", "port left the card"])
-def test_an_output_the_new_program_no_longer_has_is_switched_off_and_released(change):
+def test_an_output_the_new_program_no_longer_has_is_switched_off_and_kept_driven_at_off(change):
+    """0.4.1 (contracts v1.15.4, programs/README.md §4.8): switched off and KEPT driven — its line is never let go of to
+    its pull (0.3.x let go of it: an active-low relay board energises on a pulled-down line)."""
     b = Bench(_two_valves())
     _open_both(b)
     mark = len(b.io.writes)
@@ -253,7 +255,7 @@ def test_an_output_the_new_program_no_longer_has_is_switched_off_and_released(ch
     assert b.io.writes[mark:] == [], "nothing is written between passes"
     b.run(1)
     assert b.io.writes[mark:] == [("valve-b", "device.power", False)], "only the output that left is written"
-    assert [(aid, key, t["gpioNumber"]) for aid, key, t in b.io.released] == [("valve-b", "device.power", 22)]
+    assert b.io.released == [], "kept driven at off, never let go of (0.4.1)"
     assert b.out("valve-a") is True
     assert {"type": "output_released", "assetId": "valve-b", "sourceKey": "device.power", "level": "off"} in b.sink.events
     b.run(5)
@@ -271,7 +273,7 @@ def test_an_output_that_leaves_the_program_is_switched_off_whatever_its_safe_sta
     b.reload(_drop_card)
     b.run(3)
     assert b.io.writes[mark:] == [("valve-b", "device.power", False)]
-    assert [r[0] for r in b.io.released] == ["valve-b"]
+    assert b.io.released == []  # 0.4.1: kept driven at off
     assert {"type": "output_released", "assetId": "valve-b", "sourceKey": "device.power", "level": "off"} in b.sink.events
     assert b.out("valve-a") is True
 
@@ -284,13 +286,13 @@ def test_on_a_clean_stop_a_last_state_output_still_keeps_its_level():
     assert b.out("valve-b") is True and b.out("valve-a") is False
 
 
-def test_a_clean_stop_lets_go_of_an_output_a_reload_took_out_before_any_pass():
+def test_a_clean_stop_switches_off_an_output_a_reload_took_out_before_any_pass():
     b = Bench(_two_valves())
     _open_both(b)
     b.reload(_drop_card)
     b.rt.stop(safe_state=True)
     assert b.io.output("valve-b", "device.power") is False
-    assert [r[0] for r in b.io.released] == ["valve-b"]
+    assert b.io.released == []  # 0.4.1: switched off and kept driven at off (the agent's exit closes every line)
 
 
 class _Line:
@@ -308,10 +310,11 @@ class _Line:
         self.log.append(("close", self.line))
 
 
-def test_an_output_moved_to_another_line_carries_its_level_there_and_lets_go_of_the_old_one():
+def test_an_output_moved_to_another_line_carries_its_level_there_and_keeps_the_old_one_driven_off():
     """A port table edit (the card's port is re-stamped onto another line): the card stays on,
-    on its new line; the old line is switched off and freed. Nothing goes LOW on an active-low
-    relay that should be off, and the new line never sees an OFF first."""
+    on its new line; the old line is switched off and KEPT driven at off (0.4.1 — 0.3.x freed it,
+    and a freed line falls to its pull). Nothing goes LOW on an active-low relay that should be
+    off, and the new line never sees an OFF first."""
     log: list = []
     chips = [ChipInfo("/dev/gpiochip0", "gpiochip0", "pinctrl-bcm2835", 54)]
     lines = LineIO(chips=lambda: chips, opener=lambda path, line, direction: _Line(log, line, direction))
@@ -329,8 +332,8 @@ def test_an_output_moved_to_another_line_carries_its_level_there_and_lets_go_of_
 
     b.reload(move)
     b.run(3)
-    # active low: OFF is HIGH, ON is LOW. Line 27 is let go of (HIGH, closed); line 23 opens ON.
-    assert log[mark:] == [("write", 27, True), ("close", 27), ("open", 23, "low"), ("write", 23, False)]
+    # active low: OFF is HIGH, ON is LOW. Line 27 is switched off and kept (HIGH, never closed); line 23 opens ON.
+    assert log[mark:] == [("write", 27, True), ("open", 23, "low"), ("write", 23, False)]
     assert not [e for e in log[mark:] if e[:2] == ("write", 22)], "valve-b is untouched"
 
 
@@ -670,7 +673,7 @@ def test_two_reloads_before_a_pass_never_switch_off_a_line_the_program_holds_on(
 
     b.reload(a_to_22)
     b.run(3)
-    assert log[mark:] == [("write", 27, False), ("close", 27), ("write", 22, True)]
+    assert log[mark:] == [("write", 27, False), ("write", 22, True)]  # 0.4.1: line 27 kept driven at off
 
 
 def test_an_output_line_re_stamped_as_an_input_is_never_driven_again():

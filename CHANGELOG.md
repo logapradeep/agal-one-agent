@@ -2,6 +2,32 @@
 
 ## 0.4.1 (2026-10-17, not tagged)
 
+**The review of v1.15.3 (contracts v1.15.4, SYNC.md v1.15.4) — no reload, rollback or port test lets go of a driven
+line; a line changes its use in two bundles.** Still 0.4.1 (not tagged, never released): the backend now migrates a
+node, and serves it a v3 bundle, only on 0.4.1 or later — 0.4.0 has none of what follows or of what is below.
+
+- **A language-1 reload keeps a dropped output driven at off** (`blocks/runtime.py _release_output`): switched off and
+  its line request KEPT (`output_released`, level off) — 0.3.4 let go of it, and a freed line falls to its pull: a
+  reload that unlinked or deleted the Pump house's Light (it runs v1 today) would have energised its active-low relay.
+  An output that moved to another line keeps its old line driven at off too. The one behaviour of a language-1 bundle
+  that differs from 0.3.4 on purpose (programs/README.md §4.8; the founder's call): `tests/test_v1_parity.py` still
+  passes against `v0.3.4` — its session drops no output — and names it.
+- **A port test leaves a line as it found it** (`ports/port_test.py`, `LineIO.held_direction`): a line the agent holds
+  as an output (a dropped output kept driven at off) is written off and kept after a pulse or a read; any other line is
+  let go of, as before.
+- **A line changes its use in two bundles** (no agent change — 0.4.1's refusal is the last line): a reload that turns a
+  line its program drives into one it reads, or the reverse, is refused and the running program stays; one that first
+  drops the line (kept driven at off), then one that uses it the other way, goes through. The backend never writes the
+  one-step bundle (README §7.2 *A line keeps its role*).
+- Tests: NEW `tests/test_v3_line_roles.py` (9) — on the BCM2835 line model of `test_v3_port_direction.py`: a v1 reload
+  that drops the Light keeps line 17 driven HIGH (Light on and off before; both fail on the code before this change,
+  "a v1 reload let go of line 17"), the same on v3, a rollback whose v1 program does not drive the Light, a port test
+  (pulse, read) of a held line keeps it driven (both fail before), a free line is let go of; the vector
+  `rewire-swap.json lineRoleSwap` — the swap of the relay and the wall switch between lines 17 and 27 refused in one
+  bundle (line 17 still driven), taken in two (line 27 drives the relay, line 17 reads the switch, the Light switches).
+  Changed for the new behaviour: `tests/test_blocks_reload.py` (a dropped or moved output is switched off and kept
+  driven, never released).
+
 **Every port entry of a v3 bundle is complete, and the node refuses one that is not (contracts v1.15.3,
 programs/README.md §7.2 and §7.5a; SYNC.md v1.15.3).** A patch on 0.4.0 (released 2026-10-17, tag `v0.4.0`,
 `7078607`). Not tagged; releasing it — a tag and `/config/agent` 0.4.1 — is the founder's, and comes after the backend

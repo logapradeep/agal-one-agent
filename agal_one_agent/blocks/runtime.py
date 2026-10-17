@@ -1549,12 +1549,18 @@ class BlockRuntime:
                 logger.error("write %s.%s failed: %s", blk.asset_id, v.port.source_key, e)
 
     def _release_output(self, key: tuple[str, str], port: PortRef, vtype: str, is_motor: bool) -> None:
-        """Let go of a port an output left: switched off and the line freed. Always off: the
+        """Let go of a port an output left: switched off and KEPT DRIVEN at off. Always off: the
         asset's safeState (R-14) is what happens when the node's software stops or its power goes;
         an output the program no longer has is supervised by no rule (no maximum run, no dry-run
         protection), and on a port-table node not even its own card could switch it off any more.
         An output that moved to another port carries its level there. A port the running program
-        uses again (another card drives it, or reads it as an input) is left to that program."""
+        uses again (another card drives it, or reads it as an input) is left to that program.
+
+        0.4.1 (contracts v1.15.4, programs/README.md §4.8): the line's request is KEPT — it is never
+        freed to its pull. 0.3.x freed it: an undriven line sits at its pull, and an active-low relay
+        board energises on a pulled-down line (the Pump house's GPIO17 on 2026-10-17 — a reload that
+        unlinked or deleted the Light would have switched its relay ON). The one thing a language-1
+        bundle does on 0.4.1 that it did not on 0.3.4 (tests/test_v1_parity.py names it)."""
         still_ours = self._output_var(key[0], key[1]) is not None  # moved to another port: the key is the new one's
         if not still_ours:
             self._last_written.pop(key, None)
@@ -1562,14 +1568,13 @@ class BlockRuntime:
             return
         try:
             self.io.write_output(port, False if vtype == "bool" else 0.0)
-            self.io.release_output(port)
         except Exception as e:  # noqa: BLE001
-            logger.error("release %s.%s failed: %s", key[0], key[1], e)
+            logger.error("switching off %s.%s failed: %s", key[0], key[1], e)
             return
         if still_ours:
-            logger.info("output %s.%s moved to another port: the old one is switched off and released", key[0], key[1])
+            logger.info("output %s.%s moved to another port: the old one is switched off and kept driven at off", key[0], key[1])
             return
-        logger.info("output %s.%s left the program: switched off and released", key[0], key[1])
+        logger.info("output %s.%s left the program: switched off and kept driven at off", key[0], key[1])
         self.sink.event("output_released", {"assetId": key[0], "sourceKey": key[1], "level": "off"})
 
     # Cloud reporting policy (R-27 vs. cost): a card's snapshot goes to the

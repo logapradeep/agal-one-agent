@@ -13,6 +13,12 @@ The only differences allowed are the two that make 0.4.0 what it is: the version
 (``firmwareVersion`` / ``agentVersion``) and ``capabilities.blockLanguage`` — 3 in every status of
 0.4.0, absent from every status of 0.3.4. Both are checked, then taken out, and the rest must be equal.
 
+One behaviour of a language-1 bundle differs ON PURPOSE since 0.4.1 (contracts v1.15.4, programs/README.md §4.8; the
+founder's call to keep or revert): an output a reload DROPS is switched off and its line kept driven at off — 0.3.4 let
+go of it, and a freed line falls to its pull (the Pump house's active-low relay on GPIO 17 energises). The session
+below never drops an output in a reload, so the comparison is unaffected; tests/test_v3_line_roles.py and
+tests/test_blocks_reload.py prove the new behaviour.
+
 Skipped where the released tree cannot be had (no git, or no tag v0.3.4 — a release archive on a board).
 """
 

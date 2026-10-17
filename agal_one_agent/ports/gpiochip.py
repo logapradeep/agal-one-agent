@@ -229,6 +229,14 @@ class LineIO:
         level = bool(held.handle.read())
         return (not level) if active_low else level
 
+    def held_direction(self, label: str, line: int) -> Optional[str]:
+        """``"out"`` or ``"in"`` while this agent holds the line requested that way; None while it holds no request for it.
+        0.4.1 (contracts v1.15.4): a port test leaves a line as it found it — one held as an output (a line a reload dropped
+        is kept driven at off) is written off and kept after the test, never let go of to its pull."""
+        with self._lock:
+            held = self._lines.get((label, int(line)))
+        return held.direction if held is not None else None
+
     def bias_error(self, label: str, line: int) -> Optional[str]:
         """Why the pull an open input line was asked for is not on it; None when it is (or none was asked)."""
         with self._lock:
