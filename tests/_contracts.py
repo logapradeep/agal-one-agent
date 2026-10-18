@@ -16,3 +16,5 @@ COMMAND_SIGNING_VECTORS = os.path.join(CONTRACTS, "nodes", "vectors", "command-s
 #: contracts v1.14.2 join safety (nodes/README.md §10): the served script's guard, the version rules.
 JOIN_VECTORS = os.path.join(CONTRACTS, "nodes", "vectors", "join.json")
 IOT_NODE_SCHEMA = os.path.join(CONTRACTS, "schemas", "iot-node.schema.json")
+#: contracts v1.16.0 (nodes/README.md §11, agent 0.4.2): /proc/net/wireless samples, signal words, iw / iwconfig, the gap watch.
+NETWORK_VECTORS = os.path.join(CONTRACTS, "nodes", "vectors", "network.json")

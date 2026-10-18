@@ -10,7 +10,9 @@ setup(
     # 0.3.4 (released 2026-10-16: signed commands, archive OTA, events over HTTPS, join safety).
     # 0.4.1 (unreleased, not tagged): every port entry of a v3 bundle is complete (contracts v1.15.3) — the node refuses an
     # entry with no direction or active level, and a switch that would let go of, read, drive or invert a line.
-    version="0.4.1",
+    # 0.4.2 (unreleased, not tagged): the node's Wi-Fi care and its gaps (contracts v1.16.0) — the heartbeat's `network`
+    # block, the Wi-Fi power saving kept off, a connectivity_gap after 60 s or more without an answer from the cloud.
+    version="0.4.2",
     packages=find_packages(),
     install_requires=[
         "paho-mqtt>=2.0.0",

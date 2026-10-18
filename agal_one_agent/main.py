@@ -20,6 +20,7 @@ from .http_reporter import HttpReporter
 from .command_acks import wire_command_acks
 from .command_signing import wire_command_gate
 from .node_events import wire_node_events
+from .net_care import wire_network, with_network
 from . import boot_reconciler
 from .sentry_setup import init_sentry
 from .sensors import (
@@ -206,6 +207,14 @@ def main():
     if command_gate is not None and command_gate.protected:
         logger.info("Commands on %s are checked: signed for this node (hs256-v1), not replayed, not stale",
                     config.mqtt.commands_topic)
+
+    # The node's network (agent 0.4.2, contracts v1.16.0, nodes/README.md §11): the reporter tells a link watch of every
+    # answer from the cloud and every request that got none, and a gap of 60 s or more is reported as a
+    # connectivity_gap through the node-event queue above; the net-care thread — its own, never the runtime's — reads the
+    # link, keeps the Wi-Fi power saving off and gives the heartbeat its `network` block. Started here, before MQTT
+    # connects: the power saving is turned off as early as it can be. tests/test_net_care.py checks this call.
+    network = wire_network(mqtt_client, http_reporter, offline=args.offline,
+                           clock_ok=agent_clock.clock_ok, server_time=server_time)
 
     # ---- Node linking (ADR-024): one GPIO path for every Linux board, and the
     # report of what this board is and has. Nothing here names a board.
@@ -645,10 +654,12 @@ def main():
                                  config=config.telemetry.batch.to_batch_config())
 
     def _heartbeat_extra():
-        if runtime is None:
-            return None
-        from .blocks.cloud import heartbeat_extra
-        return heartbeat_extra(runtime, config, cloud_sink)
+        extra = None
+        if runtime is not None:
+            from .blocks.cloud import heartbeat_extra
+            extra = heartbeat_extra(runtime, config, cloud_sink)
+        # agent 0.4.2: + `network`, the last sample of the net-care thread (from memory: no file, no program here).
+        return with_network(extra, network)
 
     # Every status carries the version of the code that is running, resolved once at start
     # (contracts v1.14.2 join safety; tests/test_join_safety.py).
@@ -782,6 +793,8 @@ def main():
             cloud_sink.close()
         if command_acks is not None:
             command_acks.close(timeout=3.0)  # one more try for each ack still waiting
+        if network is not None:
+            network.stop()
         if node_events is not None:
             node_events.close(timeout=3.0)  # after runtime.stop: its output_released events go too
         telemetry.stop()

@@ -1,5 +1,58 @@
 # Changelog — agal-one-agent
 
+## 0.4.2 (2026-10-18)
+
+**The node's Wi-Fi care, its network report and its gaps (contracts v1.16.0, nodes/README.md §11; SYNC.md v1.16.0).**
+Not tagged, not released: releasing it — a tag and `/config/agent` 0.4.2 — is the founder's, after the backend deploy.
+It reaches the Pi over the air (the app's Update button); nothing is done on its terminal.
+
+**Why (2026-10-18, the Pump house).** The Pi (a Raspberry Pi 3B, Raspberry Pi OS on Debian trixie, NetworkManager, agent
+0.4.1) went silent for about five minutes, 10:40:13Z → 10:45:23Z, without restarting (`uptimeSeconds` ran on): no
+request reached the cloud, so it lost its network. A Pi 3B's brcmfmac Wi-Fi power saving is a common cause of short
+drops, but the node reported nothing about its Wi-Fi, so it could not be told from a router or internet drop.
+
+- **NEW `net_care.py`, on a thread of its own (`net-care`)** — never the runtime's, never under its lock (programs/README.md
+  §4.8). Every 5 s it reads the link the node uses, from files only: an Ethernet interface up with carrier first (a
+  `device`, `type` 1, not wireless), else the wireless one (`/sys/class/net/*/wireless`, `wlan0` first) with its
+  `operstate`, the kernel's `carrier_down_count` (else `carrier_changes`) and, on Wi-Fi, the level from
+  `/proc/net/wireless` (no program run for it).
+- **The Wi-Fi power saving is kept off.** Every 60 s, and only while the link is Wi-Fi: `iw dev <if> get power_save`;
+  when on, `iw dev <if> set power_save off`, read back. NetworkManager turns it on again at a reconnect — the next check
+  turns it off again. Without `iw`: `iwconfig <if>` / `iwconfig <if> power off`. Neither: `unknown`, said once. Each
+  program runs in a session of its own with a 5 s timeout; one that does not end is killed with its process group (a
+  child it started cannot keep its output open), and one that will not die is left, no other started while it lives.
+  It edits no file — nothing under /etc, no NetworkManager configuration — so a reboot or a reconnect puts the system's
+  own setting back, and the next check turns it off again. A failure is logged once and never raised.
+- **The heartbeat carries `network`** {interface, kind wifi | ethernet, connected, rssiDbm, signal (good ≥ −60 dBm, fair
+  −70 … −61, weak < −70), powerSave off | on | unknown, powerSaveHeld, at} — read from memory (`with_network`); the
+  heartbeat does no I/O for it. No interface (a Mac, a container without /sys/class/net): no block, as before.
+- **Connectivity gaps.** `HttpReporter._open` is now the one call every request of the reporter makes (the ingress
+  posts, getProgram, reportHardware, getBootState): an answer of any status — the request reached the cloud — gives its
+  Date to the server-time reference, then tells the `LinkWatch`; a request with no answer (no connection, a timeout, a
+  name that did not resolve) tells it so. At the first answer after the last one, when a request in between got none
+  and the two are 60 s or more apart, ONE `connectivity_gap` (source node, no card) goes through the node-event queue —
+  ordered, retried, with an eventId: `payload.connectivity` {from, to — the backend's time from the two answers' Date,
+  seconds by the monotonic clock, interface, kind, wifiConnectedThroughout / wifiDropped (a 5 s sample found it not
+  associated, or carrier_down_count rose), rssiDbmBefore, signalBefore, powerSave — the last readings before the first
+  request got none}. Nothing before the first answer since the start, nothing for a silence in which nothing was asked.
+  The log says it in words ("no answer from the cloud for 5 min 10 s (…); its Wi-Fi stayed connected (the router or
+  the internet dropped) — reported as connectivity_gap").
+- `main.py`: `wire_network` (after the node events; before MQTT connects, so the power saving goes off as early as it
+  can), the heartbeat extra through `with_network`, the thread stopped at the clean stop. Offline (`--offline`): none.
+- Tests: NEW `tests/test_net_care.py` (67): the power saving on → off → read back, already off, NetworkManager turning it
+  on again (off at the next check, not before), `iwconfig` without `iw`, neither (unknown, said once), a turning off that
+  fails (said once, tried again), an `iw` that cannot read it, a program that does not end (killed) and one that will not
+  die (left; nothing started while it lives), `run_tool` on a real script that sleeps; Ethernet first (and no program
+  run), Ethernet without carrier, a bridge that is not Ethernet, Wi-Fi not associated; every vector of
+  `nodes/vectors/network.json` (the `/proc/net/wireless` samples in the kernel's format, the signal words, iw / iwconfig,
+  every gap timeline); the Pump house's 5 min 10 s on the real sampling with its Wi-Fi up and with it dropping; the real
+  HttpReporter against a local ingress that stops answering — one gap posted once through the node-event queue with an
+  eventId, an error answer counted as an answer, every request of the reporter reaching the watch; nothing on the
+  runtime's thread and an `iw` that hangs never delays a pass (passes every 0.1 s, a switch carried out within a pass);
+  main() wires it; every block and gap validates against the contract (AJV). `tests/test_v1_parity.py`: the version is
+  0.4.2, and a status may carry `network` (checked against the contract's keys, then taken out; 0.3.4 never sends it;
+  none on a Mac) — the comparison with 0.3.4 is otherwise unchanged.
+
 ## 0.4.1 (2026-10-18)
 
 **The review of v1.15.3 (contracts v1.15.4, SYNC.md v1.15.4) — no reload, rollback or port test lets go of a driven

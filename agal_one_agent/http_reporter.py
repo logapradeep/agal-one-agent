@@ -30,12 +30,15 @@ class HttpReporter:
     """
 
     def __init__(self, node_uid: str, auth_token: str = "",
-                 base_url: str = "", server_time=None):
+                 base_url: str = "", server_time=None, link_watch=None):
         self.node_uid = node_uid
         self.auth_token = auth_token
         # The backend's time from the Date of every HTTPS answer (server_time.ServerTime; contracts
         # v1.14.2 review, command-signing.md §5.4): the command gate checks a command's age against it.
         self.server_time = server_time
+        # Agent 0.4.2 (contracts v1.16.0, nodes/README.md §11): told of every answer from the cloud and of every
+        # request that got none (net_care.LinkWatch) — every request goes through _open, so this is the one place.
+        self.link_watch = link_watch
         # Prefer the backend-supplied URL (config.telemetry.ingress_url); fall
         # back to the module default when the config omits it (older configs or
         # a bare manual install).
@@ -82,14 +85,12 @@ class HttpReporter:
                 headers=self._headers(),
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                self._note_time(resp, req)
+            with self._open(req, 20) as resp:
                 if resp.status != 200:
                     logger.warning("getProgram failed: %d", resp.status)
                     return None
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            self._note_time(e, req)
             logger.warning("getProgram error: %s", e)
             return None
         except Exception as e:  # noqa: BLE001
@@ -119,11 +120,9 @@ class HttpReporter:
                 data=json.dumps({"nodeUid": self.node_uid, "hardware": hardware}).encode("utf-8"),
                 headers=self._headers(), method="POST",
             )
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                self._note_time(resp, req)
+            with self._open(req, 20) as resp:
                 return json.loads(resp.read().decode("utf-8")) if resp.status == 200 else None
         except urllib.error.HTTPError as e:
-            self._note_time(e, req)
             if e.code == 409:
                 logger.error("reportHardware: this board is already linked to another node — unlink it there first")
             else:
@@ -277,8 +276,7 @@ class HttpReporter:
                 headers=headers,
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                self._note_time(resp, req)
+            with self._open(req, 15) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode("utf-8"))
                     return data.get("commands", [])
@@ -286,21 +284,48 @@ class HttpReporter:
                     logger.warning("fetch_boot_state failed: %d", resp.status)
                     return []
         except urllib.error.HTTPError as e:
-            self._note_time(e, req)
             logger.warning("fetch_boot_state error: %s", e)
             return []
         except Exception as e:
             logger.warning("fetch_boot_state error: %s", e)
             return []
 
-    def _note_time(self, resp, req) -> None:
-        """Hand the answer's Date to the server-time reference (an https:// answer only)."""
-        if self.server_time is None:
-            return
+    def _open(self, req, timeout: float):
+        """``urllib.request.urlopen`` — the one call every request of this reporter makes (agent 0.4.2). An answer, of
+        any status (an HTTPError is one: the request reached the cloud), gives its Date to the server-time reference,
+        then tells the link watch it was answered; a request that got none (no connection, a timeout, a name that
+        did not resolve) tells it so. Then the answer or the error goes on to the caller, as before."""
         try:
-            self.server_time.observe(getattr(resp, "headers", None), getattr(req, "full_url", ""))
-        except Exception as e:  # noqa: BLE001 — the time reference never fails a report
-            logger.debug("server time not noted: %s", e)
+            resp = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            self._note_time(e, req)
+            raise
+        except Exception:
+            self._note_no_answer()
+            raise
+        self._note_time(resp, req)
+        return resp
+
+    def _note_time(self, resp, req) -> None:
+        """Hand the answer's Date to the server-time reference (an https:// answer only); then tell the link watch
+        that the cloud answered — after the Date, so the time of the answer that ends a gap is the backend's."""
+        if self.server_time is not None:
+            try:
+                self.server_time.observe(getattr(resp, "headers", None), getattr(req, "full_url", ""))
+            except Exception as e:  # noqa: BLE001 — the time reference never fails a report
+                logger.debug("server time not noted: %s", e)
+        if self.link_watch is not None:
+            try:
+                self.link_watch.answered()
+            except Exception as e:  # noqa: BLE001 — the link watch never fails a report
+                logger.debug("link watch not told of an answer: %s", e)
+
+    def _note_no_answer(self) -> None:
+        if self.link_watch is not None:
+            try:
+                self.link_watch.no_answer()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("link watch not told of a request with no answer: %s", e)
 
     def _headers(self) -> dict:
         """Request headers, including the node auth header when a token is configured."""
@@ -326,14 +351,12 @@ class HttpReporter:
                 headers=self._headers(),
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                self._note_time(resp, req)
+            with self._open(req, 10) as resp:
                 self.last_status = resp.status
                 if resp.status != 200:
                     logger.warning("HTTP report failed: %d", resp.status)
                 return resp.status
         except urllib.error.HTTPError as e:
-            self._note_time(e, req)
             self.last_status = e.code
             logger.warning("HTTP report error: %s", e)
             return e.code

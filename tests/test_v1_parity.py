@@ -12,6 +12,9 @@ port tests, the hardware report …), every OTA update started and what it named
 The only differences allowed are the two that make 0.4.0 what it is: the version it names
 (``firmwareVersion`` / ``agentVersion``) and ``capabilities.blockLanguage`` — 3 in every status of
 0.4.0, absent from every status of 0.3.4. Both are checked, then taken out, and the rest must be equal.
+Since 0.4.2 (contracts v1.16.0, nodes/README.md §11) a status may also carry ``network`` — the node's link, read on a
+thread of its own — on a board that has /sys/class/net (none on a Mac, where this runs): where it is there it must have
+the contract's shape, and it is taken out too; 0.3.4 never sends it.
 
 One behaviour of a language-1 bundle differs ON PURPOSE since 0.4.1 (contracts v1.15.4, programs/README.md §4.8; the
 founder's call to keep or revert): an output a reload DROPS is switched off and its line kept driven at off — 0.3.4 let
@@ -114,6 +117,23 @@ def _block_language_taken_out(records: list[dict], expected) -> list[str]:
     return seen
 
 
+NETWORK_KEYS = {"interface", "kind", "connected", "rssiDbm", "signal", "powerSave", "powerSaveHeld", "at"}
+
+
+def _network_taken_out(records: list[dict], allowed: bool) -> int:
+    """0.4.2: a status may carry `network` (iot-node network without reportedAt) — checked, taken out; 0.3.4: never."""
+    seen = 0
+    for r in records:
+        b = r.get("body")
+        payload = b.get("payload") if isinstance(b, dict) else None
+        if isinstance(b, dict) and b.get("type") == "status" and isinstance(payload, dict) and "network" in payload:
+            block = payload.pop("network")
+            assert allowed, f"0.3.4 sent a network block: {block}"
+            assert isinstance(block, dict) and set(block) <= NETWORK_KEYS and block.get("kind") in ("wifi", "ethernet"), block
+            seen += 1
+    return seen
+
+
 def _streams(data: dict) -> dict[str, list]:
     """Per stream (GPIO, each MQTT topic + type, each HTTPS endpoint + type, OTA, the steps), in order —
     each stream is written by one thread or in the order of the session's steps."""
@@ -145,9 +165,11 @@ def _first_difference(a: list, b: list) -> str:
 
 def _assert_same(old: dict, new: dict) -> dict:
     assert old["version"] == "0.3.4", old["version"]
-    assert new["version"] == "0.4.1", new["version"]  # the tree's own version (the driver ignores installed metadata)
+    assert new["version"] == "0.4.2", new["version"]  # the tree's own version (the driver ignores installed metadata)
     _block_language_taken_out(old["records"], None)
     _block_language_taken_out(new["records"], 3)
+    _network_taken_out(old["records"], allowed=False)
+    _network_taken_out(new["records"], allowed=True)
     so, sn = _streams(old), _streams(new)
     assert sorted(so) == sorted(sn), f"streams differ: {sorted(set(so) ^ set(sn))}"
     for name in so:
@@ -231,7 +253,7 @@ def test_the_wave_1_commands_reach_a_v3_program_only_through_the_signed_command_
     node) go through the 0.3.4 event queue with an eventId; every status names 0.4.0 and blockLanguage 3."""
     data = drives["0.4.0 v3-gate"]
     recs = data["records"]
-    assert data["version"] == "0.4.1"
+    assert data["version"] == "0.4.2"
     https = [r for r in recs if r["kind"] == "https"]
 
     # The cold start of the pump house: Valve 2 (latching) cannot be vouched for — FAULT, posted as a node event.
@@ -271,7 +293,7 @@ def test_the_wave_1_commands_reach_a_v3_program_only_through_the_signed_command_
     assert all(r["body"]["payload"].get("eventId") for r in https if (r.get("body") or {}).get("type") == "sensor_event")
 
     statuses = [r["body"]["payload"] for r in https if (r.get("body") or {}).get("type") == "status"]
-    assert statuses and all(s["firmwareVersion"] == "0.4.1" for s in statuses)  # the clean stop's offline one too
+    assert statuses and all(s["firmwareVersion"] == "0.4.2" for s in statuses)  # the clean stop's offline one too
     online = [s for s in statuses if s.get("online")]
     assert online and all(s["capabilities"]["blockLanguage"] == 3 for s in online)
     # After the restart the program is loaded before MQTT: its first status carries the built-ins.
