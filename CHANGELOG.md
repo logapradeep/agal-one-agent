@@ -1,6 +1,6 @@
 # Changelog — agal-one-agent
 
-## 0.4.1 (2026-10-17, not tagged)
+## 0.4.1 (2026-10-18)
 
 **The review of v1.15.3 (contracts v1.15.4, SYNC.md v1.15.4) — no reload, rollback or port test lets go of a driven
 line; a line changes its use in two bundles.** Still 0.4.1 (not tagged, never released): the backend now migrates a
