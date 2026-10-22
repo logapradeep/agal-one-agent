@@ -7,6 +7,8 @@ import urllib.request
 import urllib.error
 from typing import Optional
 
+from .net_care import failure_kind
+
 logger = logging.getLogger(__name__)
 
 # Fallback only — the backend supplies the live endpoint via config.yaml
@@ -294,14 +296,16 @@ class HttpReporter:
         """``urllib.request.urlopen`` — the one call every request of this reporter makes (agent 0.4.2). An answer, of
         any status (an HTTPError is one: the request reached the cloud), gives its Date to the server-time reference,
         then tells the link watch it was answered; a request that got none (no connection, a timeout, a name that
-        did not resolve) tells it so. Then the answer or the error goes on to the caller, as before."""
+        did not resolve) tells it so — since agent 0.4.3 with HOW it got none (``net_care.failure_kind``: dns, connect,
+        tls, timeout or other, from the error's type; the error's text stays in this node's log). Then the answer or
+        the error goes on to the caller, as before."""
         try:
             resp = urllib.request.urlopen(req, timeout=timeout)
         except urllib.error.HTTPError as e:
             self._note_time(e, req)
             raise
-        except Exception:
-            self._note_no_answer()
+        except Exception as e:
+            self._note_no_answer(e)
             raise
         self._note_time(resp, req)
         return resp
@@ -320,10 +324,10 @@ class HttpReporter:
             except Exception as e:  # noqa: BLE001 — the link watch never fails a report
                 logger.debug("link watch not told of an answer: %s", e)
 
-    def _note_no_answer(self) -> None:
+    def _note_no_answer(self, error: Optional[BaseException] = None) -> None:
         if self.link_watch is not None:
             try:
-                self.link_watch.no_answer()
+                self.link_watch.no_answer(failure_kind(error) if error is not None else None)
             except Exception as e:  # noqa: BLE001
                 logger.debug("link watch not told of a request with no answer: %s", e)
 

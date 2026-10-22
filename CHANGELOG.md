@@ -1,5 +1,63 @@
 # Changelog — agal-one-agent
 
+## 0.4.3 (2026-10-22)
+
+**Why the cloud could not be reached (contracts v1.17.0, nodes/README.md §12; SYNC.md v1.17.0).** Not tagged, not
+released: releasing it — a tag and `/config/agent` 0.4.3 — is the founder's, after the backend deploy. It reaches the Pi
+over the air (the app's Update button); nothing is done on its terminal.
+
+**Why (2026-10-22, the Pump house).** From 16:18Z the Pi (a Raspberry Pi 3B, Raspberry Pi OS on Debian trixie,
+NetworkManager, agent 0.4.2) lost the cloud about once a minute for 25+ minutes: its MQTT connection reconnected every
+~61–92 s and most HTTPS heartbeats between got no answer. Every `connectivity_gap` said its Wi-Fi stayed connected
+(−42 … −44 dBm, power saving off), so the fault was beyond the Wi-Fi — but nothing said whether the router stopped
+answering, the internet behind it was down, the name lookup (DNS) failed, or the cloud itself did not answer.
+
+- **Every request that got no answer is classified.** `HttpReporter._open` (the one call every request makes) hands the
+  `LinkWatch` the kind — `net_care.failure_kind`, from the error's TYPE: `dns` (a `socket.gaierror`), `connect` (refused,
+  the network or host unreachable, a connection that timed out), `tls` (an `ssl.SSLError` while connecting, or CPython's
+  *The handshake operation timed out*), `timeout` (a `TimeoutError` while waiting for the answer — urllib does not wrap
+  it), `other`. The error's text stays in the node's log; nothing of it is sent. An HTTP answer of any status is still an
+  answer.
+- **NEW `NetworkProbe`, on a thread of its own (`net-probe`)** — never the runtime's, never under its lock
+  (programs/README.md §4.8). Woken (an Event, set by the request's thread, which never waits) when a silence begins
+  after an answer, it probes while the silence lasts, one probe at a time, a round at most every 10 s and at most 12
+  rounds per silence: the ROUTER — `ip -4 route show default` (the lowest metric; a `linkdown` route only when no other),
+  `ping -n -c1 -W1 <gateway>`, then `ip neigh show <gateway>` (read after the ping, which makes the kernel resolve the
+  router): answered (the ping, or the entry REACHABLE), silent (no ping answer and the entry FAILED / INCOMPLETE),
+  unknown; when the router is silent the round ends there; the INTERNET — a TCP connection, 3 s, to the cloud's
+  last-known address on 443, closed at once (no TLS, no request; never a third-party host); the NAME LOOKUP —
+  `getent ahosts <host>`, 3 s (no answer in 3 s is failed). The last-known address is the first IPv4 address of the last
+  successful lookup — a round's, or the probe thread's own outside a silence: once after the cloud first answers, then at
+  most once an hour (the only program the probes run outside a silence). Every program is an argv list, never a shell,
+  with `LC_ALL=C` and a bound (`ip` 2 s, `ping` 3 s, `getent` 3 s), killed with its process group when it does not end;
+  one that will not die is left and no program is started while it lives. A round hands each finding to the watch as
+  soon as it is known, and only for the silence that lasts (a round that ends after the answer is dropped). Nothing is
+  probed before the cloud has answered once, nor on a board without /sys/class/net (the probe thread starts with the
+  net-care thread and stops with it).
+- **The gap says why.** `connectivity_gap`'s payload.connectivity gains `failures` {dns, connect, tls, timeout, other},
+  `router`, `internet`, `nameLookup` (the worse finding of the silence's rounds) and `cause` — the decision table
+  (`net_care.cause_of`, the reference's `causeOf`): wifi (the Wi-Fi dropped) · router (silent, the Wi-Fi up throughout) ·
+  internet (the router answered, the cloud's address unreachable) · dns (the address reached, the name not looked up —
+  in a probe, or by every request) · cloud (everything the node could check worked) · unknown. The log says it in words
+  (*no answer from the cloud for 5 min 10 s (…); its router answered, but the internet behind it was down — reported as
+  connectivity_gap (router answered, internet unreachable, name lookup failed; no answer: 9 connect)*).
+- `wire_network` (main.py's call, unchanged) also starts the probe thread, with the reporter's ingress host as its cloud;
+  `NetworkCare.stop()` stops it. Version 0.4.3 (`setup.py`, `__init__`).
+- Tests: NEW `tests/test_net_why.py` (133): every error urllib raises → its kind, constructed and REAL (a name that does
+  not resolve, a refused port, a server that speaks no TLS, one that never finishes the handshake, an HTTP server that
+  never answers, one that closes) through the real reporter; every new vector of `nodes/vectors/network.json` (`ip -4
+  route`, `ip neigh`, iputils `ping`'s exits, glibc `getent ahosts`, each finding, merge, the decision table); the
+  round's exact argv lists and bounds; the router silent ends the round; the address lookup (after the first answer,
+  hourly, a round's refreshing it, IPv4 first, kept when DNS fails), no third-party host; rounds ≥ 10 s apart and 12 at
+  most per silence; a round of an ended silence dropped; a probe that will not die starts no other program; a ping
+  that does not end killed at its bound (the real run_tool); no probe possible → unknown; nothing before the first
+  answer; on a real ProgramHost the probes run on `net-probe` only and a pass is never delayed (hung ip, ping and getent);
+  end to end the real reporter, watch, probe thread and node-event queue against a local ingress — the gap posted once
+  saying `internet`, the error's words not in it; `wire_network` starts and stops the probe; every gap of every cause
+  validates (AJV). `tests/test_net_care.py`: the 0.4.2 gap vectors on their v1.16.0 fields (the five checked present and
+  the cause the table's), the `diagnose` ones whole, the Pump house's gaps with the five. `tests/test_v1_parity.py`: the
+  version is 0.4.3; nothing it records changes (no probe runs on a Mac).
+
 ## 0.4.2 (2026-10-18)
 
 **The node's Wi-Fi care, its network report and its gaps (contracts v1.16.0, nodes/README.md §11; SYNC.md v1.16.0).**

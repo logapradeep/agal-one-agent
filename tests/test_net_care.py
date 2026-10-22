@@ -18,6 +18,10 @@ power saving is a common cause on a Pi 3B — from a router or internet drop. He
   an eventId, through the node-event queue;
 * nothing of it runs on the runtime's thread, and an `iw` that hangs never delays a pass;
 * main() wires it, and what the agent sends validates against the contract (AJV, when AJV_PATH is set).
+
+Agent 0.4.3 (contracts v1.17.0, nodes/README.md §12): every gap also carries failures, router, internet, nameLookup and
+cause — the 0.4.2 gap vectors are checked on their v1.16.0 fields (and the five checked present, the cause the table's),
+the `diagnose` vectors whole; the probes themselves are tests/test_net_why.py's.
 """
 
 from __future__ import annotations
@@ -391,6 +395,8 @@ def test_iwconfig_outputs(case):
 
 
 def _replay(steps: list, emitted: list, min_gap_s: float = V["_meta"]["minGapS"]) -> LinkWatch:
+    """A timeline of the contract's vectors on the real LinkWatch: answers, misses (with their failure kind, 0.4.3),
+    link samples, and (0.4.3) probe rounds — handed over as NetworkProbe hands them, for the silence that lasts."""
     clock = {"t": 0.0, "ms": 0.0}
     w = LinkWatch(emitted.append, monotonic=lambda: clock["t"], now_ms=lambda: clock["ms"], min_gap_s=min_gap_s)
     for s in steps:
@@ -399,17 +405,32 @@ def _replay(steps: list, emitted: list, min_gap_s: float = V["_meta"]["minGapS"]
             clock["ms"] = ms_of(s["at"])
             w.answered()
         elif s["kind"] == "miss":
-            w.no_answer()
+            w.no_answer(s.get("failure"))
+        elif s["kind"] == "probe":
+            silence = w.silence()
+            if silence is not None:
+                w.found(silence, router=s.get("router"), internet=s.get("internet"), name_lookup=s.get("nameLookup"))
         else:
             w.sample(LinkSample.from_reference(s["sample"]))
     return w
+
+
+#: The fields of agent 0.4.2's gap (v1.16.0); agent 0.4.3 adds DIAGNOSTICS.
+V1160 = ("from", "to", "seconds", "interface", "kind", "wifiConnectedThroughout", "wifiDropped", "rssiDbmBefore",
+         "signalBefore", "powerSave")
+DIAGNOSTICS = ("failures", "router", "internet", "nameLookup", "cause")
 
 
 @pytest.mark.parametrize("case", V["gaps"], ids=lambda c: c["name"])
 def test_the_gap_watch_answers_every_vector(case):
     emitted: list = []
     _replay(case["steps"], emitted)
-    assert [e["payload"]["connectivity"] for e in emitted] == case["expect"]
+    got = [e["payload"]["connectivity"] for e in emitted]
+    if case.get("diagnose"):
+        assert got == case["expect"]
+    else:  # an agent 0.4.2 timeline: its fields as they were, and the five of 0.4.3 beside them
+        assert [{k: g[k] for k in V1160 if k in g} for g in got] == case["expect"]
+        assert all(set(DIAGNOSTICS) <= set(g) and g["cause"] == net_care.cause_of(g) for g in got)
     assert all(e["type"] == "connectivity_gap" and e["source"] == "node" and "sourceKey" not in e for e in emitted)
 
 
@@ -442,12 +463,18 @@ def _pump_house(tmp_path, drop_at=None):
     return emitted
 
 
+#: What a gap of the Pump house's morning carries beside its v1.16.0 fields on agent 0.4.3 with no probe thread (here):
+#: ten heartbeats that got nothing (no kind given: other), nothing found.
+NOT_PROBED = {"failures": {"dns": 0, "connect": 0, "tls": 0, "timeout": 0, "other": 10}, "router": "unknown",
+              "internet": "unknown", "nameLookup": "unknown"}
+
+
 def test_the_pump_house_was_cut_off_with_its_wifi_up(tmp_path):
     emitted = _pump_house(tmp_path)
     assert [e["payload"] for e in emitted] == [{"connectivity": {
         "from": "2026-10-18T10:40:13.500Z", "to": "2026-10-18T10:45:23.500Z", "seconds": 310, "interface": "wlan0",
         "kind": "wifi", "wifiConnectedThroughout": True, "wifiDropped": False, "rssiDbmBefore": -64, "signalBefore": "fair",
-        "powerSave": "off"}}]
+        "powerSave": "off", **NOT_PROBED, "cause": "unknown"}}]
 
 
 def test_the_pump_house_was_cut_off_and_its_wifi_dropped(tmp_path):
@@ -455,7 +482,7 @@ def test_the_pump_house_was_cut_off_and_its_wifi_dropped(tmp_path):
     assert [e["payload"]["connectivity"] for e in emitted] == [{
         "from": "2026-10-18T10:40:13.500Z", "to": "2026-10-18T10:45:23.500Z", "seconds": 310, "interface": "wlan0",
         "kind": "wifi", "wifiConnectedThroughout": False, "wifiDropped": True, "rssiDbmBefore": -64, "signalBefore": "fair",
-        "powerSave": "off"}]
+        "powerSave": "off", **NOT_PROBED, "cause": "wifi"}]
 
 
 class _Ingress:
@@ -526,6 +553,9 @@ def test_the_reporter_tells_the_watch_and_the_gap_is_posted_once_through_the_nod
         # nothing known of the link (no net-care here): no interface, no kind, the five null
         assert {k: gap[k] for k in ("wifiConnectedThroughout", "wifiDropped", "rssiDbmBefore", "signalBefore", "powerSave")} == \
             dict.fromkeys(("wifiConnectedThroughout", "wifiDropped", "rssiDbmBefore", "signalBefore", "powerSave"))
+        # 0.4.3: the request to the dead port was refused — a connect failure; no probe ran here: unknown
+        assert gap["failures"] == {"dns": 0, "connect": 1, "tls": 0, "timeout": 0, "other": 0}
+        assert (gap["router"], gap["internet"], gap["nameLookup"], gap["cause"]) == ("unknown",) * 4
         # answered again at once: no second gap
         rep.report_status(online=True, uptime=4, firmware_version="0.4.2")
         assert len(watch.gaps) == 1
@@ -563,8 +593,8 @@ def test_every_request_of_the_reporter_reaches_the_watch():
         def answered(self):
             seen.append("answer")
 
-        def no_answer(self):
-            seen.append("miss")
+        def no_answer(self, kind=None):
+            seen.append(f"miss {kind}")
 
     dead = _dead_url()
     rep = HttpReporter(NODE, auth_token=TOKEN, base_url=dead, link_watch=W())
@@ -578,7 +608,7 @@ def test_every_request_of_the_reporter_reaches_the_watch():
         assert rep.report_command_ack("Xq3k9TzLmN2pRs7VbW1c", "completed") is None
     finally:
         hr.BOOT_STATE_URL = old
-    assert seen == ["miss"] * 4
+    assert seen == ["miss connect"] * 4, "0.4.3: each with how it got no answer (the dead port refuses)"
     ingress = _Ingress()
     try:
         rep.base_url = ingress.url
