@@ -2,7 +2,7 @@
 
 ## 0.4.3 (2026-10-22)
 
-**Why the cloud could not be reached (contracts v1.17.0, nodes/README.md §12; SYNC.md v1.17.0).** Not tagged, not
+**Why the cloud could not be reached (contracts v1.18.0, nodes/README.md §12; SYNC.md v1.18.0).** Not tagged, not
 released: releasing it — a tag and `/config/agent` 0.4.3 — is the founder's, after the backend deploy. It reaches the Pi
 over the air (the app's Update button); nothing is done on its terminal.
 

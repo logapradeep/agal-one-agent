@@ -12,7 +12,7 @@ setup(
     # entry with no direction or active level, and a switch that would let go of, read, drive or invert a line.
     # 0.4.2 (unreleased, not tagged): the node's Wi-Fi care and its gaps (contracts v1.16.0) — the heartbeat's `network`
     # block, the Wi-Fi power saving kept off, a connectivity_gap after 60 s or more without an answer from the cloud.
-    # 0.4.3 (unreleased, not tagged): why the cloud could not be reached (contracts v1.17.0) — every request that got no
+    # 0.4.3 (unreleased, not tagged): why the cloud could not be reached (contracts v1.18.0) — every request that got no
     # answer classified, the router, the internet and the name lookup probed while a silence lasts, the gap's cause.
     version="0.4.3",
     packages=find_packages(),

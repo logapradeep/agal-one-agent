@@ -14,7 +14,7 @@ The only differences allowed are the two that make 0.4.0 what it is: the version
 0.4.0, absent from every status of 0.3.4. Both are checked, then taken out, and the rest must be equal.
 Since 0.4.2 (contracts v1.16.0, nodes/README.md §11) a status may also carry ``network`` — the node's link, read on a
 thread of its own — on a board that has /sys/class/net (none on a Mac, where this runs): where it is there it must have
-the contract's shape, and it is taken out too; 0.3.4 never sends it. Agent 0.4.3 (contracts v1.17.0, nodes/README.md §12)
+the contract's shape, and it is taken out too; 0.3.4 never sends it. Agent 0.4.3 (contracts v1.18.0, nodes/README.md §12)
 probes while a silence lasts — on a board with /sys/class/net only, so here nothing runs and nothing it records changes.
 
 One behaviour of a language-1 bundle differs ON PURPOSE since 0.4.1 (contracts v1.15.4, programs/README.md §4.8; the

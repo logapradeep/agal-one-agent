@@ -213,7 +213,7 @@ def main():
     # connectivity_gap through the node-event queue above; the net-care thread — its own, never the runtime's — reads the
     # link, keeps the Wi-Fi power saving off and gives the heartbeat its `network` block. Started here, before MQTT
     # connects: the power saving is turned off as early as it can be. tests/test_net_care.py checks this call.
-    # Agent 0.4.3 (contracts v1.17.0, §12): every request that got no answer is classified, and while a silence lasts
+    # Agent 0.4.3 (contracts v1.18.0, §12): every request that got no answer is classified, and while a silence lasts
     # the net-probe thread (its own too) probes the router, the internet and the name lookup; the gap says why.
     network = wire_network(mqtt_client, http_reporter, offline=args.offline,
                            clock_ok=agent_clock.clock_ok, server_time=server_time)

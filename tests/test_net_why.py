@@ -1,4 +1,4 @@
-"""Agent 0.4.3 (contracts v1.17.0, nodes/README.md §12): why the cloud could not be reached.
+"""Agent 0.4.3 (contracts v1.18.0, nodes/README.md §12): why the cloud could not be reached.
 
 The Pump house (2026-10-22): from 16:18Z a Raspberry Pi 3B on Raspberry Pi OS (trixie, NetworkManager), agent 0.4.2,
 lost the cloud about once a minute for 25+ minutes — its MQTT connection reconnected every ~61–92 s and most HTTPS

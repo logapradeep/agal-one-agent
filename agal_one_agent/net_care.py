@@ -27,7 +27,7 @@ network, the disk or a probe):
   answers are ``MIN_GAP_S`` (60 s) or more apart, it raises one ``connectivity_gap`` event through the node-event queue
   (``mqtt_client.publish_event`` → node_events.py: HTTPS, ordered, retried, with an eventId).
 
-Agent 0.4.3 (contracts v1.17.0 — nodes/README.md §12; the reference's part F, the same vectors, which
+Agent 0.4.3 (contracts v1.18.0 — nodes/README.md §12; the reference's part F, the same vectors, which
 tests/test_net_why.py runs this module against): WHY the cloud could not be reached. The Pump house (2026-10-22): from
 16:18Z its link to the cloud dropped about once a minute for 25+ minutes, every gap said its Wi-Fi stayed connected
 (−42 … −44 dBm, power saving off), and nothing said whether the router, the internet behind it, the name lookup or the

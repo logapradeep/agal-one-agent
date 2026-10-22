@@ -19,7 +19,7 @@ power saving is a common cause on a Pi 3B — from a router or internet drop. He
 * nothing of it runs on the runtime's thread, and an `iw` that hangs never delays a pass;
 * main() wires it, and what the agent sends validates against the contract (AJV, when AJV_PATH is set).
 
-Agent 0.4.3 (contracts v1.17.0, nodes/README.md §12): every gap also carries failures, router, internet, nameLookup and
+Agent 0.4.3 (contracts v1.18.0, nodes/README.md §12): every gap also carries failures, router, internet, nameLookup and
 cause — the 0.4.2 gap vectors are checked on their v1.16.0 fields (and the five checked present, the cause the table's),
 the `diagnose` vectors whole; the probes themselves are tests/test_net_why.py's.
 """
