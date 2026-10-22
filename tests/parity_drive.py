@@ -20,7 +20,8 @@ Scenarios:
               then a warm one that loads the persisted program, switches the light on and stops.
 ``v3-gate``   (0.4.0 only) The pump house of the golden vectors (two-node-layout.json, bundle v3) on the
               same fakes: the wave-1 commands — resetValve, pauseAutomation, resumeAutomation — unsigned,
-              forged, stale and replayed, then signed; an OTA update; a restart.
+              forged, stale and replayed, then signed; an OTA update; a restart. Its block runtime runs on a
+              wall clock of its own, from 10:00 IST (``pin_wall_clock``): the pump house waters at 06:00.
 
 The output is a list of records in the order they happened (``seq``), each with its ``kind``
 (``gpio`` | ``mqtt`` | ``https`` | ``ota`` | ``step``). Nothing is normalised here: the test does it.
@@ -37,7 +38,9 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta
 from email.message import Message
+from zoneinfo import ZoneInfo
 
 # Each tree reports the version its own source says (the __init__.py fallback): the venv's editable
 # install would otherwise answer with its own metadata for both.
@@ -513,7 +516,32 @@ def _wait_writes(line: int, before: int, timeout: float = 10.0) -> bool:
     return False
 
 
+# The pump house's instruction waters every day at 06:00 (a start up to 60 min late is still taken): on the machine's
+# own clock the v3-gate session ran into that run between 06:00 and 07:00 IST, and its OTA step named the pump, Valve 1
+# and the run as on (SYNC.md v1.15.2 item 15(e)). Its block runtime is given a wall clock that starts here instead.
+V3_GATE_WALL = datetime(2026, 10, 17, 10, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+
+
+def pin_wall_clock(start: datetime) -> None:
+    """The block runtimes read the wall clock only through ``Clock.now`` (blocks/clock.py — so that the simulator and
+    the tests can drive it, as they do with a SimClock); ``main()`` builds its own SystemClock, so the class's wall
+    clock is set here: from ``start``, moving with the monotonic clock. Nothing else reads it: signatures, acks and
+    timestamps keep the machine's time."""
+    from agal_one_agent.blocks import clock as clock_mod  # noqa: PLC0415
+    t0 = time.monotonic()
+
+    def now(self, tz: str) -> datetime:
+        wall = start + timedelta(seconds=time.monotonic() - t0)
+        try:
+            return wall.astimezone(ZoneInfo(tz or "Asia/Kolkata"))
+        except Exception:  # noqa: BLE001 — an unknown zone name, as SystemClock.now
+            return wall
+
+    clock_mod.SystemClock.now = now
+
+
 def scenario_v3_gate(workdir: str) -> None:
+    pin_wall_clock(V3_GATE_WALL)
     sys.path.insert(0, os.path.join(ROOT, "tests"))
     import v3_bench  # noqa: PLC0415 — the golden vectors' pump house
     b = v3_bench.pumphouse(7)
