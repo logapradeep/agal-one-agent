@@ -171,7 +171,7 @@ class ClockCare:
         return reading
 
     def status(self) -> Optional[dict]:
-        """The heartbeat's ``clock`` block (functions.yaml 1.18.0 NodeStatusClock), from memory — None before the
+        """The heartbeat's ``clock`` block (functions.yaml 1.19.0 NodeStatusClock), from memory — None before the
         first reading."""
         with self._lock:
             r = dict(self._reading) if self._reading else None

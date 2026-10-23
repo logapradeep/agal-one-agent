@@ -1156,7 +1156,7 @@ def _iso_ms(ms: float) -> str:
 
 
 def wait_report() -> Optional[dict]:
-    """The heartbeat's `otaWait` block (contracts v1.24.0, functions.yaml 1.18.0 NodeStatusOtaWait), or None: while an
+    """The heartbeat's `otaWait` block (contracts v1.24.0, functions.yaml 1.19.0 NodeStatusOtaWait), or None: while an
     update waits for the node's outputs to go off, {phase waiting_idle, on, runs, since, until, at}; after a wait that ran
     out, {phase busy, on — what stayed on, runs, since, endedAt, at} until the next update starts. From memory."""
     with _WAIT_LOCK:
