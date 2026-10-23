@@ -18,7 +18,7 @@ first answer since the agent started, the wall clock when ``clock_ok()`` (NTP / 
 otherwise None — and the command gate then refuses every command as ``stale`` ("no trusted time
 yet") until the backend has answered (the answer to that refusal's own ack is enough).
 
-The offset (agent 0.4.4, contracts v1.24.0; nodes/README.md §14, ADR-031 §6). Each answer is also a
+The offset (agent 0.4.4, contracts v1.26.0; nodes/README.md §14, ADR-031 §6). Each answer is also a
 sample of how far the node's WALL clock is from the backend's: the wall clock when it was read minus
 its Date + 500 ms (``add_sample``). ``offset`` is the median of the last 15 samples since the wall
 clock last stepped against the monotonic clock by more than 1 s (NTP synchronising after a power cut,

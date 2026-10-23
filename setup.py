@@ -15,7 +15,7 @@ setup(
     # 0.4.3 (released 2026-10-23, live on the Pump house): why the cloud could not be reached (contracts v1.18.0) — every
     # request that got no answer classified, the router, the internet and the name lookup probed while a silence lasts,
     # the gap's cause.
-    # 0.4.4 (unreleased, not tagged): contracts v1.24.0 — a single-pulse valve closed before a clean shutdown and at a
+    # 0.4.4 (unreleased, not tagged): contracts v1.26.0 — a single-pulse valve closed before a clean shutdown and at a
     # clean start (built in; an unclean start faults it, no pulse); an update that waits says so (the heartbeat's
     # otaWait); a valve's words name its port (DI3, DO2) with the card; the node's clock source and offset (`clock`).
     version="0.4.4",

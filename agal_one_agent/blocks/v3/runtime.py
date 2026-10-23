@@ -22,7 +22,7 @@ everything as it was and the bundle is rejected.
 Pause-first manual operation (§4a, §7.7): while paused, instruction parts and ordinary rule slots wait;
 the built-ins and the interlock rule slots keep running.
 
-A single-pulse valve is closed at start-up and before a shutdown, built in (agent 0.4.4, contracts v1.24.0; §7.9 —
+A single-pulse valve is closed at start-up and before a shutdown, built in (agent 0.4.4, contracts v1.26.0; §7.9 —
 the founder's rule of 2026-10-14): a clean stop sends every single-pulse valve not in FAULT one close pulse before it
 records the clean stop (``apply_safe_state``); a clean start's boot pass sends each one it vouches for one close pulse,
 whatever position it recorded (``start_close``); an unclean start sends none — FAULT, a reset needed. ``valve_closed``.
@@ -367,8 +367,8 @@ class RuntimeV3:
             if first_start or ent is None:
                 reason = "position_unknown"
             elif ent.get("config") and not same_configuration(ent["config"], drv.signature):
-                # A changed configuration (contracts v1.24.0: a port id stated on one side only — a state agent 0.4.3
-                # wrote, a bundle compiled before v1.24.0 — is not a change).
+                # A changed configuration (contracts v1.26.0: a port id stated on one side only — a state agent 0.4.3
+                # wrote, a bundle compiled before v1.26.0 — is not a change).
                 reason = "position_unknown"
             elif ent.get("pulse"):
                 reason = "pulse_cut_short"
@@ -378,7 +378,7 @@ class RuntimeV3:
             elif not clean:
                 reason = "unclean_boot"
             elif ent.get("position") in ("open", "closed"):
-                # Vouched for: a clean start. Agent 0.4.4 (contracts v1.24.0, README §7.9 — the founder's rule): the boot
+                # Vouched for: a clean start. Agent 0.4.4 (contracts v1.26.0, README §7.9 — the founder's rule): the boot
                 # pass sends it one close pulse, whatever position it recorded (start_close); an interrupted run re-opens
                 # it when it resumes, 30 s later.
                 drv.position = ent["position"]
@@ -488,7 +488,7 @@ class RuntimeV3:
                     st.pending_events.append(("__valve_fault__", {"assetId": aid, "reason": "position_unknown"}))
                 continue
             if same_configuration(od.cfg, drv.cfg) or (not drv.latching and not od.latching):
-                # Contracts v1.24.0: a bundle that only adds the port ids (words) is not a changed configuration.
+                # Contracts v1.26.0: a bundle that only adds the port ids (words) is not a changed configuration.
                 drv.carry_from(od)
             else:  # a changed configuration: its position cannot be vouched for
                 drv.carry_from(od)
@@ -789,7 +789,7 @@ class RuntimeV3:
 
     def apply_safe_state(self) -> None:
         """A clean stop: every motor and every other output whose safeState is off is switched off, each
-        continuous valve closes; then (agent 0.4.4, contracts v1.24.0, README §7.9 — the founder's rule of 2026-10-14)
+        continuous valve closes; then (agent 0.4.4, contracts v1.26.0, README §7.9 — the founder's rule of 2026-10-14)
         every single-pulse valve that is not in FAULT gets ONE close pulse, in assets[] order, whatever position it
         recorded: recorded as any pulse is, with ``valve_closed`` (cause shutdown). Its supply is read first: not
         present (or not readable) puts it in FAULT (``supply_lost``) and no pulse is sent; absent after the pulse is
@@ -1277,7 +1277,7 @@ class RuntimeV3:
                 continue
             v = self._input(drv.supply)
             if v is None or not bool(v):
-                # Contracts v1.24.0: the port id with the sense card's name ("the supply on DI3 (UPS supply) dropped").
+                # Contracts v1.26.0: the port id with the sense card's name ("the supply on DI3 (UPS supply) dropped").
                 where = (f"the supply on {self._supply_words(drv)}" if drv.supply_port_id
                          else f"the supply on {drv.supply[1]} of card {drv.supply[0]}")
                 detail = f"{where} " + ("cannot be read" if v is None else "dropped")
@@ -2149,7 +2149,7 @@ class RuntimeV3:
         return card.ports.get(drv.supply[1]) if card is not None else None
 
     def _supply_words(self, drv) -> str:
-        """A latching valve's supply sense named by its PORT. Agent 0.4.4 (contracts v1.24.0 — the founder's answer 7,
+        """A latching valve's supply sense named by its PORT. Agent 0.4.4 (contracts v1.26.0 — the founder's answer 7,
         SF-5): its node port id with the sense card's name — ``DI3 (UPS supply)`` — when the bundle names the port; else,
         as before, its chip line (``line 13 of pinctrl-bcm2835``; a bus input by its bus address: io.describe_port).
         Never a card id: a commandAck has no structured field for the card (contracts v1.15.2 item 15)."""
@@ -2467,7 +2467,7 @@ class RuntimeV3:
             return out
 
     def outputs_on_items(self) -> dict:
-        """The same as ``outputs_on``, for the update's report (agent 0.4.4, contracts v1.24.0, nodes/README.md §13):
+        """The same as ``outputs_on``, for the update's report (agent 0.4.4, contracts v1.26.0, nodes/README.md §13):
         ``{"on": [{"name", "assetId"}], "runs": n}`` — each card that is on once, by its name in the bundle, in the node's
         order; ``runs`` the schedule runs in progress."""
         with self._lock:

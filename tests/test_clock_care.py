@@ -1,4 +1,4 @@
-"""The node's clock: its source and its offset from the backend's time (agent 0.4.4, contracts v1.24.0; nodes/README.md
+"""The node's clock: its source and its offset from the backend's time (agent 0.4.4, contracts v1.26.0; nodes/README.md
 §14; ADR-031 §6 — "each node reports its clock source and offset").
 
 Replays Agal/contracts/nodes/vectors/clock.json: what ``timedatectl show`` and ``systemctl is-active`` print and what is

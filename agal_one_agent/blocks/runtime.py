@@ -1871,7 +1871,7 @@ class BlockRuntime:
             return out
 
     def outputs_on_items(self) -> dict:
-        """The same as ``outputs_on``, for an update's report (agent 0.4.4, contracts v1.24.0, nodes/README.md §13):
+        """The same as ``outputs_on``, for an update's report (agent 0.4.4, contracts v1.26.0, nodes/README.md §13):
         ``{"on": [{"name", "assetId"}], "runs": n}`` — each card with an output on, once; ``runs`` the plot runs."""
         def on(value) -> bool:
             if isinstance(value, bool):

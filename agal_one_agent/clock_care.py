@@ -1,4 +1,4 @@
-"""The node's clock: its source and its offset from the backend's time (agent 0.4.4, contracts v1.24.0;
+"""The node's clock: its source and its offset from the backend's time (agent 0.4.4, contracts v1.26.0;
 nodes/README.md §14; ADR-031 §6 — "each node reports its clock source and offset").
 
 Why. A booking of a shared pump runs in two halves on two nodes — the pump on its owner's node, the well
@@ -171,7 +171,7 @@ class ClockCare:
         return reading
 
     def status(self) -> Optional[dict]:
-        """The heartbeat's ``clock`` block (functions.yaml 1.19.0 NodeStatusClock), from memory — None before the
+        """The heartbeat's ``clock`` block (functions.yaml 1.21.0 NodeStatusClock), from memory — None before the
         first reading."""
         with self._lock:
             r = dict(self._reading) if self._reading else None

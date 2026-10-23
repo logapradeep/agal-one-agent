@@ -1,4 +1,4 @@
-"""An update that waits says so (agent 0.4.4, contracts v1.24.0; nodes/README.md §13; _audit/107 follow-up 32).
+"""An update that waits says so (agent 0.4.4, contracts v1.26.0; nodes/README.md §13; _audit/107 follow-up 32).
 
 On 2026-10-23 the Pump house's update to 0.4.3 waited seven minutes for Mtr1 to go off and the node said nothing but
 "updating" — the founder thought it was stuck. Agent 0.4.4's update thread keeps a record of its wait (wait_report): the

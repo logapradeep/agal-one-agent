@@ -15,7 +15,7 @@ stayed in FAULT (SYNC.md v1.15.2 12(e)). Now the node answers once, from the pas
 * a command that arrives once the runtime has stopped — main() stops it first and disconnects MQTT last — is refused
   on arrival, in words, until the runtime is started again (item 16);
 * ``completed`` with NO pulse for a latching valve no longer in FAULT (idempotent);
-* the words name the supply's PORT as the node knows it, never a card id — agent 0.4.4 (contracts v1.24.0, the
+* the words name the supply's PORT as the node knows it, never a card id — agent 0.4.4 (contracts v1.26.0, the
   founder's answer 7): its node port id with the card's name (DI3 (UPS supply)) when the bundle names it, else its line;
 * through the node's HTTPS ack queue (command_acks.CommandAcks): a pass never waits on the network, also while the
   ingress is stalled.
@@ -50,7 +50,7 @@ from v3_bench import CLEAN, ESTOP, HEALTHY, PUMP, STATE_FILE, TZ, UPS, V1, V2, B
 
 ACTOR = {"uid": "u_owner01", "via": "app"}
 SUPPLY_GONE = "refused: Valve 2's supply on DI3 (UPS supply) is not present"
-# A bundle compiled before contracts v1.24.0 names no port id: the words name the line, as agent 0.4.3 did.
+# A bundle compiled before contracts v1.26.0 names no port id: the words name the line, as agent 0.4.3 did.
 SUPPLY_GONE_LINE = "refused: the valve's supply on line 13 of pinctrl-bcm2835 is not present"
 CLOSE = ("valve.close_coil", 100)
 
@@ -169,7 +169,7 @@ def _without_port_ids(bundle: dict) -> dict:
 
 
 def test_a_bundle_compiled_before_v1_24_0_names_the_line_as_before():
-    """Agent 0.4.4 on a bundle with no port ids (a backend before contracts v1.24.0): the words of agent 0.4.3."""
+    """Agent 0.4.4 on a bundle with no port ids (a backend before contracts v1.26.0): the words of agent 0.4.3."""
     b = bench(bundle=_without_port_ids(both_valves(pumphouse())))
     faulted(b)
     b.set(UPS, "sensor.power", None)

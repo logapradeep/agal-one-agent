@@ -88,7 +88,7 @@ def is_output_port(t: dict) -> bool:
 
 
 def port_words(aid: str, sk: str, t: dict, pid: Optional[str] = None, card_name: Optional[str] = None) -> str:
-    """A card's port in the node's words. Agent 0.4.4 (contracts v1.24.0 — the founder's answer 7, SF-5): the node port
+    """A card's port in the node's words. Agent 0.4.4 (contracts v1.26.0 — the founder's answer 7, SF-5): the node port
     id with the card's name, ``DO3 of Valve 2 (valve.open_coil)``, when the bundle names the port (a valve's coils and
     its supply sense); else, as before, ``valve.open_coil of card asset_x (line 22 of pinctrl-bcm2835)``."""
     if pid:
@@ -97,7 +97,7 @@ def port_words(aid: str, sk: str, t: dict, pid: Optional[str] = None, card_name:
 
 
 def valve_port_ids(bundle: dict) -> dict[tuple[str, str], str]:
-    """(assetId, sourceKey) → the node port id the bundle's valve entries name for it (contracts v1.24.0): each valve's
+    """(assetId, sourceKey) → the node port id the bundle's valve entries name for it (contracts v1.26.0): each valve's
     open and close coils on its own card, its supply sense on the sense card. Words only."""
     out: dict[tuple[str, str], str] = {}
     for a in bundle.get("assets") or []:

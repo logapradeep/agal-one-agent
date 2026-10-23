@@ -1,4 +1,4 @@
-"""A single-pulse valve is closed at start-up and before a shutdown — built in (agent 0.4.4, contracts v1.24.0;
+"""A single-pulse valve is closed at start-up and before a shutdown — built in (agent 0.4.4, contracts v1.26.0;
 programs/README.md §7.9; the founder's rule of 2026-10-14) — and its words name its port (the founder's answer 7, SF-5).
 
 The founder's rule: a single-pulse (latching DC) valve holds its position without power, so the node CLOSES every one at

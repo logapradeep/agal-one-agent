@@ -16,7 +16,7 @@ Since 0.4.2 (contracts v1.16.0, nodes/README.md §11) a status may also carry ``
 thread of its own — on a board that has /sys/class/net (none on a Mac, where this runs): where it is there it must have
 the contract's shape, and it is taken out too; 0.3.4 never sends it. Agent 0.4.3 (contracts v1.18.0, nodes/README.md §12)
 probes while a silence lasts — on a board with /sys/class/net only, so here nothing runs and nothing it records changes.
-Agent 0.4.4 (contracts v1.24.0, nodes/README.md §14) adds ``clock`` to every online status — the node's clock source and
+Agent 0.4.4 (contracts v1.26.0, nodes/README.md §14) adds ``clock`` to every online status — the node's clock source and
 its offset from the backend's time, read on a thread of its own: where it is there it must have the contract's shape, and
 it is taken out too; 0.3.4 never sends it. Its ``otaWait`` (§13) is sent only while a real update waits — never here (the
 session's updates are recorded by a fake perform_update), and 0.3.4 never sends it.

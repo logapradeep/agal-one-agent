@@ -69,7 +69,7 @@ def test_every_event_the_runtime_sends_is_a_valid_event_document(tmp_path):
               "power_cut", "power_restored", "watering_resumed", "guard_tripped", "watering_not_finished",
               "automation_paused", "automation_resumed", "valve_closed"):
         assert t in types, t
-    # agent 0.4.4 (contracts v1.24.0): both causes of valve_closed are among them — the vectors' clean start, the stop
+    # agent 0.4.4 (contracts v1.26.0): both causes of valve_closed are among them — the vectors' clean start, the stop
     assert {e["valve"]["cause"] for e in raw if e["type"] == "valve_closed"} == {"start_up", "shutdown"}
     events = [{"type": e["type"], "source": e["_source"],
                "payload": {k: v for k, v in e.items() if k not in ("type", "_source")}} for e in raw]

@@ -3,7 +3,7 @@
 ## 0.4.4 (2026-10-23)
 
 **A single-pulse valve closed at start-up and before a shutdown, an update that waits says so, a valve's words name its
-port, the node's clock (contracts v1.24.0; programs/README.md §7.9, nodes/README.md §13–§14; SYNC.md v1.24.0).** Not
+port, the node's clock (contracts v1.26.0; programs/README.md §7.9, nodes/README.md §13–§14; SYNC.md v1.26.0).** Not
 tagged, not released: releasing it — a tag and `/config/agent` 0.4.4 — is the founder's, after the backend deploy. It
 reaches the Pi over the air (the app's Update button); nothing is done on its terminal.
 
@@ -22,7 +22,7 @@ reaches the Pi over the air (the app's Update button); nothing is done on its te
   one recorded closed got none) and nothing closed it before a stop. An unclean start is unchanged: FAULT, no pulse. A
   reload and the switch of language (`stop(safe_state=False)`, `take_over_language`) send none.
 - **A valve's configuration and its port ids.** `valve.same_configuration` compares two valve entries leaving out a
-  port id stated on one side only — the first bundle that names them (contracts v1.24.0), or a state file 0.4.3 wrote, is
+  port id stated on one side only — the first bundle that names them (contracts v1.26.0), or a state file 0.4.3 wrote, is
   not a changed configuration (no `position_unknown` at the update to 0.4.4); a coil moved to another port is one.
 - **The words name the port** (SF-5, the founder's answer 7). The bundle's valve entry now names its ports
   (`openPortId`, `closePortId`, `supplyPortId` — words only), and the node says: *refused: Valve 2's supply on DI3 (UPS

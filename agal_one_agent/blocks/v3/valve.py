@@ -18,17 +18,17 @@ a first start, a changed configuration (``position_unknown``). While a valve is 
 to it; the runtime holds only the blocks that use it. A reset sends one close pulse (refused while the
 supply is not sensed present), records the valve closed and clears the fault.
 
-Closed at start-up and before a shutdown — built in (agent 0.4.4, contracts v1.24.0; the founder's rule of
+Closed at start-up and before a shutdown — built in (agent 0.4.4, contracts v1.26.0; the founder's rule of
 2026-10-14; programs/README.md §7.9): before a clean shutdown the runtime sends one close pulse to every
 single-pulse valve that is not in FAULT and only then records the clean stop; at a clean start (a clean-stop
 record, no pulse in progress, the same configuration, not in FAULT) the boot pass sends each one close pulse,
 whatever position it recorded (``start_close``); an unclean start sends none — the valve is in FAULT and waits
 for a reset. Each raises ``valve_closed`` (cause ``shutdown`` / ``start_up``).
 
-The node port ids (agent 0.4.4, contracts v1.24.0 — the founder's answer 7, SF-5): the bundle's valve entry
+The node port ids (agent 0.4.4, contracts v1.26.0 — the founder's answer 7, SF-5): the bundle's valve entry
 names the node port of each port it names (``openPortId``, ``closePortId``, ``supplyPortId``). They are WORDS
 only — the node says "Valve 2's supply on DI3 (UPS supply)" — never what it drives or reads by. A bundle
-compiled before v1.24.0 names none; the words then name the chip line, as before. A port id stated on one side
+compiled before v1.26.0 names none; the words then name the chip line, as before. A port id stated on one side
 only is left out when two configurations are compared (``same_configuration``), so the first bundle that names
 them — or a 0.4.3 state file — is not a changed configuration.
 
@@ -56,7 +56,7 @@ FAULT_WORDS = {
 }
 
 
-#: The valve entry's node port ids (contracts v1.24.0): words only, compared only when both sides state them.
+#: The valve entry's node port ids (contracts v1.26.0): words only, compared only when both sides state them.
 PORT_ID_KEYS = ("openPortId", "closePortId", "supplyPortId")
 PORT_ID_RE = re.compile(r"^(DO|DI|DIO|AI)[1-9][0-9]{0,2}$")
 CLOSE_CAUSES = ("start_up", "shutdown")  # enums.yaml ValveCloseCause
@@ -82,7 +82,7 @@ def _as_config(v: Any) -> Optional[dict]:
 
 def same_configuration(a: Any, b: Any) -> bool:
     """Whether two valve configurations are the same for vouching for the position (programs/README.md §7.9): every
-    key but a port id stated on one side only (a bundle compiled before contracts v1.24.0, a state file agent 0.4.3
+    key but a port id stated on one side only (a bundle compiled before contracts v1.26.0, a state file agent 0.4.3
     wrote). Each side is a cfg dict or its signature; anything that is not JSON is compared as it is."""
     da, db = _as_config(a), _as_config(b)
     if da is None or db is None:
@@ -112,7 +112,7 @@ class ValveDriver:
         self.pulse_ms = max(20, min(2000, int(pm if isinstance(pm, (int, float)) and not isinstance(pm, bool) else DEFAULT_PULSE_MS)))
         sup = cfg.get("supply") or {}
         self.supply: Optional[tuple[str, str]] = (sup["assetId"], sup["sourceKey"]) if sup.get("assetId") and sup.get("sourceKey") else None
-        # Contracts v1.24.0: the node port ids of the ports the entry names — for the node's words only.
+        # Contracts v1.26.0: the node port ids of the ports the entry names — for the node's words only.
         self.open_port_id: Optional[str] = port_id(cfg.get("openPortId"))
         self.close_port_id: Optional[str] = port_id(cfg.get("closePortId")) if self.close_key else None
         self.supply_port_id: Optional[str] = port_id(cfg.get("supplyPortId")) if self.supply else None

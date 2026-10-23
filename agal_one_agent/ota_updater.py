@@ -15,7 +15,7 @@ Flow (see Agal/contracts/enums.yaml#OtaStatus + firmware-rollout.schema.json):
         GitHub release archive of logapradeep/agal-one-agent for exactly that tag) with a sha256;
      b. the node waits while anything it drives is ON (outputs_on): a restart cuts every
         output, so it is not restarted under a running pump. Up to BUSY_WAIT_S, then the
-        update ends `failed` with an error that starts "busy:". Agent 0.4.4 (contracts v1.24.0,
+        update ends `failed` with an error that starts "busy:". Agent 0.4.4 (contracts v1.26.0,
         nodes/README.md §13): the wait SAYS SO — wait_report() is the heartbeat's `otaWait`
         (phase waiting_idle, what is on, since, until), and after a wait that ran out (phase busy,
         what stayed on) until the next update; one heartbeat is asked for at once when the wait
@@ -131,7 +131,7 @@ INSTALL_GRACE_S = 2 * PIP_TIMEOUT_S + VERIFY_DEADLINE_S
 # How long an update waits for the node's outputs to switch off, and how often it looks.
 BUSY_WAIT_S = int(os.environ.get("AGAL_ONE_AGENT_OTA_BUSY_WAIT_S", "1800"))
 BUSY_POLL_S = 10.0
-# Agent 0.4.4 (contracts v1.24.0, nodes/README.md §13): what the wait's report names, and how often a change of it asks
+# Agent 0.4.4 (contracts v1.26.0, nodes/README.md §13): what the wait's report names, and how often a change of it asks
 # for a heartbeat at once (more often, the next 30-s heartbeat carries it).
 WAIT_MAX_ON = 16
 WAIT_MAX_NAME = 80
@@ -1156,7 +1156,7 @@ def _iso_ms(ms: float) -> str:
 
 
 def wait_report() -> Optional[dict]:
-    """The heartbeat's `otaWait` block (contracts v1.24.0, functions.yaml 1.19.0 NodeStatusOtaWait), or None: while an
+    """The heartbeat's `otaWait` block (contracts v1.26.0, functions.yaml 1.21.0 NodeStatusOtaWait), or None: while an
     update waits for the node's outputs to go off, {phase waiting_idle, on, runs, since, until, at}; after a wait that ran
     out, {phase busy, on — what stayed on, runs, since, endedAt, at} until the next update starts. From memory."""
     with _WAIT_LOCK:

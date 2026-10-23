@@ -48,7 +48,7 @@ def handle_firmware_update(command: dict, mqtt_client, node_uid: str, outputs_on
     The command may carry the release archive to install — ``source`` (its URL) and ``sha256``
     (agent 0.3.4): then no git is needed on the board. ``outputs_on`` names what the node has ON;
     the update waits while it names anything (ota_updater.perform_update). Agent 0.4.4
-    (contracts v1.24.0, nodes/README.md §13): ``outputs_report`` names them by card for the wait's
+    (contracts v1.26.0, nodes/README.md §13): ``outputs_report`` names them by card for the wait's
     report (the heartbeat's otaWait), ``on_wait_change`` asks for a heartbeat at once, ``now_ms``
     is the node's trusted time. Blocking: run it through start_firmware_update, never on the MQTT
     loop."""
@@ -120,7 +120,7 @@ def outputs_on_for(runtime) -> list:
 
 
 def outputs_report_for(runtime) -> dict:
-    """``outputs_on_for`` by card, for an update's report (agent 0.4.4, contracts v1.24.0, nodes/README.md §13):
+    """``outputs_on_for`` by card, for an update's report (agent 0.4.4, contracts v1.26.0, nodes/README.md §13):
     {"on": [{name, assetId?}], "runs": n} — the program's cards that are on (each once, by its name in the program) and
     its runs in progress, then the legacy GPIO / PWM outputs by their config names (no card)."""
     from .handlers import gpio_handler, pwm_handler
@@ -269,7 +269,7 @@ def main():
             v = None
         return float(v) if v is not None else time.time() * 1000.0
 
-    # The node's clock (agent 0.4.4, contracts v1.24.0, nodes/README.md §14; ADR-031 §6): the clock-care thread — its own,
+    # The node's clock (agent 0.4.4, contracts v1.26.0, nodes/README.md §14; ADR-031 §6): the clock-care thread — its own,
     # never the runtime's — reads the clock's source every 60 s; the offset from the backend's time comes from the Date of
     # its HTTPS answers (server_time). The heartbeat carries both as `clock`. tests/test_clock_care.py checks this call.
     from .clock_care import wire_clock, with_clock
