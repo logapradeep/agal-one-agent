@@ -39,6 +39,8 @@ class HeartbeatPublisher:
         self._timer: Optional[threading.Timer] = None
         self._running = False
         self._start_time = time.time()
+        # Agent 0.4.4: one timer at a time, whoever schedules it (the chain and a nudge).
+        self._timer_lock = threading.Lock()
 
     def _extra(self) -> Optional[dict]:
         if self.extra_provider is None:
@@ -72,11 +74,24 @@ class HeartbeatPublisher:
         self._running = True
         self._send_heartbeat()
 
+    def nudge(self) -> bool:
+        """Send a heartbeat now, on a thread of its own, and start the 30-s chain again from it (agent 0.4.4: an update
+        that begins to wait says so at once — nodes/README.md §13). Never on the caller's thread; nothing while
+        stopped or paused. True when one was asked for."""
+        if not self._running:
+            return False
+        try:
+            threading.Thread(target=self._send_heartbeat, name="heartbeat-now", daemon=True).start()
+            return True
+        except RuntimeError:  # no thread can be had: the next heartbeat carries it
+            return False
+
     def stop(self) -> None:
         self._running = False
-        if self._timer:
-            self._timer.cancel()
-            self._timer = None
+        with self._timer_lock:
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
         # Send offline status via both channels for immediate reflection — with this agent's own
         # version (the backend stores no version from an offline status, contracts v1.14.2; the
         # agent never sends a placeholder either). Each channel on its own: a failing MQTT publish
@@ -119,10 +134,14 @@ class HeartbeatPublisher:
         except Exception as e:
             logger.error("Heartbeat error: %s", e)
         finally:
-            if self._running:
-                self._timer = threading.Timer(
-                    self.config.telemetry.heartbeat_seconds,
-                    self._send_heartbeat,
-                )
-                self._timer.daemon = True
-                self._timer.start()
+            # One timer at a time (agent 0.4.4): a nudge's heartbeat replaces the one that was due.
+            with self._timer_lock:
+                if self._running:
+                    if self._timer is not None:
+                        self._timer.cancel()
+                    self._timer = threading.Timer(
+                        self.config.telemetry.heartbeat_seconds,
+                        self._send_heartbeat,
+                    )
+                    self._timer.daemon = True
+                    self._timer.start()

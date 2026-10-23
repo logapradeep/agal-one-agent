@@ -16,6 +16,10 @@ Since 0.4.2 (contracts v1.16.0, nodes/README.md §11) a status may also carry ``
 thread of its own — on a board that has /sys/class/net (none on a Mac, where this runs): where it is there it must have
 the contract's shape, and it is taken out too; 0.3.4 never sends it. Agent 0.4.3 (contracts v1.18.0, nodes/README.md §12)
 probes while a silence lasts — on a board with /sys/class/net only, so here nothing runs and nothing it records changes.
+Agent 0.4.4 (contracts v1.24.0, nodes/README.md §14) adds ``clock`` to every online status — the node's clock source and
+its offset from the backend's time, read on a thread of its own: where it is there it must have the contract's shape, and
+it is taken out too; 0.3.4 never sends it. Its ``otaWait`` (§13) is sent only while a real update waits — never here (the
+session's updates are recorded by a fake perform_update), and 0.3.4 never sends it.
 
 One behaviour of a language-1 bundle differs ON PURPOSE since 0.4.1 (contracts v1.15.4, programs/README.md §4.8; the
 founder's call to keep or revert): an output a reload DROPS is switched off and its line kept driven at off — 0.3.4 let
@@ -135,6 +139,27 @@ def _network_taken_out(records: list[dict], allowed: bool) -> int:
     return seen
 
 
+CLOCK_KEYS = {"source", "service", "rtc", "offsetMs", "offsetSamples", "offsetAt", "at"}
+
+
+def _clock_taken_out(records: list[dict], allowed: bool) -> int:
+    """0.4.4: a status may carry `clock` (iot-node clock without reportedAt) — checked, taken out; and never `otaWait`
+    here. 0.3.4: neither."""
+    seen = 0
+    for r in records:
+        b = r.get("body")
+        payload = b.get("payload") if isinstance(b, dict) else None
+        if not (isinstance(b, dict) and b.get("type") == "status" and isinstance(payload, dict)):
+            continue
+        assert "otaWait" not in payload, f"an otaWait block with no update waiting: {payload['otaWait']}"
+        if "clock" in payload:
+            block = payload.pop("clock")
+            assert allowed, f"0.3.4 sent a clock block: {block}"
+            assert isinstance(block, dict) and set(block) <= CLOCK_KEYS and block.get("source") in ("ntp", "rtc", "none", "unknown"), block
+            seen += 1
+    return seen
+
+
 def _streams(data: dict) -> dict[str, list]:
     """Per stream (GPIO, each MQTT topic + type, each HTTPS endpoint + type, OTA, the steps), in order —
     each stream is written by one thread or in the order of the session's steps."""
@@ -166,11 +191,13 @@ def _first_difference(a: list, b: list) -> str:
 
 def _assert_same(old: dict, new: dict) -> dict:
     assert old["version"] == "0.3.4", old["version"]
-    assert new["version"] == "0.4.3", new["version"]  # the tree's own version (the driver ignores installed metadata)
+    assert new["version"] == "0.4.4", new["version"]  # the tree's own version (the driver ignores installed metadata)
     _block_language_taken_out(old["records"], None)
     _block_language_taken_out(new["records"], 3)
     _network_taken_out(old["records"], allowed=False)
     _network_taken_out(new["records"], allowed=True)
+    _clock_taken_out(old["records"], allowed=False)
+    _clock_taken_out(new["records"], allowed=True)
     so, sn = _streams(old), _streams(new)
     assert sorted(so) == sorted(sn), f"streams differ: {sorted(set(so) ^ set(sn))}"
     for name in so:
@@ -254,7 +281,7 @@ def test_the_wave_1_commands_reach_a_v3_program_only_through_the_signed_command_
     node) go through the 0.3.4 event queue with an eventId; every status names 0.4.0 and blockLanguage 3."""
     data = drives["0.4.0 v3-gate"]
     recs = data["records"]
-    assert data["version"] == "0.4.3"
+    assert data["version"] == "0.4.4"
     https = [r for r in recs if r["kind"] == "https"]
 
     # The cold start of the pump house: Valve 2 (latching) cannot be vouched for — FAULT, posted as a node event.
@@ -294,7 +321,7 @@ def test_the_wave_1_commands_reach_a_v3_program_only_through_the_signed_command_
     assert all(r["body"]["payload"].get("eventId") for r in https if (r.get("body") or {}).get("type") == "sensor_event")
 
     statuses = [r["body"]["payload"] for r in https if (r.get("body") or {}).get("type") == "status"]
-    assert statuses and all(s["firmwareVersion"] == "0.4.3" for s in statuses)  # the clean stop's offline one too
+    assert statuses and all(s["firmwareVersion"] == "0.4.4" for s in statuses)  # the clean stop's offline one too
     online = [s for s in statuses if s.get("online")]
     assert online and all(s["capabilities"]["blockLanguage"] == 3 for s in online)
     # After the restart the program is loaded before MQTT: its first status carries the built-ins.

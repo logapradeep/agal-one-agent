@@ -22,6 +22,11 @@ everything as it was and the bundle is rejected.
 Pause-first manual operation (§4a, §7.7): while paused, instruction parts and ordinary rule slots wait;
 the built-ins and the interlock rule slots keep running.
 
+A single-pulse valve is closed at start-up and before a shutdown, built in (agent 0.4.4, contracts v1.24.0; §7.9 —
+the founder's rule of 2026-10-14): a clean stop sends every single-pulse valve not in FAULT one close pulse before it
+records the clean stop (``apply_safe_state``); a clean start's boot pass sends each one it vouches for one close pulse,
+whatever position it recorded (``start_close``); an unclean start sends none — FAULT, a reset needed. ``valve_closed``.
+
 Deterministic under a SimClock and a SimulatedIO — the golden vectors of programs/vectors run through it.
 """
 
@@ -43,7 +48,7 @@ from ..sun import sun_event_local
 from . import program as P
 from .guard import GUARD_WORDS
 from .program import Block, Output, Program, is_on, off_value
-from .valve import FAULT_WORDS
+from .valve import FAULT_WORDS, same_configuration
 
 logger = logging.getLogger(__name__)
 
@@ -361,7 +366,9 @@ class RuntimeV3:
             reason = None
             if first_start or ent is None:
                 reason = "position_unknown"
-            elif ent.get("config") and ent["config"] != drv.signature:
+            elif ent.get("config") and not same_configuration(ent["config"], drv.signature):
+                # A changed configuration (contracts v1.24.0: a port id stated on one side only — a state agent 0.4.3
+                # wrote, a bundle compiled before v1.24.0 — is not a change).
                 reason = "position_unknown"
             elif ent.get("pulse"):
                 reason = "pulse_cut_short"
@@ -371,9 +378,11 @@ class RuntimeV3:
             elif not clean:
                 reason = "unclean_boot"
             elif ent.get("position") in ("open", "closed"):
-                # Vouched for. Every output starts off after a restart, so one known open gets one close pulse at
-                # the boot pass; an interrupted run re-opens it when it resumes.
+                # Vouched for: a clean start. Agent 0.4.4 (contracts v1.24.0, README §7.9 — the founder's rule): the boot
+                # pass sends it one close pulse, whatever position it recorded (start_close); an interrupted run re-opens
+                # it when it resumes, 30 s later.
                 drv.position = ent["position"]
+                drv.start_close = True
             else:
                 reason = "position_unknown"
             if reason:
@@ -478,7 +487,8 @@ class RuntimeV3:
                     drv.set_fault("position_unknown", FAULT_WORDS["position_unknown"], wall)
                     st.pending_events.append(("__valve_fault__", {"assetId": aid, "reason": "position_unknown"}))
                 continue
-            if od.signature == drv.signature or (not drv.latching and not od.latching):
+            if same_configuration(od.cfg, drv.cfg) or (not drv.latching and not od.latching):
+                # Contracts v1.24.0: a bundle that only adds the port ids (words) is not a changed configuration.
                 drv.carry_from(od)
             else:  # a changed configuration: its position cannot be vouched for
                 drv.carry_from(od)
@@ -757,6 +767,8 @@ class RuntimeV3:
                 t.join(timeout=3.0)
         with self._lock:
             if safe_state:
+                # Agent 0.4.4 (README §7.9): the safe state, then every single-pulse valve's close pulse — and only then
+                # the clean stop is recorded, so the next start finds each one closed (or in FAULT).
                 self.apply_safe_state()
             self._persist(clean=True, wait=wait_record)
             self._cold = True
@@ -766,11 +778,22 @@ class RuntimeV3:
             for c in [c for c in self._pending_commands if c.get("type") == "resetValve"]:
                 self._answer(c, "failed", RESET_STOPPED)
             self._pending_commands = [c for c in self._pending_commands if c.get("type") != "resetValve"]
+            # What the stop raised (valve_closed, a valve_fault) goes out like a pass's events: no pass runs after it.
+            events, self._pass_events = self._pass_events, []
+        for t, pl, src in events:
+            try:
+                self.sink.event(t, pl, source=src)
+            except Exception as e:  # noqa: BLE001 — telling the cloud never stops a stop
+                logger.error("the stop's %s event could not be handed over: %s", t, e)
         self._send_acks()
 
     def apply_safe_state(self) -> None:
         """A clean stop: every motor and every other output whose safeState is off is switched off, each
-        continuous valve closes. A latching valve stays where it is (its position is persisted)."""
+        continuous valve closes; then (agent 0.4.4, contracts v1.24.0, README §7.9 — the founder's rule of 2026-10-14)
+        every single-pulse valve that is not in FAULT gets ONE close pulse, in assets[] order, whatever position it
+        recorded: recorded as any pulse is, with ``valve_closed`` (cause shutdown). Its supply is read first: not
+        present (or not readable) puts it in FAULT (``supply_lost``) and no pulse is sent; absent after the pulse is
+        ``pulse_cut_short``. The caller records the clean stop after this."""
         p = self.prog
         if p is None:
             return
@@ -795,6 +818,39 @@ class RuntimeV3:
                 out.written = off_value(out.type)
             except Exception as e:  # noqa: BLE001
                 logger.error("safe-state write %s.%s failed: %s", out.asset_id, out.source_key, e)
+        self._close_before_stop()
+
+    def _close_before_stop(self) -> None:
+        """README §7.9: before a clean shutdown, one close pulse to every single-pulse valve not in FAULT."""
+        p = self.prog
+        now, wall = self.clock.monotonic(), self.clock.now(p.tz)
+        for aid in p.card_order:
+            drv = p.valves.get(aid)
+            if drv is None or not drv.latching:
+                continue
+            drv.start_close = False
+            try:
+                if drv.fault:
+                    logger.warning("valve %s is in FAULT (%s): no close pulse before the stop — it stays in FAULT", drv.name, drv.fault)
+                    continue
+                supply = self._read_supply(drv)
+                if supply is None or not bool(supply):
+                    detail = (f"{self._supply_phrase(drv)} {'cannot be read' if supply is None else 'is not present'} as the "
+                              "node stops: no close pulse sent")
+                    self._fault(drv, "supply_lost", detail, now, wall)
+                    continue
+                if self._pulse(drv, False, now, wall):
+                    self._closed_built_in(drv, "shutdown")
+            except Exception as e:  # noqa: BLE001 — one valve never keeps the others open
+                logger.error("valve %s: the close pulse before the stop failed: %s", drv.name, e)
+
+    def _closed_built_in(self, drv, cause: str) -> None:
+        """A single-pulse valve its driver closed, built in (README §7.9): ``valve_closed`` with its cause."""
+        self._emit("valve_closed", {"valve": {"assetId": drv.asset_id, "nodeUid": self.node_uid, "cause": cause},
+                                    "assetId": drv.asset_id}, NODE)
+        self._persist_due = True
+        logger.warning("valve %s: one close pulse %s — recorded closed", drv.name,
+                       "as the node starts" if cause == "start_up" else "before the node stops")
 
     def _loop(self) -> None:
         while self._running:
@@ -1221,7 +1277,10 @@ class RuntimeV3:
                 continue
             v = self._input(drv.supply)
             if v is None or not bool(v):
-                detail = f"the supply on {drv.supply[1]} of card {drv.supply[0]} " + ("cannot be read" if v is None else "dropped")
+                # Contracts v1.24.0: the port id with the sense card's name ("the supply on DI3 (UPS supply) dropped").
+                where = (f"the supply on {self._supply_words(drv)}" if drv.supply_port_id
+                         else f"the supply on {drv.supply[1]} of card {drv.supply[0]}")
+                detail = f"{where} " + ("cannot be read" if v is None else "dropped")
                 if drv.set_fault("supply_lost", detail, wall):
                     self._announce_fault(aid, "supply_lost", now, wall, detail)
 
@@ -1802,6 +1861,15 @@ class RuntimeV3:
             if out.kind == "valve":
                 drv = out.valve
                 if drv.latching:
+                    if drv.start_close:
+                        # Agent 0.4.4 (README §7.9): a clean start's close pulse — whatever position it recorded, with the
+                        # switch-offs, before any open pulse; what a block set for it this pass waits for the next pass. In
+                        # FAULT by now (its supply not sensed at the boot pass): no pulse.
+                        if drv.fault:
+                            drv.start_close = False
+                        else:
+                            writes.append((0, 1, out.index, ("startclose", out)))
+                        continue
                     if drv.fault or drv.position == ("open" if on else "closed"):
                         continue
                     writes.append((1 if on else 0, cls, out.index, ("pulse", out, on)))
@@ -1840,6 +1908,11 @@ class RuntimeV3:
                         w[1].coil_state[w[2]] = None
                 elif kind == "pulse":
                     self._pulse(w[1].valve, w[2], now, wall)
+                elif kind == "startclose":
+                    drv = w[1].valve
+                    drv.start_close = False
+                    if self._pulse(drv, False, now, wall):
+                        self._closed_built_in(drv, "start_up")
             except Exception as e:  # noqa: BLE001
                 logger.error("write %s failed: %s", w, e)
 
@@ -1865,7 +1938,13 @@ class RuntimeV3:
                 supply = None
         drv.pulse_mark = None
         if not ok or supply is None or not bool(supply):
-            detail = "the pulse could not be sent" if not ok else "the supply was not present after the pulse"
+            pid = drv.coil_port_id(key)
+            which = "open" if want_open else "close"
+            if not ok:
+                detail = f"the {which} pulse on {pid} could not be sent" if pid else "the pulse could not be sent"
+            else:
+                detail = (f"the supply on {self._supply_words(drv)} was not present after the {which} pulse" if drv.supply_port_id
+                          else "the supply was not present after the pulse")
             self._fault(drv, "pulse_cut_short", detail, now, wall)
             self._persist()
             return False
@@ -1884,7 +1963,10 @@ class RuntimeV3:
                 drv.coil_state[k] = False
             except Exception as e:  # noqa: BLE001
                 logger.error("valve %s: the %s coil could not be written off (%s): no pulse sent", drv.asset_id, k, e)
-                self._fault(drv, "position_unknown", "the other coil could not be switched off: no pulse sent", now, wall)
+                pid = drv.coil_port_id(k)
+                which = "open" if k == drv.open_key else "close"
+                self._fault(drv, "position_unknown", f"the {which} coil on {pid} could not be switched off: no pulse sent" if pid
+                            else "the other coil could not be switched off: no pulse sent", now, wall)
                 return False
         return True
 
@@ -1979,6 +2061,9 @@ class RuntimeV3:
         if out is None:
             card = p.cards.get(asset_id)
             if card is not None and asset_id in p.valves and source_key in p.valves[asset_id].cfg.values():
+                pid = p.valves[asset_id].coil_port_id(source_key)
+                if pid:
+                    return f"refused: {pid} of {card.name} is driven by its valve driver — switch valve.open"
                 return f"refused: {source_key} of card {asset_id} is driven by its valve driver — switch valve.open"
             if card is not None and source_key in card.ports:
                 return f"refused: {source_key} of card {asset_id} is an input on this node"
@@ -2056,7 +2141,7 @@ class RuntimeV3:
             return None
         v = self._input(drv.supply)
         if v is None or not bool(v):
-            return f"refused: the valve's supply on {self._supply_words(drv)} is not present"
+            return f"refused: {self._supply_phrase(drv)} is not present"
         return None
 
     def _supply_port(self, drv) -> Optional[PortRef]:
@@ -2064,11 +2149,22 @@ class RuntimeV3:
         return card.ports.get(drv.supply[1]) if card is not None else None
 
     def _supply_words(self, drv) -> str:
-        """A latching valve's supply sense named by its PORT as the node knows it — its chip line (``line 13 of
-        pinctrl-bcm2835``; a bus input by its bus address: io.describe_port) — never a card id: a commandAck has no
-        structured field for the card, and the bundle carries no node port id (contracts v1.15.2 item 15)."""
+        """A latching valve's supply sense named by its PORT. Agent 0.4.4 (contracts v1.24.0 — the founder's answer 7,
+        SF-5): its node port id with the sense card's name — ``DI3 (UPS supply)`` — when the bundle names the port; else,
+        as before, its chip line (``line 13 of pinctrl-bcm2835``; a bus input by its bus address: io.describe_port).
+        Never a card id: a commandAck has no structured field for the card (contracts v1.15.2 item 15)."""
+        if drv.supply_port_id:
+            card = self.prog.cards.get(drv.supply[0]) if drv.supply else None
+            return f"{drv.supply_port_id} ({card.name})" if card is not None and card.name else drv.supply_port_id
         port = self._supply_port(drv)
         return describe_port(port.transport) if port is not None else "its sense input"
+
+    def _supply_phrase(self, drv) -> str:
+        """``Valve 2's supply on DI3 (UPS supply)`` (a bundle that names the port: the valve's name too); else, as
+        before, ``the valve's supply on line 13 of pinctrl-bcm2835``."""
+        if drv.supply_port_id:
+            return f"{drv.name}'s supply on {self._supply_words(drv)}"
+        return f"the valve's supply on {self._supply_words(drv)}"
 
     def _read_supply(self, drv):
         """The supply sense read now (after a pulse), as the pulse path reads it; None when it cannot be read."""
@@ -2169,7 +2265,8 @@ class RuntimeV3:
             drv.fault_detail = "the open coil could not be switched off: no reset pulse sent"
             self._persist()
             logger.warning("resetValve %s at the pass: the open coil could not be switched off — no pulse sent", aid)
-            return "failed", f"the open coil could not be switched off: no close pulse sent — {drv.name} stays in fault"
+            coil = f"the open coil of {drv.name} on {drv.open_port_id}" if drv.open_port_id else "the open coil"
+            return "failed", f"{coil} could not be switched off: no close pulse sent — {drv.name} stays in fault"
         drv.pulse_mark = "close"
         if not self._persist():
             drv.pulse_mark = None
@@ -2187,8 +2284,9 @@ class RuntimeV3:
                                 else "the supply was not present after the reset's close pulse")
             self._persist()
             logger.error("resetValve %s at the pass: %s — the valve stays in FAULT", aid, drv.fault_detail)
-            return "failed", (f"the close pulse could not be sent — {drv.name} stays in fault" if not sent else
-                              f"the valve's supply on {self._supply_words(drv)} was not present after the close pulse — "
+            pulse = f"the close pulse on {drv.close_port_id}" if drv.close_port_id else "the close pulse"
+            return "failed", (f"{pulse} could not be sent — {drv.name} stays in fault" if not sent else
+                              f"{self._supply_phrase(drv)} was not present after the close pulse — "
                               f"{drv.name} stays in fault")
         drv.pulse_mark = None
         drv.cleared()
@@ -2330,38 +2428,60 @@ class RuntimeV3:
 
     # ---------------------------------------------------------------- status
 
+    def _on_now(self) -> list[tuple[Output, str]]:
+        """Under the lock: each output the program has ON now, with how it is on in words — what an update waits for."""
+        p = self.prog
+        out: list[tuple[Output, str]] = []
+        for key in p.output_order:
+            o = p.outputs[key]
+            if o.kind == "valve" and o.valve is not None:
+                drv = o.valve
+                if drv.latching:
+                    if drv.position == "open":
+                        out.append((o, "valve open"))
+                    elif drv.pulse_mark or not drv.coils_known_off():
+                        out.append((o, "a valve coil not known off"))
+                else:
+                    coil_open = drv.coil_written is not None and drv.coil_written != drv.coil_level(False)
+                    if is_on(o.level) or coil_open:
+                        out.append((o, "valve open"))
+                continue
+            if is_on(o.level) or (o.written is not None and is_on(o.written)):
+                out.append((o, o.source_key))
+        return out
+
     def outputs_on(self) -> list[str]:
         """What the program has ON now, named for a person — an OTA update waits while this is not empty
-        (agent 0.3.4's busy-wait, ota_updater): a restart switches every output off and closes every valve (a
-        latching valve known open gets its close pulse at the boot pass), and interrupts every run. So: every
-        motor or plain output at an on level (wanted or last written), every valve that is open — a continuous
-        one whose ``valve.open`` is on, a latching one recorded open — or has a pulse in progress or a coil not
-        known off, and every schedule run that is running (a run interrupted by a power cut has its outputs off
-        and resumes from the state directory after a restart)."""
+        (agent 0.3.4's busy-wait, ota_updater): a restart switches every output off and closes every valve (agent
+        0.4.4: a single-pulse valve gets its close pulse before the stop and again at the boot pass, README §7.9), and
+        interrupts every run. So: every motor or plain output at an on level (wanted or last written), every valve
+        that is open — a continuous one whose ``valve.open`` is on, a latching one recorded open — or has a pulse in
+        progress or a coil not known off, and every schedule run that is running (a run interrupted by a power cut has
+        its outputs off and resumes from the state directory after a restart)."""
         with self._lock:
             p, st = self.prog, self.st
             if p is None:
                 return []
-            out: list[str] = []
-            for key in p.output_order:
-                o = p.outputs[key]
-                name = o.card.name or o.asset_id
-                if o.kind == "valve" and o.valve is not None:
-                    drv = o.valve
-                    if drv.latching:
-                        if drv.position == "open":
-                            out.append(f"{name} (valve open)")
-                        elif drv.pulse_mark or not drv.coils_known_off():
-                            out.append(f"{name} (a valve coil not known off)")
-                    else:
-                        coil_open = drv.coil_written is not None and drv.coil_written != drv.coil_level(False)
-                        if is_on(o.level) or coil_open:
-                            out.append(f"{name} (valve open)")
-                    continue
-                if is_on(o.level) or (o.written is not None and is_on(o.written)):
-                    out.append(f"{name} ({o.source_key})")
+            out = [f"{o.card.name or o.asset_id} ({how})" for o, how in self._on_now()]
             out.extend(f"the run of schedule {r.sid} on {r.layout}" for r in st.runs.values() if r.state == "running")
             return out
+
+    def outputs_on_items(self) -> dict:
+        """The same as ``outputs_on``, for the update's report (agent 0.4.4, contracts v1.24.0, nodes/README.md §13):
+        ``{"on": [{"name", "assetId"}], "runs": n}`` — each card that is on once, by its name in the bundle, in the node's
+        order; ``runs`` the schedule runs in progress."""
+        with self._lock:
+            p, st = self.prog, self.st
+            if p is None:
+                return {"on": [], "runs": 0}
+            on: list[dict] = []
+            seen: set[str] = set()
+            for o, _how in self._on_now():
+                if o.asset_id in seen:
+                    continue
+                seen.add(o.asset_id)
+                on.append({"name": o.card.name or o.asset_id, "assetId": o.asset_id})
+            return {"on": on, "runs": sum(1 for r in st.runs.values() if r.state == "running")}
 
     # ------------------------------------------- what the cloud is told of the cards (v1.15.1)
 
@@ -2509,6 +2629,9 @@ class RuntimeV3:
         with self._lock:
             p, st = self.prog, self.st
             now, wall = self.clock.monotonic(), self.clock.now(p.tz)
+            # Not a start (README §7.9): the switch of language sends no single-pulse valve a close pulse.
+            for drv in p.valves.values():
+                drv.start_close = False
             st.runs.clear()
             st.orphans, st.releases, st.now_releases = [], [], []
             st.power_wait, st.resume_at, st.resuming = None, None, None

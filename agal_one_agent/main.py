@@ -37,7 +37,8 @@ logger = logging.getLogger("agal_one_agent")
 BOOT_WAIT_FOR_PORT_TABLE_S = 30.0
 
 
-def handle_firmware_update(command: dict, mqtt_client, node_uid: str, outputs_on=None) -> None:
+def handle_firmware_update(command: dict, mqtt_client, node_uid: str, outputs_on=None, outputs_report=None,
+                           on_wait_change=None, now_ms=None) -> None:
     """A managed OTA update (health-gated rollback). Receipt ack only — the real outcome is
     reported asynchronously via firmware_update_* events (started on install, then succeeded
     once the new version clears probation, or rolled_back by the verify-timer). Its acks stay on
@@ -46,8 +47,11 @@ def handle_firmware_update(command: dict, mqtt_client, node_uid: str, outputs_on
 
     The command may carry the release archive to install — ``source`` (its URL) and ``sha256``
     (agent 0.3.4): then no git is needed on the board. ``outputs_on`` names what the node has ON;
-    the update waits while it names anything (ota_updater.perform_update). Blocking: run it
-    through start_firmware_update, never on the MQTT loop."""
+    the update waits while it names anything (ota_updater.perform_update). Agent 0.4.4
+    (contracts v1.24.0, nodes/README.md §13): ``outputs_report`` names them by card for the wait's
+    report (the heartbeat's otaWait), ``on_wait_change`` asks for a heartbeat at once, ``now_ms``
+    is the node's trusted time. Blocking: run it through start_firmware_update, never on the MQTT
+    loop."""
     from .ota_updater import perform_update
     command_id = command.get("commandId", "")
     version = command.get("version", "")
@@ -58,19 +62,23 @@ def handle_firmware_update(command: dict, mqtt_client, node_uid: str, outputs_on
     try:
         msg = perform_update(version, command_id=command_id,
                              rollout_id=rollout_id, node_uid=node_uid,
-                             source=source, sha256=sha256, outputs_on=outputs_on)
+                             source=source, sha256=sha256, outputs_on=outputs_on,
+                             outputs_report=outputs_report, on_wait_change=on_wait_change, now_ms=now_ms)
         logger.info("OTA: %s", msg)
     except Exception as e:  # noqa: BLE001
         logger.error("OTA: perform_update failed: %s", e)
         mqtt_client.publish_command_ack(command_id, "failed", error=str(e), ingress=False)
 
 
-def start_firmware_update(command: dict, mqtt_client, node_uid: str, outputs_on=None) -> threading.Thread:
+def start_firmware_update(command: dict, mqtt_client, node_uid: str, outputs_on=None, outputs_report=None,
+                          on_wait_change=None, now_ms=None) -> threading.Thread:
     """handle_firmware_update on its own thread: a download, an install and a wait for the pump to
     stop take minutes, and the MQTT loop must go on meanwhile — the command that switches the
     pump off arrives through it."""
     t = threading.Thread(target=handle_firmware_update, args=(command, mqtt_client, node_uid),
-                         kwargs={"outputs_on": outputs_on}, name="ota-update", daemon=True)
+                         kwargs={"outputs_on": outputs_on, "outputs_report": outputs_report,
+                                 "on_wait_change": on_wait_change, "now_ms": now_ms},
+                         name="ota-update", daemon=True)
     t.start()
     return t
 
@@ -109,6 +117,37 @@ def outputs_on_for(runtime) -> list:
     on.extend(gpio_handler.outputs_on())
     on.extend(pwm_handler.outputs_on())
     return on
+
+
+def outputs_report_for(runtime) -> dict:
+    """``outputs_on_for`` by card, for an update's report (agent 0.4.4, contracts v1.24.0, nodes/README.md §13):
+    {"on": [{name, assetId?}], "runs": n} — the program's cards that are on (each once, by its name in the program) and
+    its runs in progress, then the legacy GPIO / PWM outputs by their config names (no card)."""
+    from .handlers import gpio_handler, pwm_handler
+    on: list = []
+    runs = 0
+    loaded = getattr(runtime, "loaded", None) if runtime is not None else False
+    if loaded is None:  # a bare BlockRuntime of agent 0.3.x
+        loaded = getattr(runtime, "nab", None) is not None
+    if loaded and hasattr(runtime, "outputs_on_items"):
+        r = runtime.outputs_on_items() or {}
+        on.extend(r.get("on") or [])
+        runs = int(r.get("runs") or 0)
+    on.extend(gpio_handler.outputs_on_items())
+    on.extend(pwm_handler.outputs_on_items())
+    return {"on": on, "runs": runs}
+
+
+def with_ota_wait(extra):
+    """The heartbeat's extra fields with the update's wait (`otaWait`, agent 0.4.4) when an update waits, or stopped
+    because an output stayed on (ota_updater.wait_report — from memory)."""
+    from . import ota_updater
+    block = ota_updater.wait_report()
+    if not block:
+        return extra
+    out = dict(extra or {})
+    out["otaWait"] = block
+    return out
 
 
 def main():
@@ -217,6 +256,24 @@ def main():
     # the net-probe thread (its own too) probes the router, the internet and the name lookup; the gap says why.
     network = wire_network(mqtt_client, http_reporter, offline=args.offline,
                            clock_ok=agent_clock.clock_ok, server_time=server_time)
+
+    # The node's trusted now, in ms (the backend's time from its HTTPS answers; else the wall clock): the dates of an
+    # update's wait report and of the clock's reading (agent 0.4.4).
+    from .server_time import trusted_now
+    _trusted_now = trusted_now(server_time, agent_clock.clock_ok)
+
+    def trusted_ms() -> float:
+        try:
+            v = _trusted_now()
+        except Exception:  # noqa: BLE001
+            v = None
+        return float(v) if v is not None else time.time() * 1000.0
+
+    # The node's clock (agent 0.4.4, contracts v1.24.0, nodes/README.md §14; ADR-031 §6): the clock-care thread — its own,
+    # never the runtime's — reads the clock's source every 60 s; the offset from the backend's time comes from the Date of
+    # its HTTPS answers (server_time). The heartbeat carries both as `clock`. tests/test_clock_care.py checks this call.
+    from .clock_care import wire_clock, with_clock
+    clock_care = wire_clock(offline=args.offline, server_time=server_time, now_ms=trusted_ms)
 
     # ---- Node linking (ADR-024): one GPIO path for every Linux board, and the
     # report of what this board is and has. Nothing here names a board.
@@ -485,14 +542,25 @@ def main():
     def _line_busy(label, line) -> bool:
         return runtime is not None and runtime.loaded and runtime.line_in_use(label, line)
 
+    # The heartbeat an update's wait asks for at once (agent 0.4.4) — made below, after the command handler is set.
+    heartbeat_ref: dict = {}
+
+    def nudge_heartbeat() -> bool:
+        hb = heartbeat_ref.get("hb")
+        return bool(hb.nudge()) if hb is not None else False
+
     def on_command(command: dict):
         cmd_type = command.get("type", "")
         command_id = command.get("commandId", "")
 
         # OTA firmware update (managed, with health-gated rollback)
         if cmd_type == "firmwareUpdate":
+            # Agent 0.4.4 (nodes/README.md §13): the wait says so — its report by card, a heartbeat at once.
             start_firmware_update(command, mqtt_client, config.node.uid,
-                                  outputs_on=lambda: outputs_on_for(runtime))
+                                  outputs_on=lambda: outputs_on_for(runtime),
+                                  outputs_report=lambda: outputs_report_for(runtime),
+                                  on_wait_change=nudge_heartbeat,
+                                  now_ms=trusted_ms)
             return
 
         # Adaptive live cadence (ADR-013 §9-D3): the backend forwards a
@@ -661,12 +729,15 @@ def main():
             from .blocks.cloud import heartbeat_extra
             extra = heartbeat_extra(runtime, config, cloud_sink)
         # agent 0.4.2: + `network`, the last sample of the net-care thread (from memory: no file, no program here).
-        return with_network(extra, network)
+        # agent 0.4.4: + `otaWait` while an update waits (or stopped because an output stayed on), + `clock` — both from
+        # memory too.
+        return with_clock(with_ota_wait(with_network(extra, network)), clock_care)
 
     # Every status carries the version of the code that is running, resolved once at start
     # (contracts v1.14.2 join safety; tests/test_join_safety.py).
     heartbeat = HeartbeatPublisher(config, mqtt_client, http_reporter=http_reporter,
                                    extra_provider=_heartbeat_extra, agent_version=__version__)
+    heartbeat_ref["hb"] = heartbeat
 
     # Graceful shutdown
     running = True
@@ -797,6 +868,8 @@ def main():
             command_acks.close(timeout=3.0)  # one more try for each ack still waiting
         if network is not None:
             network.stop()
+        if clock_care is not None:
+            clock_care.stop()
         if node_events is not None:
             node_events.close(timeout=3.0)  # after runtime.stop: its output_released events go too
         telemetry.stop()

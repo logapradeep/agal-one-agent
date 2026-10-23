@@ -15,7 +15,11 @@ Flow (see Agal/contracts/enums.yaml#OtaStatus + firmware-rollout.schema.json):
         GitHub release archive of logapradeep/agal-one-agent for exactly that tag) with a sha256;
      b. the node waits while anything it drives is ON (outputs_on): a restart cuts every
         output, so it is not restarted under a running pump. Up to BUSY_WAIT_S, then the
-        update ends `failed` with an error that starts "busy:";
+        update ends `failed` with an error that starts "busy:". Agent 0.4.4 (contracts v1.24.0,
+        nodes/README.md §13): the wait SAYS SO — wait_report() is the heartbeat's `otaWait`
+        (phase waiting_idle, what is on, since, until), and after a wait that ran out (phase busy,
+        what stayed on) until the next update; one heartbeat is asked for at once when the wait
+        begins, when what is on changes and when it ends busy (on_wait_change);
      c. firmware_update_started; the archive is downloaded over HTTPS into the state
         directory (size cap, timeouts, redirects only to GitHub over HTTPS) and its
         sha256 checked BEFORE anything is installed;
@@ -59,6 +63,7 @@ they land even while the daemon is down / MQTT is mid-reconnect.
 """
 
 import contextlib
+import copy
 import glob
 import hashlib
 import importlib
@@ -75,6 +80,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from importlib import metadata as _metadata
 from typing import Callable, Optional
 
@@ -125,6 +131,12 @@ INSTALL_GRACE_S = 2 * PIP_TIMEOUT_S + VERIFY_DEADLINE_S
 # How long an update waits for the node's outputs to switch off, and how often it looks.
 BUSY_WAIT_S = int(os.environ.get("AGAL_ONE_AGENT_OTA_BUSY_WAIT_S", "1800"))
 BUSY_POLL_S = 10.0
+# Agent 0.4.4 (contracts v1.24.0, nodes/README.md §13): what the wait's report names, and how often a change of it asks
+# for a heartbeat at once (more often, the next 30-s heartbeat carries it).
+WAIT_MAX_ON = 16
+WAIT_MAX_NAME = 80
+WAIT_MAX_RUNS = 64
+WAIT_NUDGE_MIN_S = 5.0
 
 # The new version's heartbeat during probation (written by its main loop), read by the verify-timer.
 HEARTBEAT_EVERY_S = 10.0
@@ -152,6 +164,12 @@ MIN_FREE_BYTES = 64 * 1024 * 1024      # archive + snapshot + pip's build, with 
 # Seams for the tests (no real sleeping, no real clock).
 _sleep = time.sleep
 _monotonic = time.monotonic
+_wall_ms = lambda: time.time() * 1000.0  # noqa: E731 — the wait's dates when no trusted time is given
+
+# The wait's own record (agent 0.4.4): the heartbeat's otaWait, read from memory by wait_report().
+_WAIT_LOCK = threading.Lock()
+_WAIT: Optional[dict] = None
+_WAIT_NUDGED: Optional[float] = None
 
 _UPDATE_LOCK = threading.Lock()
 
@@ -1091,23 +1109,105 @@ def _busy(outputs_on: Optional[Callable[[], list]]) -> list:
         return [f"the outputs could not be read ({e})"]
 
 
-def _wait_until_idle(outputs_on, max_wait_s: float, on_wait: Optional[Callable[[], None]] = None) -> list:
-    """[] once nothing is ON; what is still ON when max_wait_s is over."""
+def _wait_until_idle(outputs_on, max_wait_s: float, on_wait: Optional[Callable[[], None]] = None, *,
+                     report: Optional[Callable[[], dict]] = None, on_change: Optional[Callable[[], None]] = None,
+                     now_ms: Optional[Callable[[], float]] = None) -> list:
+    """[] once nothing is ON; what is still ON when max_wait_s is over. Agent 0.4.4 (nodes/README.md §13): while it
+    waits, its record says so — phase waiting_idle with what is on (``report``, the cards by name) — and a wait that
+    runs out leaves phase busy with what stayed on (wait_report, the heartbeat's otaWait); ``on_change`` asks for a
+    heartbeat at once when it begins, when what is on changes (at most every 5 s) and when it ends busy."""
     on = _busy(outputs_on)
     if not on:
         return []
+    clock = now_ms or _wall_ms
     deadline = _monotonic() + max_wait_s
+    started = float(clock())
+    items, runs = _wait_items(report)
+    base = {"since": _iso_ms(started)}
+    _set_wait({"phase": "waiting_idle", "on": items, "runs": runs, **base,
+               "until": _iso_ms(started + max_wait_s * 1000.0), "at": _iso_ms(started)}, on_change, force=True)
     logger.info("OTA: waiting up to %d s for %s to switch off before the update", int(max_wait_s), ", ".join(on))
     while on:
         left = deadline - _monotonic()
         if left <= 0:
+            at = _iso_ms(float(clock()))
+            _set_wait({"phase": "busy", "on": items, "runs": runs, **base, "endedAt": at, "at": at}, on_change, force=True)
+            logger.warning("OTA: %s stayed on for the %d min the update waited — the update stops (the node says so)",
+                           ", ".join(on), int(max_wait_s) // 60)
             return on
         if on_wait is not None:
             on_wait()
         _sleep(min(BUSY_POLL_S, left))
         on = _busy(outputs_on)
+        if on:
+            now_items, now_runs = _wait_items(report)
+            changed = (now_items, now_runs) != (items, runs)
+            items, runs = now_items, now_runs
+            _set_wait({"phase": "waiting_idle", "on": items, "runs": runs, **base,
+                       "until": _iso_ms(started + max_wait_s * 1000.0), "at": _iso_ms(float(clock()))},
+                      on_change if changed else None)
+    _set_wait(None, None)
     logger.info("OTA: the outputs are off; the update goes ahead")
     return []
+
+
+def _iso_ms(ms: float) -> str:
+    return datetime.fromtimestamp(ms / 1000.0, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def wait_report() -> Optional[dict]:
+    """The heartbeat's `otaWait` block (contracts v1.24.0, functions.yaml 1.18.0 NodeStatusOtaWait), or None: while an
+    update waits for the node's outputs to go off, {phase waiting_idle, on, runs, since, until, at}; after a wait that ran
+    out, {phase busy, on — what stayed on, runs, since, endedAt, at} until the next update starts. From memory."""
+    with _WAIT_LOCK:
+        return copy.deepcopy(_WAIT) if _WAIT else None
+
+
+def _wait_items(report: Optional[Callable[[], dict]]) -> tuple:
+    """(on, runs) from ``report()`` — {"on": [{name, assetId?}], "runs": n} (main.outputs_report_for): each card once, a
+    name trimmed and cut at 80, at most 16; runs 0 … 64. Not readable: nothing named, no run."""
+    if report is None:
+        return [], 0
+    try:
+        r = report() or {}
+    except Exception as e:  # noqa: BLE001 — the report is words; the wait itself goes by outputs_on
+        logger.debug("OTA: what is on could not be named: %s", e)
+        return [], 0
+    on: list = []
+    seen: set = set()
+    for x in r.get("on") or [] if isinstance(r, dict) else []:
+        if not isinstance(x, dict):
+            continue
+        name = str(x.get("name") or "").strip()[:WAIT_MAX_NAME].strip()
+        if not name:
+            continue
+        aid = x.get("assetId") if isinstance(x.get("assetId"), str) and x.get("assetId") else None
+        key = ("asset", aid) if aid else ("name", name)
+        if key in seen:
+            continue
+        seen.add(key)
+        on.append({"name": name, **({"assetId": aid} if aid else {})})
+        if len(on) >= WAIT_MAX_ON:
+            break
+    runs = r.get("runs") if isinstance(r, dict) else 0
+    runs = runs if isinstance(runs, int) and not isinstance(runs, bool) else 0
+    return on, max(0, min(WAIT_MAX_RUNS, runs))
+
+
+def _set_wait(block: Optional[dict], on_change: Optional[Callable[[], None]], force: bool = False) -> None:
+    """Replace the wait's record; ask for a heartbeat at once (``on_change``) when ``force`` or at most every 5 s."""
+    global _WAIT, _WAIT_NUDGED
+    with _WAIT_LOCK:
+        _WAIT = block
+        now = _monotonic()
+        nudge = on_change is not None and (force or _WAIT_NUDGED is None or now - _WAIT_NUDGED >= WAIT_NUDGE_MIN_S)
+        if nudge:
+            _WAIT_NUDGED = now
+    if nudge:
+        try:
+            on_change()
+        except Exception as e:  # noqa: BLE001 — telling the cloud never stops an update
+            logger.debug("OTA: the heartbeat could not be asked for: %s", e)
 
 
 def _busy_error(on: list, waited_s: float) -> str:
@@ -1141,25 +1241,33 @@ def _clear_heartbeat() -> None:
 
 def perform_update(target_version: str, command_id: str = "", rollout_id: str = "",
                    node_uid: str = "", *, source: Optional[str] = None, sha256: Optional[str] = None,
-                   outputs_on: Optional[Callable[[], list]] = None) -> str:
+                   outputs_on: Optional[Callable[[], list]] = None,
+                   outputs_report: Optional[Callable[[], dict]] = None,
+                   on_wait_change: Optional[Callable[[], None]] = None,
+                   now_ms: Optional[Callable[[], float]] = None) -> str:
     """Install target_version and restart into probation. Returns a status string.
 
     ``source`` + ``sha256``: the release archive to install (no git needed). Without ``source``
     the tag is installed from git (an older backend). ``outputs_on`` names what the node has ON
     (main wires the program's outputs); the node is not restarted while it names anything.
-    On an install failure the saved previous version is put back, offline, and the update is
-    marked failed (no restart)."""
+    ``outputs_report`` names the same by card for the wait's report, ``on_wait_change`` asks for a
+    heartbeat at once, ``now_ms`` is the node's trusted time for its dates (agent 0.4.4,
+    nodes/README.md §13). On an install failure the saved previous version is put back, offline,
+    and the update is marked failed (no restart)."""
     if not _UPDATE_LOCK.acquire(blocking=False):
         logger.warning("OTA: an update is already in progress; %s (%s) ignored", target_version, command_id)
         return "an update is already in progress; this one is ignored"
     try:
+        _set_wait(None, None)  # a new update begins: an earlier wait's busy report is over
+        waits = {"report": outputs_report, "on_change": on_wait_change, "now_ms": now_ms}
         return _perform_update(target_version, command_id, rollout_id, node_uid,
-                               (source or "").strip() or None, (sha256 or "").strip().lower() or None, outputs_on)
+                               (source or "").strip() or None, (sha256 or "").strip().lower() or None, outputs_on, waits)
     finally:
         _UPDATE_LOCK.release()
 
 
-def _perform_update(target_version, command_id, rollout_id, node_uid, source, sha256, outputs_on) -> str:
+def _perform_update(target_version, command_id, rollout_id, node_uid, source, sha256, outputs_on, waits=None) -> str:
+    waits = waits or {}
     target = _norm_tag(target_version)
     previous = installed_version()
     base = {"previous": previous, "target": target, "commandId": command_id,
@@ -1216,7 +1324,7 @@ def _perform_update(target_version, command_id, rollout_id, node_uid, source, sh
 
     # A restart switches every output off: not while the node drives something.
     write_state({**base, "phase": "waiting"})
-    on = _wait_until_idle(outputs_on, BUSY_WAIT_S)
+    on = _wait_until_idle(outputs_on, BUSY_WAIT_S, **waits)
     if on:
         return refuse(_busy_error(on, BUSY_WAIT_S))
 
@@ -1256,7 +1364,7 @@ def _perform_update(target_version, command_id, rollout_id, node_uid, source, sh
     def keep_deadline_ahead():
         write_state({**state, "deadlineEpoch": int(time.time()) + INSTALL_GRACE_S})
 
-    on = _wait_until_idle(outputs_on, BUSY_WAIT_S, on_wait=keep_deadline_ahead)
+    on = _wait_until_idle(outputs_on, BUSY_WAIT_S, on_wait=keep_deadline_ahead, **waits)
     if on:
         return _undo(state, _busy_error(on, BUSY_WAIT_S))
 

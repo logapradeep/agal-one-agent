@@ -12,9 +12,13 @@ setup(
     # entry with no direction or active level, and a switch that would let go of, read, drive or invert a line.
     # 0.4.2 (unreleased, not tagged): the node's Wi-Fi care and its gaps (contracts v1.16.0) — the heartbeat's `network`
     # block, the Wi-Fi power saving kept off, a connectivity_gap after 60 s or more without an answer from the cloud.
-    # 0.4.3 (unreleased, not tagged): why the cloud could not be reached (contracts v1.18.0) — every request that got no
-    # answer classified, the router, the internet and the name lookup probed while a silence lasts, the gap's cause.
-    version="0.4.3",
+    # 0.4.3 (released 2026-10-23, live on the Pump house): why the cloud could not be reached (contracts v1.18.0) — every
+    # request that got no answer classified, the router, the internet and the name lookup probed while a silence lasts,
+    # the gap's cause.
+    # 0.4.4 (unreleased, not tagged): contracts v1.24.0 — a single-pulse valve closed before a clean shutdown and at a
+    # clean start (built in; an unclean start faults it, no pulse); an update that waits says so (the heartbeat's
+    # otaWait); a valve's words name its port (DI3, DO2) with the card; the node's clock source and offset (`clock`).
+    version="0.4.4",
     packages=find_packages(),
     install_requires=[
         "paho-mqtt>=2.0.0",

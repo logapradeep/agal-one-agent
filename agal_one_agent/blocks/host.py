@@ -534,6 +534,12 @@ class ProgramHost:
             return []
         return self.active.outputs_on()
 
+    def outputs_on_items(self) -> dict:
+        """``outputs_on`` for an update's report (agent 0.4.4, nodes/README.md §13): {"on": [{name, assetId}], "runs"}."""
+        if self.active is None or not self.active.loaded:
+            return {"on": [], "runs": 0}
+        return self.active.outputs_on_items()
+
     def status_extra(self) -> dict:
         return self.v3.status_extra() if self.active is self.v3 else {}
 

@@ -15,12 +15,13 @@ stayed in FAULT (SYNC.md v1.15.2 12(e)). Now the node answers once, from the pas
 * a command that arrives once the runtime has stopped — main() stops it first and disconnects MQTT last — is refused
   on arrival, in words, until the runtime is started again (item 16);
 * ``completed`` with NO pulse for a latching valve no longer in FAULT (idempotent);
-* the words name the supply's PORT as the node knows it, never a card id;
+* the words name the supply's PORT as the node knows it, never a card id — agent 0.4.4 (contracts v1.24.0, the
+  founder's answer 7): its node port id with the card's name (DI3 (UPS supply)) when the bundle names it, else its line;
 * through the node's HTTPS ack queue (command_acks.CommandAcks): a pass never waits on the network, also while the
   ingress is stalled.
 
-No hardware: the pump house of the golden vectors (Valve 2 latching, its supply sensed on line 13 of
-pinctrl-bcm2835 — the vectors' DI3) on a SimClock and a SimulatedIO.
+No hardware: the pump house of the golden vectors (Valve 2 latching on DO3 and DO4, its supply sensed on DI3 — line 13
+of pinctrl-bcm2835 — by the UPS supply card) on a SimClock and a SimulatedIO.
 """
 
 from __future__ import annotations
@@ -48,7 +49,9 @@ from test_v3_valves import both_valves, pulses
 from v3_bench import CLEAN, ESTOP, HEALTHY, PUMP, STATE_FILE, TZ, UPS, V1, V2, Bench, card, nxt, pumphouse
 
 ACTOR = {"uid": "u_owner01", "via": "app"}
-SUPPLY_GONE = "refused: the valve's supply on line 13 of pinctrl-bcm2835 is not present"
+SUPPLY_GONE = "refused: Valve 2's supply on DI3 (UPS supply) is not present"
+# A bundle compiled before contracts v1.24.0 names no port id: the words name the line, as agent 0.4.3 did.
+SUPPLY_GONE_LINE = "refused: the valve's supply on line 13 of pinctrl-bcm2835 is not present"
 CLOSE = ("valve.close_coil", 100)
 
 
@@ -158,6 +161,22 @@ def test_the_supply_refusal_names_the_port_never_a_card_id():
     assert UPS not in r["reason"] and "card" not in r["reason"] and "sensor.power" not in r["reason"]
 
 
+def _without_port_ids(bundle: dict) -> dict:
+    for a in bundle["assets"]:
+        for k in ("openPortId", "closePortId", "supplyPortId"):
+            (a.get("valve") or {}).pop(k, None)
+    return bundle
+
+
+def test_a_bundle_compiled_before_v1_24_0_names_the_line_as_before():
+    """Agent 0.4.4 on a bundle with no port ids (a backend before contracts v1.24.0): the words of agent 0.4.3."""
+    b = bench(bundle=_without_port_ids(both_valves(pumphouse())))
+    faulted(b)
+    b.set(UPS, "sensor.power", None)
+    b.run(1)
+    assert b.rt.apply_command(reset("cL")) == {"accepted": False, "reason": SUPPLY_GONE_LINE}
+
+
 def test_a_reset_of_a_valve_a_reload_made_continuous_is_refused_at_the_pass():
     b = bench(bundle=pumphouse())
     faulted(b)
@@ -198,37 +217,45 @@ def test_a_reset_of_a_valve_no_longer_in_fault_is_completed_with_no_pulse():
 # ======================================================================== could not be carried out
 
 class _CloseFails(SimulatedIO):
+    """Valve 2's close pulse fails once ``armed`` — after the boot pass, whose close pulse (agent 0.4.4, a clean start
+    closes it, README §7.9) goes through: the reset's is the one these tests mean."""
+    armed = False
+
     def pulse(self, port, ms):
-        if (port.asset_id, port.source_key) == (V2, "valve.close_coil"):
+        if self.armed and (port.asset_id, port.source_key) == (V2, "valve.close_coil"):
             raise OSError("the relay driver did not answer")
         super().pulse(port, ms)
 
 
 class _SupplyGoesWithTheClose(SimulatedIO):
+    armed = False
+
     def pulse(self, port, ms):
         super().pulse(port, ms)
-        if (port.asset_id, port.source_key) == (V2, "valve.close_coil"):
+        if self.armed and (port.asset_id, port.source_key) == (V2, "valve.close_coil"):
             self._inputs[(UPS, "sensor.power")] = False  # the supply went during the pulse (no listener: not a pass)
 
 
 def test_a_reset_whose_close_pulse_cannot_be_sent_is_answered_failed_and_stays_in_fault():
     b = bench(io=_CloseFails())
     faulted(b)
+    b.io.armed = True
     m = b.mark()
     assert b.rt.apply_command(reset("c6"))["accepted"]
     b.step()
-    assert acks(b) == [("c6", "failed", "the close pulse could not be sent — Valve 2 stays in fault")]
+    assert acks(b) == [("c6", "failed", "the close pulse on DO4 could not be sent — Valve 2 stays in fault")]
     assert b.rt.prog.valves[V2].fault == "pulse_cut_short" and b.events_since(m, "valve_reset") == []
 
 
 def test_a_reset_after_whose_pulse_the_supply_is_gone_is_answered_failed_and_stays_in_fault():
     b = bench(io=_SupplyGoesWithTheClose())
     faulted(b)
+    b.io.armed = True
     m = b.mark()
     assert b.rt.apply_command(reset("c7"))["accepted"]
     b.step()
     assert pulses(b.writes_since(m)) == [CLOSE]
-    assert acks(b) == [("c7", "failed", "the valve's supply on line 13 of pinctrl-bcm2835 was not present after the "
+    assert acks(b) == [("c7", "failed", "Valve 2's supply on DI3 (UPS supply) was not present after the "
                                          "close pulse — Valve 2 stays in fault")]
     d = b.rt.prog.valves[V2]
     assert d.fault == "pulse_cut_short" and "after the reset's close pulse" in d.fault_detail
@@ -237,7 +264,7 @@ def test_a_reset_after_whose_pulse_the_supply_is_gone_is_answered_failed_and_sta
 
 # ======================================================================== one reset per valve per pass
 
-GONE_AFTER = "the valve's supply on line 13 of pinctrl-bcm2835 was not present after the close pulse — Valve 2 stays in fault"
+GONE_AFTER = "Valve 2's supply on DI3 (UPS supply) was not present after the close pulse — Valve 2 stays in fault"
 
 
 def test_two_resets_in_one_pass_send_one_close_pulse_when_the_supply_is_read_absent_after_it():
@@ -247,6 +274,7 @@ def test_two_resets_in_one_pass_send_one_close_pulse_when_the_supply_is_read_abs
     again — so exactly one close pulse and two failed answers in the same words."""
     b = bench(io=_SupplyGoesWithTheClose())
     faulted(b)
+    b.io.armed = True
     m = b.mark()
     assert b.rt.apply_command(reset("cA"))["accepted"] and b.rt.apply_command(reset("cB"))["accepted"]
     b.step()
@@ -265,17 +293,18 @@ class _CloseFailsCounted(_CloseFails):
         self.close_tries = 0
 
     def pulse(self, port, ms):
-        if (port.asset_id, port.source_key) == (V2, "valve.close_coil"):
-            self.close_tries += 1
+        if self.armed and (port.asset_id, port.source_key) == (V2, "valve.close_coil"):
+            self.close_tries += 1  # the reset's tries (the boot pass's close pulse, before it was armed, went through)
         super().pulse(port, ms)
 
 
 def test_a_second_reset_in_the_same_pass_does_not_retry_a_close_pulse_that_could_not_be_sent():
     b = bench(io=_CloseFailsCounted())
     faulted(b)
+    b.io.armed = True
     assert b.rt.apply_command(reset("cD"))["accepted"] and b.rt.apply_command(reset("cE"))["accepted"]
     b.step()
-    words = "the close pulse could not be sent — Valve 2 stays in fault"
+    words = "the close pulse on DO4 could not be sent — Valve 2 stays in fault"
     assert b.io.close_tries == 1
     assert acks(b) == [("cD", "failed", words), ("cE", "failed", words)]
 
@@ -303,7 +332,8 @@ def test_a_reset_that_cannot_switch_the_open_coil_off_is_answered_failed():
     m = b.mark()
     assert b.rt.apply_command(reset("c8"))["accepted"]
     b.step()
-    assert acks(b) == [("c8", "failed", "the open coil could not be switched off: no close pulse sent — Valve 2 stays in fault")]
+    assert acks(b) == [("c8", "failed", "the open coil of Valve 2 on DO3 could not be switched off: no close pulse sent — "
+                                         "Valve 2 stays in fault")]
     assert pulses(b.writes_since(m)) == []
 
 

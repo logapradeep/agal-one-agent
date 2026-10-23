@@ -1,5 +1,60 @@
 # Changelog — agal-one-agent
 
+## 0.4.4 (2026-10-23)
+
+**A single-pulse valve closed at start-up and before a shutdown, an update that waits says so, a valve's words name its
+port, the node's clock (contracts v1.24.0; programs/README.md §7.9, nodes/README.md §13–§14; SYNC.md v1.24.0).** Not
+tagged, not released: releasing it — a tag and `/config/agent` 0.4.4 — is the founder's, after the backend deploy. It
+reaches the Pi over the air (the app's Update button); nothing is done on its terminal.
+
+- **A single-pulse valve is closed at start-up and before a shutdown — built in** (`_audit/107` follow-up 28; the
+  founder's rule of 2026-10-14). `RuntimeV3.apply_safe_state` — a clean stop, the `finally` of main() after SIGTERM
+  (systemd's stop or restart, an update's restart, a reboot) — now sends, after the motors and the continuous valves are
+  off, ONE close pulse to every single-pulse valve that is not in FAULT, in `assets[]` order, whatever position it
+  recorded: the pulse mark on disk first, the position after (as every pulse), its supply read before and after (not
+  present: FAULT — `supply_lost` and no pulse, or `pulse_cut_short`), `valve_closed` (cause `shutdown`); only then does
+  `stop()` record the clean stop, and it hands the stop's events to the sink (no pass runs after it). At a clean start
+  (a clean-stop record, no pulse in progress, the same configuration, not in FAULT) the cold load marks each valve
+  `start_close`, and the boot pass's flush sends it one close pulse with the switch-offs, before any open pulse, whatever
+  position it recorded — `valve_closed` (cause `start_up`); a valve its boot pass found with no supply is in FAULT and gets
+  none; what a block set for it in that pass waits for the next pass; a run the restart interrupted re-opens it 30 s
+  later. Before, a clean restart kept the recorded position (a valve recorded open got a close pulse at the boot pass,
+  one recorded closed got none) and nothing closed it before a stop. An unclean start is unchanged: FAULT, no pulse. A
+  reload and the switch of language (`stop(safe_state=False)`, `take_over_language`) send none.
+- **A valve's configuration and its port ids.** `valve.same_configuration` compares two valve entries leaving out a
+  port id stated on one side only — the first bundle that names them (contracts v1.24.0), or a state file 0.4.3 wrote, is
+  not a changed configuration (no `position_unknown` at the update to 0.4.4); a coil moved to another port is one.
+- **The words name the port** (SF-5, the founder's answer 7). The bundle's valve entry now names its ports
+  (`openPortId`, `closePortId`, `supplyPortId` — words only), and the node says: *refused: Valve 2's supply on DI3 (UPS
+  supply) is not present* (reset refusals), *the supply on DI3 (UPS supply) dropped* (`valve_fault` detail), *the close
+  pulse on DO4 could not be sent — Valve 2 stays in fault*, *the open coil of Valve 2 on DO3 could not be switched off: no
+  close pulse sent — …*, *refused: DO3 of Valve 2 is driven by its valve driver — switch valve.open*, and in a compile
+  refusal *DO4 of Valve 2 (valve.close_coil) states no direction …* / *valve Valve 2 (asset_x): coil DO4
+  ('valve.close_coil') is not an output port of the card*. A bundle without port ids gets 0.4.3's words.
+- **An update that waits says so** (`_audit/107` follow-up 32; the Pump house's update of 2026-10-23 waited 7 minutes for
+  Mtr1 and the apps said only *Update under way*). `ota_updater._wait_until_idle` keeps a record of its wait —
+  `wait_report()`, the heartbeat's `otaWait`: phase `waiting_idle` with the cards that are on (`outputs_report_for`: the
+  program's `outputs_on_items` — each card once by its name in the bundle — and the legacy outputs by their config names),
+  the runs in progress, `since`, `until` (= since + BUSY_WAIT_S) and `at`; phase `busy` with what stayed on and `endedAt`
+  when the 30 minutes run out, kept until the next update starts. Both waits (before the download, and before the restart
+  when something came on while pip ran). One heartbeat is sent at once (`HeartbeatPublisher.nudge`, on a thread of its
+  own; one timer at a time) when the wait begins, when what is on changes (at most every 5 s) and when it ends busy. The
+  dates are the node's trusted time (the backend's, from its HTTPS answers).
+- **The node's clock** (ADR-031 §6, accepted 2026-10-23: each node reports its clock source and offset). NEW
+  `clock_care.py`: the `clock-care` thread reads, every 60 s, `timedatectl show` (NTPSynchronized), `systemctl
+  is-active` of systemd-timesyncd, chrony, chronyd, ntpsec, ntp, ntpd and /dev/rtc0 — argv lists, 3 s bounds,
+  `net_care.run_tool` (killed with its process group; none started while one that will not die lives) — into `source`
+  (ntp | rtc | none | unknown), `service` and `rtc`. `ServerTime` takes a sample of the wall clock against every HTTPS
+  answer's Date (`add_sample`: + 500 ms, the history restarted when the wall clock steps by more than 1 s against the
+  monotonic clock) and `offset()` is the median of the last 15 (`offset_of`). Every online heartbeat carries `clock`
+  {source, service, rtc, offsetMs, offsetSamples, offsetAt, at}, from memory.
+- Version 0.4.4 (`setup.py`, `__init__`). Tests: NEW `tests/test_v3_single_pulse.py` (29: each start and stop path, the
+  order of the shutdown record, the supply, FAULT kept, the port-id configuration rule, the words), `tests/test_ota_wait.py`
+  (10), `tests/test_clock_care.py` (16, the contract's `clock.json` vectors); updated for the new behaviour:
+  `test_v3_valves.py`, `test_v3_corners.py`, `test_v3_reset_ack.py` (+ the old words on a bundle without port ids),
+  `test_v3_events_schema.py` (both causes of `valve_closed` validated against event.schema.json),
+  `test_ota_rollback.py` (the new keyword arguments), `test_v1_parity.py` (`clock` checked and taken out, as `network`).
+
 ## 0.4.3 (2026-10-22)
 
 **Why the cloud could not be reached (contracts v1.18.0, nodes/README.md §12; SYNC.md v1.18.0).** Not tagged, not

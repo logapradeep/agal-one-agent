@@ -57,6 +57,7 @@ def _scenarios(tmp_path) -> list[dict]:
     b.run(2)
     b.rt.apply_command({"type": "resumeAutomation", "actor": {"uid": "u_op", "via": "app"}})
     b.run(2)
+    b.rt.stop(safe_state=True)  # agent 0.4.4: the clean stop closes the single-pulse valve (valve_closed, shutdown)
     out += [dict(e, _source=s) for e, s in zip(b.sink.events, b.sink.sources)]
     return out
 
@@ -66,8 +67,10 @@ def test_every_event_the_runtime_sends_is_a_valid_event_document(tmp_path):
     types = {e["type"] for e in raw}
     for t in ("instruction_switched", "output_released", "valve_fault", "valve_reset", "estop_pressed", "estop_cleared",
               "power_cut", "power_restored", "watering_resumed", "guard_tripped", "watering_not_finished",
-              "automation_paused", "automation_resumed"):
+              "automation_paused", "automation_resumed", "valve_closed"):
         assert t in types, t
+    # agent 0.4.4 (contracts v1.24.0): both causes of valve_closed are among them — the vectors' clean start, the stop
+    assert {e["valve"]["cause"] for e in raw if e["type"] == "valve_closed"} == {"start_up", "shutdown"}
     events = [{"type": e["type"], "source": e["_source"],
                "payload": {k: v for k, v in e.items() if k not in ("type", "_source")}} for e in raw]
     path = tmp_path / "events.json"

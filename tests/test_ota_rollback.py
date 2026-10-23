@@ -738,7 +738,9 @@ def test_start_firmware_update_runs_off_the_mqtt_loop_with_the_archive(monkeypat
     gate.set()
     t.join(5)
     assert seen == {"version": "v0.3.4", "command_id": "c1", "node_uid": "node-1",
-                    "source": ARCHIVE.format(tag="v0.3.4"), "sha256": "a" * 64, "outputs_on": outputs}
+                    "source": ARCHIVE.format(tag="v0.3.4"), "sha256": "a" * 64, "outputs_on": outputs,
+                    # agent 0.4.4 (nodes/README.md §13): the wait's report — none given here
+                    "outputs_report": None, "on_wait_change": None, "now_ms": None}
     mqtt.publish_command_ack.assert_called_once_with("c1", "executing", ingress=False)
 
 
@@ -782,10 +784,15 @@ def test_main_routes_firmware_update_off_the_loop_with_the_outputs(tmp_path, mon
 
     calls = []
     monkeypatch.setattr(agent_main, "start_firmware_update",
-                        lambda command, mqtt, node_uid, outputs_on=None: calls.append((command, node_uid, outputs_on)))
+                        lambda command, mqtt, node_uid, outputs_on=None, **kw: calls.append((command, node_uid, outputs_on, kw)))
     handler["fn"]({"commandId": "c1", "type": "firmwareUpdate", "version": "v0.3.4"})
     assert len(calls) == 1 and calls[0][1] == "node-1"
     assert calls[0][2]() == [], "no program, nothing on"
+    # Agent 0.4.4 (nodes/README.md §13): the wait's report by card, a heartbeat at once, the node's trusted time.
+    kw = calls[0][3]
+    assert kw["outputs_report"]() == {"on": [], "runs": 0}
+    assert kw["on_wait_change"]() is False  # offline: the heartbeat is not running, nothing is sent
+    assert isinstance(kw["now_ms"](), float)
 
 
 def test_outputs_on_names_what_the_program_has_on():

@@ -158,7 +158,8 @@ def test_debounced_safety_inputs_boot_with_no_latch_and_no_fault():
     b = Bench(bundle)
     b.step()  # the boot pass
     assert not b.rt.prog.estop.latched and b.rt.prog.valves[V2].fault is None
-    assert [e["type"] for e in b.sink.events] == ["program_applied"]
+    # Agent 0.4.4 (README §7.9): a clean start's boot pass closes the single-pulse valve, built in.
+    assert [e["type"] for e in b.sink.events] == ["program_applied", "valve_closed"]
     b.until(6, 5)
     assert b.pump_on() and b.level(V2, "valve.open") is True
     b.set(ESTOP, "sensor.contact", False)
@@ -264,7 +265,8 @@ def test_a_normal_day_never_has_both_coils_on():
     b = Bench(both_valves(pumphouse()))
     b.step()
     b.until(6, 31)
-    assert pulses(b.io.log) == [("valve.open_coil", 100), ("valve.close_coil", 100)]
+    # The boot pass's close (a clean start, agent 0.4.4), the morning's open at 06:00 and its close at 06:30.
+    assert pulses(b.io.log) == [("valve.close_coil", 100), ("valve.open_coil", 100), ("valve.close_coil", 100)]
     never_both(b.io, V2)
 
 

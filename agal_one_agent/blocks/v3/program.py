@@ -32,7 +32,7 @@ from ..io import IOAdapter, PortRef, describe_port, physical_port
 from ..runtime import CompileError, _Rule, _Var, _signature
 from .guard import MotorGuard
 from .safety import EStop, PowerSense
-from .valve import ValveDriver
+from .valve import ValveDriver, port_id
 
 logger = logging.getLogger(__name__)
 
@@ -87,14 +87,41 @@ def is_output_port(t: dict) -> bool:
     return (t or {}).get("direction") == "out" or (t or {}).get("kind") == "pwm"
 
 
-def entry_refusal(aid: str, sk: str, t: dict) -> Optional[str]:
+def port_words(aid: str, sk: str, t: dict, pid: Optional[str] = None, card_name: Optional[str] = None) -> str:
+    """A card's port in the node's words. Agent 0.4.4 (contracts v1.24.0 — the founder's answer 7, SF-5): the node port
+    id with the card's name, ``DO3 of Valve 2 (valve.open_coil)``, when the bundle names the port (a valve's coils and
+    its supply sense); else, as before, ``valve.open_coil of card asset_x (line 22 of pinctrl-bcm2835)``."""
+    if pid:
+        return f"{pid} of {card_name or aid} ({sk})"
+    return f"{sk} of card {aid} ({describe_port(t)})"
+
+
+def valve_port_ids(bundle: dict) -> dict[tuple[str, str], str]:
+    """(assetId, sourceKey) → the node port id the bundle's valve entries name for it (contracts v1.24.0): each valve's
+    open and close coils on its own card, its supply sense on the sense card. Words only."""
+    out: dict[tuple[str, str], str] = {}
+    for a in bundle.get("assets") or []:
+        v = a.get("valve") if isinstance(a, dict) else None
+        if not isinstance(v, dict) or not a.get("assetId"):
+            continue
+        for key, pid_key in (("open", "openPortId"), ("close", "closePortId")):
+            pid = port_id(v.get(pid_key))
+            if pid and isinstance(v.get(key), str):
+                out[(str(a["assetId"]), v[key])] = pid
+        sup, pid = v.get("supply"), port_id(v.get("supplyPortId"))
+        if pid and isinstance(sup, dict) and sup.get("assetId") and sup.get("sourceKey"):
+            out[(str(sup["assetId"]), str(sup["sourceKey"]))] = pid
+    return out
+
+
+def entry_refusal(aid: str, sk: str, t: dict, pid: Optional[str] = None, card_name: Optional[str] = None) -> Optional[str]:
     """Why a port entry is not complete (contracts v1.15.3, programs/README.md §7.2 *Every port entry is complete*;
     automation-block.schema.json CompiledTransport), in the node's own words naming the card and the port — or None.
     Every entry states its direction, ``in`` or ``out`` (a PWM port is an output by its kind), and an output its active
     level. An entry with no direction is never taken as an input: agent 0.4.0 did, for the Pump house's DO1 on
     2026-10-17 — it let go of the Light's active-low relay (the line fell to its pull and the relay energised) and
-    refused every switch."""
-    where = f"{sk} of card {aid} ({describe_port(t)})"
+    refused every switch. Agent 0.4.4: a port the bundle names by its node port id is said by it (``port_words``)."""
+    where = port_words(aid, sk, t, pid, card_name)
     d = t.get("direction")
     kind = str(t.get("kind", "gpio"))
     if kind == "pwm":
@@ -325,6 +352,7 @@ def _build(bundle: dict, io: IOAdapter) -> Program:
                        "they record nothing", version, len(bundle["dataCards"]))
     p = Program(bundle)
     safety_keys = _safety_keys(bundle)
+    pids = valve_port_ids(bundle)
     for i, a in enumerate(bundle.get("assets") or []):
         aid = a.get("assetId")
         if not aid or aid in p.cards:
@@ -333,7 +361,7 @@ def _build(bundle: dict, io: IOAdapter) -> Program:
         for sk, t in (a.get("ports") or {}).items():
             if not isinstance(t, dict):
                 raise CompileError(f"{aid}.{sk}: the port has no transport")
-            why = entry_refusal(aid, sk, t)
+            why = entry_refusal(aid, sk, t, pids.get((aid, sk)), card.name)
             if why:
                 raise CompileError(why)
             ref = _port_ref(aid, sk, t, card.asset_type, safety_keys)
@@ -414,12 +442,15 @@ def _card_builtins_and_outputs(p: Program, card: Card) -> None:
         owned.add(out_key)
     if v:
         drv_ports = {}
-        for k in (v.get("open"), v.get("close")):
+        for k, pid_key in ((v.get("open"), "openPortId"), (v.get("close"), "closePortId")):
             if k is None:
                 continue
             r = card.ports.get(k)
             if r is None or not is_output_port(r.transport):
-                raise CompileError(f"valve {aid}: coil '{k}' is not an output port of the card")
+                pid = port_id(v.get(pid_key))
+                coil = f"coil {pid} ('{k}')" if pid else f"coil '{k}'"
+                raise CompileError(f"valve {card.name} ({aid}): {coil} is not an output port of the card" if pid
+                                   else f"valve {aid}: {coil} is not an output port of the card")
             drv_ports[k] = r
         if v.get("open") is None:
             raise CompileError(f"valve {aid}: the driver names no open output")
@@ -448,11 +479,13 @@ def _add_output(p: Program, card: Card, key: str, kind: str, ref: Optional[PortR
 
 
 def _safety(p: Program, safety: dict) -> None:
-    def input_of(pk: dict, what: str) -> tuple[str, str]:
+    def input_of(pk: dict, what: str, pid: Optional[str] = None) -> tuple[str, str]:
         aid, sk = pk.get("assetId"), pk.get("sourceKey")
         card = p.cards.get(aid)
         ref = card.ports.get(sk) if card else None
         if ref is None or is_output_port(ref.transport):
+            if pid:
+                raise CompileError(f"{what}: {pid} of {card.name if card is not None else aid} ({sk}) is not an input of this node")
             raise CompileError(f"{what}: {sk} of card {aid} is not an input of this node")
         if not is_digital_input(ref.transport):
             # A sense the node judges present or absent is a contact: an analog reading has no threshold in the
@@ -477,7 +510,8 @@ def _safety(p: Program, safety: dict) -> None:
         p.power = PowerSense(ps)
     for aid, drv in p.valves.items():
         if drv.latching:
-            input_of({"assetId": drv.supply[0], "sourceKey": drv.supply[1]} if drv.supply else {}, f"valve {aid}'s supply")
+            input_of({"assetId": drv.supply[0], "sourceKey": drv.supply[1]} if drv.supply else {},
+                     f"{drv.name}'s supply" if drv.supply_port_id else f"valve {aid}'s supply", drv.supply_port_id)
 
 
 # ------------------------------------------------------------------ blocks

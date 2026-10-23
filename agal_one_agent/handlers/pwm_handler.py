@@ -75,6 +75,11 @@ def outputs_on() -> list[str]:
     return [f"{name} (PWM GPIO{gpio})" for gpio, (duty, name) in sorted(_duties.items()) if duty > 0]
 
 
+def outputs_on_items() -> list[dict]:
+    """The same, for an update's report (agent 0.4.4): each by its config name — a legacy output has no card."""
+    return [{"name": str(name or f"PWM GPIO{gpio}")} for gpio, (duty, name) in sorted(_duties.items()) if duty > 0]
+
+
 class PwmHandler:
     def read(self, pin) -> Optional[float]:
         return None  # PWM is output-only

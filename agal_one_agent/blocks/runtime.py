@@ -1870,6 +1870,23 @@ class BlockRuntime:
             out.extend(f"the run of plot {pid}" for pid in self._active_runs)
             return out
 
+    def outputs_on_items(self) -> dict:
+        """The same as ``outputs_on``, for an update's report (agent 0.4.4, contracts v1.24.0, nodes/README.md §13):
+        ``{"on": [{"name", "assetId"}], "runs": n}`` — each card with an output on, once; ``runs`` the plot runs."""
+        def on(value) -> bool:
+            if isinstance(value, bool):
+                return value
+            return isinstance(value, (int, float)) and value > 0
+
+        with self._lock:
+            items = []
+            for aid in self.aab_order:
+                blk = self.aabs[aid]
+                if any(v.port is not None and v.port.transport.get("direction") == "out"
+                       and (on(self._last_written.get((aid, v.port.source_key))) or on(v.value)) for v in blk.vars.values()):
+                    items.append({"name": self._asset_meta(aid).get("name") or aid, "assetId": aid})
+            return {"on": items, "runs": len(self._active_runs)}
+
     def snapshot(self) -> dict:
         with self._lock:
             return {

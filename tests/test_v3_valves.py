@@ -81,11 +81,13 @@ def test_latching_pulses_open_then_close_and_never_both():
     b = Bench(both_valves(pumphouse()))
     m = b.mark()
     b.step()
+    # Agent 0.4.4: the boot pass of a clean start closes it first, built in (README §7.9).
+    assert pulses(b.writes_since(m)) == [("valve.close_coil", 100)]
     b.until(6, 0)
-    assert pulses(b.writes_since(m)) == [("valve.open_coil", 100)]
+    assert pulses(b.writes_since(m)) == [("valve.close_coil", 100), ("valve.open_coil", 100)]
     assert b.level(V2, "valve.open") is True
     b.until(6, 30)
-    assert pulses(b.writes_since(m)) == [("valve.open_coil", 100), ("valve.close_coil", 100)]
+    assert pulses(b.writes_since(m)) == [("valve.close_coil", 100), ("valve.open_coil", 100), ("valve.close_coil", 100)]
     # The coils are only ever pulsed, one at a time: never written as a level.
     assert [w for w in b.writes_since(m) if w["assetId"] == V2 and "value" in w] == []
     assert state(b)["valves"][V2]["position"] == "closed" and state(b)["valves"][V2]["pulse"] is None
@@ -98,24 +100,30 @@ def test_latching_pulse_length_is_the_cards():
     m = b.mark()
     b.step()
     b.until(6, 0)
-    assert pulses(b.writes_since(m)) == [("valve.open_coil", 250)]
+    assert pulses(b.writes_since(m)) == [("valve.close_coil", 250), ("valve.open_coil", 250)]
 
 
-def test_the_position_is_persisted_and_a_clean_restart_keeps_it(tmp_path):
+def test_a_clean_stop_closes_it_and_a_clean_restart_closes_it_again(tmp_path):
+    """Agent 0.4.4 (README §7.9, the founder's rule): open at 06:05, the node stops cleanly — one close pulse before the
+    clean stop is recorded (valve_closed, shutdown); it starts again — one close pulse at the boot pass (start_up)."""
     b = Bench(both_valves(pumphouse()), state_dir=str(tmp_path))
     b.step()
     b.until(6, 5)
     assert state(b)["valves"][V2]["position"] == "open"
+    m = b.mark()
     b.rt.stop(safe_state=True)
-    assert state(b)["cleanStop"] is True
+    assert pulses(b.writes_since(m)) == [("valve.close_coil", 100)]
+    [c] = b.events_since(m, "valve_closed")
+    assert c["valve"] == {"assetId": V2, "nodeUid": "node_pumphouse", "cause": "shutdown"} and b.source_of(c) == "node"
+    assert state(b)["cleanStop"] is True and state(b)["valves"][V2]["position"] == "closed" and state(b)["valves"][V2]["pulse"] is None
     rt = b.new_runtime()
     m = b.mark()
     rt.compile(b.bundle)
     st = {v["assetId"]: v for v in rt.status_extra()["valves"]}
-    assert st[V2]["state"] == "open"  # vouched for: no FAULT after a clean stop
+    assert st[V2]["state"] == "closed"  # vouched for: no FAULT after a clean stop
     b.step()
-    # Outputs start off after a restart: the open valve gets one close pulse at the boot pass.
-    assert pulses(b.writes_since(m)) == [("valve.close_coil", 100)]
+    assert pulses(b.writes_since(m)) == [("valve.close_coil", 100)]  # closed again, whatever it recorded
+    assert [e["valve"]["cause"] for e in b.events_since(m, "valve_closed")] == ["start_up"]
     assert b.events_since(m, "valve_fault") == []
 
 
@@ -188,7 +196,7 @@ def test_reset_is_refused_while_the_supply_is_not_sensed_and_idempotent_when_not
     b.set(UPS, "sensor.power", False)
     b.run(1)
     r = b.rt.apply_command({"type": "resetValve", "assetId": V2})
-    assert r == {"accepted": False, "reason": "refused: the valve's supply on line 13 of pinctrl-bcm2835 is not present"}
+    assert r == {"accepted": False, "reason": "refused: Valve 2's supply on DI3 (UPS supply) is not present"}
     assert b.rt.apply_command({"type": "resetValve", "assetId": V1})["accepted"] is False  # not a latching valve
 
 

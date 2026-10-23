@@ -30,6 +30,11 @@ def outputs_on() -> list[str]:
     return [f"{name} (GPIO{gpio})" for gpio, (on, name) in sorted(_levels.items()) if on]
 
 
+def outputs_on_items() -> list[dict]:
+    """The same, for an update's report (agent 0.4.4): each by its config name — a legacy output has no card."""
+    return [{"name": str(name or f"GPIO{gpio}")} for gpio, (on, name) in sorted(_levels.items()) if on]
+
+
 class GpioHandler:
     def _setup(self, pin, mode, initial=None, pull=None):
         gpio = pin.gpio_number

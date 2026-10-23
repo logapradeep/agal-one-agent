@@ -17,11 +17,19 @@ requests time out after at most 20 s): seconds, against windows of 10 and 2 minu
 first answer since the agent started, the wall clock when ``clock_ok()`` (NTP / RTC) says so;
 otherwise None — and the command gate then refuses every command as ``stale`` ("no trusted time
 yet") until the backend has answered (the answer to that refusal's own ack is enough).
+
+The offset (agent 0.4.4, contracts v1.24.0; nodes/README.md §14, ADR-031 §6). Each answer is also a
+sample of how far the node's WALL clock is from the backend's: the wall clock when it was read minus
+its Date + 500 ms (``add_sample``). ``offset`` is the median of the last 15 samples since the wall
+clock last stepped against the monotonic clock by more than 1 s (NTP synchronising after a power cut,
+a person setting the clock) — the reference's ``addSample`` / ``offsetOf`` (Agal/contracts/nodes/
+reference/clock.mjs). The heartbeat's ``clock`` block carries it (clock_care.py).
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from datetime import timezone
@@ -30,14 +38,47 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+#: The offset is the median of at most this many answers (the reference's MAX_SAMPLES).
+MAX_SAMPLES = 15
+#: A step of the wall clock against the monotonic clock bigger than this (ms) restarts the samples (STEP_MS).
+STEP_MS = 1000
+#: A Date has whole seconds: the middle of that second is taken (DATE_MIDDLE_MS).
+DATE_MIDDLE_MS = 500
+
+
+def add_sample(history: list, wall_ms: float, mono_ms: float, date_ms: float) -> list:
+    """The reference's addSample: one answer — the wall and monotonic clocks when it was read, its Date as ms — added to
+    the samples since the wall clock last stepped; at most MAX_SAMPLES kept (the newest). Rounds as JavaScript's
+    Math.round (half up), so the agent and the reference agree on every vector."""
+    server = date_ms + DATE_MIDDLE_MS
+    s = {"offsetMs": int(math.floor(wall_ms - server + 0.5)), "drift": wall_ms - mono_ms, "serverMs": server}
+    prev = history[-1] if history else None
+    kept = [] if prev is not None and abs(s["drift"] - prev["drift"]) > STEP_MS else list(history)
+    kept.append(s)
+    return kept[-MAX_SAMPLES:]
+
+
+def offset_of(history: list) -> Optional[dict]:
+    """The reference's offsetOf: {offsetMs (the median; an even count: the floor of the two middle ones' mean), samples,
+    atMs (the backend's time of the newest)}, or None."""
+    if not history:
+        return None
+    xs = sorted(int(h["offsetMs"]) for h in history)
+    n = len(xs)
+    median = xs[(n - 1) // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) // 2
+    return {"offsetMs": median, "samples": n, "atMs": history[-1]["serverMs"]}
+
 
 class ServerTime:
     """The latest backend ``Date`` with the monotonic time it arrived (see the module docstring)."""
 
-    def __init__(self, monotonic: Callable[[], float] = time.monotonic):
+    def __init__(self, monotonic: Callable[[], float] = time.monotonic,
+                 wall_ms: Callable[[], float] = lambda: time.time() * 1000.0):
         self._monotonic = monotonic
+        self._wall_ms = wall_ms
         self._lock = threading.Lock()
         self._anchor: Optional[tuple[float, float]] = None  # (server ms, monotonic s)
+        self._samples: list = []  # agent 0.4.4: the wall clock against each answer's Date (add_sample)
         self.observations = 0
 
     def observe(self, headers: Any, url: str) -> bool:
@@ -60,14 +101,27 @@ class ServerTime:
             return False
         if dt.tzinfo is None:  # an HTTP-date is GMT
             dt = dt.replace(tzinfo=timezone.utc)
-        server_ms = dt.timestamp() * 1000.0 + 500.0  # whole seconds: the middle of that second
+        date_ms = dt.timestamp() * 1000.0
+        server_ms = date_ms + 500.0  # whole seconds: the middle of that second
         with self._lock:
             first = self._anchor is None
-            self._anchor = (server_ms, self._monotonic())
+            mono = self._monotonic()
+            self._anchor = (server_ms, mono)
             self.observations += 1
+            try:
+                self._samples = add_sample(self._samples, float(self._wall_ms()), mono * 1000.0, date_ms)
+            except Exception as e:  # noqa: BLE001 — the offset is a report; the command check never depends on it
+                logger.debug("server time: the offset sample was not taken: %s", e)
         if first:
             logger.info("the backend's time is known (from its HTTPS answers): commands are checked against it")
         return True
+
+    def offset(self) -> Optional[dict]:
+        """The node's wall clock minus the backend's time (agent 0.4.4, nodes/README.md §14): {offsetMs, samples, atMs}
+        — offset_of the samples since the wall clock last stepped — or None before the first answer."""
+        with self._lock:
+            history = list(self._samples)
+        return offset_of(history)
 
     def now_ms(self) -> Optional[int]:
         """The backend's time now, in ms since the epoch — None until an answer has been seen."""
